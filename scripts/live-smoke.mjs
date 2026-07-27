@@ -9,9 +9,9 @@
  * pass means "server + credential + production reachable" — the same path an MCP
  * host takes.
  *
- * Read-only by construction: writes are force-disabled for the child process
- * regardless of the ambient environment, and only GET endpoints are exercised.
- * The key is never printed.
+ * Read-only by construction: the child process is started with
+ * XYTE_MCP_READ_ONLY=1 regardless of the ambient environment, and only GET
+ * endpoints are exercised. The key is never printed.
  */
 
 import { spawn } from 'node:child_process';
@@ -59,8 +59,9 @@ class Client {
       env: {
         ...process.env,
         XYTE_ORG_API_KEY: key,
-        // Never let an ambient setting turn this into a mutating run.
-        XYTE_MCP_ALLOW_WRITES: '0'
+        // Writes are the server's default, so pin this run shut explicitly: it
+        // goes against production, and no smoke test should be able to mutate.
+        XYTE_MCP_READ_ONLY: '1'
       },
       stdio: ['pipe', 'pipe', 'pipe']
     });
@@ -157,7 +158,7 @@ async function main() {
     check(
       'running read-only',
       String(init.result?.instructions ?? '').includes('READ-ONLY'),
-      'writes are force-disabled for this run'
+      'this run is pinned read-only regardless of ambient config'
     );
 
     const tools = await client.rpc(2, 'tools/list');

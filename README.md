@@ -4,7 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server for the [Xyte](https://www.xyte
 API. It gives an AI agent typed, validated access to the public Xyte REST API — endpoint
 discovery plus a generic call tool — over a local stdio transport.
 
-**Read-only by default.**
+Reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it a
+read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
@@ -68,12 +69,17 @@ Everything below is about running the server itself.
 | --- | --- |
 | `XYTE_ORG_API_KEY` | Organization-scoped API key. |
 | `XYTE_PARTNER_API_KEY` | Partner-scoped API key. Set either or both. |
-| `XYTE_MCP_ALLOW_WRITES` | Set to `1` to permit mutating endpoints. Off by default. |
+| `XYTE_MCP_READ_ONLY` | Set to `1` to refuse every mutating endpoint. Writes are permitted by default. |
 | `XYTE_HUB_URL` | Override the hub base URL. Defaults to `https://hub.xyte.io`. |
 | `XYTE_ENTRY_URL` | Override the entry base URL. |
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
 
 The last three are escape hatches for non-production hubs; the defaults are what you want.
+
+`XYTE_MCP_ALLOW_WRITES` from 0.1.x is still honoured with its original meaning: if it is set
+at all, it decides, so a server pinned shut with `XYTE_MCP_ALLOW_WRITES=0` stays shut across
+the upgrade. Where the two disagree, the restrictive one wins. New configuration should use
+`XYTE_MCP_READ_ONLY`.
 
 ## Tools
 
@@ -92,18 +98,28 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
 
 ## Write policy
 
-The caller here is a model, and it may be acting on content a third party can influence —
-device names, ticket bodies, notes. So mutations are off unless an operator turns them on
-out of band:
-
-- **Default:** only `GET`/`HEAD` endpoints can be called. Anything else is refused, and no
-  request goes out.
-- **`XYTE_MCP_ALLOW_WRITES=1`:** `POST`/`PUT`/`PATCH` are permitted.
-- **`DELETE`:** additionally requires `confirm` set to the endpoint key verbatim, on top of
-  writes being enabled.
+- **Default:** `GET`/`HEAD`/`POST`/`PUT`/`PATCH` are all permitted.
+- **`DELETE`:** additionally requires `confirm` set to the endpoint key verbatim. This holds
+  even with writes enabled — an irreversible call is the one that cannot be walked back.
+- **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
+  before a request is built, and the model is told an operator alone can lift it.
 
 `xyte_api_call`'s MCP annotations (`readOnlyHint`, `destructiveHint`) follow the live
-configuration, so a host can prompt appropriately.
+configuration, so a host prompts according to what the server can actually do.
+
+**Worth knowing before you point it at a live fleet.** The caller is a model, and read tools
+return content a third party can influence — device names, ticket bodies, notes. Nothing
+stops a model from treating text it just read as an instruction, so the server tells it
+outright that fleet content is untrusted and that mutating intent must come from you. That is
+a mitigation, not a guarantee. Prefer read-only when the agent runs unattended, when it is
+working through content you do not control, or when you simply want to look around:
+
+```bash
+claude mcp add xyte-ro -e XYTE_ORG_API_KEY=<key> -e XYTE_MCP_READ_ONLY=1 -- npx -y @xyteai/mcp
+```
+
+Both can coexist — register a read-only server for exploration and a writable one for the
+sessions where you want changes to land.
 
 API keys are never echoed back: output is filtered both by field name (`api_key`, `token`,
 `authorization`, …) and by literal secret value.
@@ -143,10 +159,11 @@ npm run smoke:live -- --key-stdin     # paste the key; keeps it out of shell his
 XYTE_ORG_API_KEY=<key> npm run smoke:live
 ```
 
-It spawns the built server and drives real MCP requests against the live API. Writes are
-force-disabled for the run regardless of your environment, only `GET` endpoints are
-exercised, and the key is never printed. A pass means the whole path works; if this passes
-but your host still shows nothing, the problem is the host registration, not the server.
+It spawns the built server and drives real MCP requests against the live API. The child is
+started with `XYTE_MCP_READ_ONLY=1` regardless of your environment, only `GET` endpoints are
+exercised, and the key is never printed — this runs against production, so it cannot mutate
+anything. A pass means the whole path works; if this passes but your host still shows
+nothing, the problem is the host registration, not the server.
 
 ## Development
 
@@ -223,8 +240,11 @@ resource-server layer would not touch any tool.
 ## Security notes
 
 - Read tools return fleet data (device names, notes, ticket text) that a third party can
-  influence, and that data enters the model's context. Treat it as untrusted input. The
-  read-only default is the mitigation; enable writes deliberately.
+  influence, and that data enters the model's context. Treat it as untrusted input — see
+  [Write policy](#write-policy) for what the server does about it and where `XYTE_MCP_READ_ONLY`
+  is the right call.
+- The API key sets the blast radius, and it is the one control the model cannot talk its way
+  around. Scope it to what the agent needs.
 - Prefer passing keys through your host's secret handling rather than committing them into a
   shared `.mcp.json`.
 

@@ -8,10 +8,12 @@ export type WriteDecision =
 /**
  * Decide whether a call may proceed.
  *
- * The caller here is a model, which may be acting on content it read from the
- * fleet (device names, ticket bodies, notes) and which a third party can
- * influence. So mutations are off unless an operator turned them on out of
- * band, and deletes need a deliberate, endpoint-specific acknowledgement on top.
+ * Mutations are permitted by default, so this is the layer that still holds when
+ * they are: a DELETE needs a deliberate, endpoint-specific acknowledgement,
+ * because the caller is a model that may be acting on fleet content a third
+ * party can influence (device names, ticket bodies, notes) and an irreversible
+ * call is the one that cannot be walked back. An operator who wants nothing
+ * mutating at all sets `XYTE_MCP_READ_ONLY=1`.
  */
 export function evaluateWritePolicy(
   endpoint: EndpointSpec,
@@ -27,7 +29,9 @@ export function evaluateWritePolicy(
         `Refusing to call ${endpoint.key}: it is a ${endpoint.method} (mutating) endpoint ` +
         'and this server is running read-only.',
       hints: [
-        `An operator must restart the server with ${ENV.allowWrites}=1 to enable writes.`,
+        `Read-only was requested explicitly (${ENV.readOnly}=1, or the legacy ` +
+          `${ENV.allowWrites}=0). Only an operator can lift it, by restarting the server ` +
+          'without it — do not ask for the same call again.',
         'Read-only endpoints remain available — use xyte_endpoints_list with readOnly: true.'
       ]
     };

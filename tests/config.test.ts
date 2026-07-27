@@ -50,20 +50,41 @@ describe('resolveConfig', () => {
     expect(config.baseUrls.hub).toBe('http://localhost:3001');
   });
 
-  it('defaults writes to off', () => {
-    expect(resolveConfig(withOrgKey).allowWrites).toBe(false);
+  it('defaults writes to on', () => {
+    expect(resolveConfig(withOrgKey).allowWrites).toBe(true);
   });
 
-  it.each(['1', 'true', 'TRUE', 'yes'])('enables writes for %s', (value) => {
-    expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(true);
+  it.each(['1', 'true', 'TRUE', 'yes'])('goes read-only for %s', (value) => {
+    expect(resolveConfig({ ...withOrgKey, [ENV.readOnly]: value }).allowWrites).toBe(false);
   });
 
   it.each(['0', 'false', 'no', '', 'maybe', 'on'])(
-    'leaves writes off for %s',
+    'keeps writes on when read-only is %s',
     (value) => {
-      expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(false);
+      expect(resolveConfig({ ...withOrgKey, [ENV.readOnly]: value }).allowWrites).toBe(true);
     }
   );
+
+  // 0.1.x was read-only by default and this was the only switch, so anyone who
+  // set it decided deliberately. Upgrading must not widen their posture.
+  describe('the legacy allow-writes variable', () => {
+    it.each(['0', 'false', 'no', '', 'maybe'])('still forces read-only for %s', (value) => {
+      expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(false);
+    });
+
+    it.each(['1', 'true', 'yes'])('still permits writes for %s', (value) => {
+      expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(true);
+    });
+
+    it('loses to an explicit read-only request', () => {
+      const config = resolveConfig({
+        ...withOrgKey,
+        [ENV.allowWrites]: '1',
+        [ENV.readOnly]: '1'
+      });
+      expect(config.allowWrites).toBe(false);
+    });
+  });
 
   it('defaults and validates the timeout', () => {
     expect(resolveConfig(withOrgKey).timeoutMs).toBe(15_000);

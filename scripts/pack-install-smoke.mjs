@@ -104,15 +104,18 @@ class StdioClient {
   stdoutLines = [];
   stderr = '';
 
-  constructor(entry, cwd) {
+  constructor(entry, cwd, extraEnv = {}) {
+    // Enough to satisfy config resolution; nothing here reaches the network.
+    const env = { ...process.env, XYTE_ORG_API_KEY: 'pack-install-smoke-placeholder-key' };
+    // Unset rather than blank: a *present* allow-writes variable, empty
+    // included, means "read-only" for back-compatibility, which would quietly
+    // invert the default-posture case below.
+    delete env.XYTE_MCP_READ_ONLY;
+    delete env.XYTE_MCP_ALLOW_WRITES;
+
     this.#child = spawn(process.execPath, [entry], {
       cwd,
-      env: {
-        ...process.env,
-        // Enough to satisfy config resolution; nothing here reaches the network.
-        XYTE_ORG_API_KEY: 'pack-install-smoke-placeholder-key',
-        XYTE_MCP_ALLOW_WRITES: '0'
-      },
+      env: { ...env, ...extraEnv },
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
@@ -182,6 +185,7 @@ async function main() {
   let tarballPath;
   let tempRoot;
   let client;
+  let readOnlyClient;
 
   try {
     step(1, total, 'Building');
@@ -247,6 +251,10 @@ async function main() {
       init.result?.serverInfo?.version === PKG.version,
       String(init.result?.serverInfo?.version)
     );
+    check(
+      'writes enabled by default',
+      String(init.result?.instructions ?? '').includes('ENABLED')
+    );
 
     const tools = await client.rpc(2, 'tools/list');
     const names = (tools.result?.tools ?? []).map((tool) => tool.name).sort();
@@ -259,20 +267,43 @@ async function main() {
       `${list.result?.structuredContent?.count} read endpoints`
     );
 
-    const blocked = await client.call(4, 'xyte_api_call', {
+    // Both guard checks refuse before a request is built, so neither touches the
+    // network — which is what lets this run with a placeholder key.
+    const unconfirmed = await client.call(4, 'xyte_api_call', {
+      key: 'organization.devices.deleteDevice',
+      path: { device_id: 'pack-install-smoke-never-real' }
+    });
+    check(
+      'delete refused without confirm',
+      unconfirmed.result?.isError === true &&
+        String(unconfirmed.result?.content?.[0]?.text).includes('confirmation')
+    );
+
+    readOnlyClient = new StdioClient(entry, tempRoot, { XYTE_MCP_READ_ONLY: '1' });
+    const readOnlyInit = await readOnlyClient.rpc(1, 'initialize', {
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: 'xyte-mcp-pack-install-smoke', version: '0' }
+    });
+    readOnlyClient.notify('notifications/initialized');
+    check(
+      'read-only mode is advertised',
+      String(readOnlyInit.result?.instructions ?? '').includes('READ-ONLY')
+    );
+    const blocked = await readOnlyClient.call(2, 'xyte_api_call', {
       key: 'organization.commands.sendCommand',
       path: { device_id: 'pack-install-smoke-never-real' },
       body: { name: 'reboot' }
     });
     check(
-      'write refused by default',
+      'read-only mode refuses a write',
       blocked.result?.isError === true &&
         String(blocked.result?.content?.[0]?.text).includes('read-only')
     );
 
     check(
       'stdout carried only JSON-RPC',
-      client.stdoutLines.every((line) => {
+      [...client.stdoutLines, ...readOnlyClient.stdoutLines].every((line) => {
         try {
           JSON.parse(line);
           return true;
@@ -283,6 +314,7 @@ async function main() {
     );
   } finally {
     client?.kill();
+    readOnlyClient?.kill();
     if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
     if (tarballPath) await unlink(tarballPath).catch(() => {});
   }

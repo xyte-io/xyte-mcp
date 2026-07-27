@@ -62,9 +62,17 @@ describe('xyte_endpoint_describe', () => {
     expect(result.content[0]?.text).toContain('organization.devices.');
   });
 
-  it('says writes are disabled for a mutating endpoint when they are', async () => {
+  it('says a mutating endpoint will be refused when read-only', async () => {
+    const result = await endpointDescribeTool.handler(
+      { key: WRITE_KEY },
+      testContext({ allowWrites: false })
+    );
+    expect(result.content[0]?.text).toContain('running read-only');
+  });
+
+  it('says writes are enabled for a mutating endpoint under the default posture', async () => {
     const result = await endpointDescribeTool.handler({ key: WRITE_KEY }, testContext());
-    expect(result.content[0]?.text).toContain('Writes are currently disabled');
+    expect(result.content[0]?.text).toContain('Writes are enabled');
   });
 
   it('tells the caller to pass confirm for a DELETE when writes are on', async () => {
@@ -92,11 +100,11 @@ describe('xyte_api_call', () => {
     expect(structured.data).toEqual({ devices: [{ id: 'd1' }] });
   });
 
-  it('refuses a mutating endpoint when writes are off, without calling out', async () => {
+  it('refuses a mutating endpoint in read-only mode, without calling out', async () => {
     const http = stubHttp(() => ({ data: {} }));
     const result = await apiCallTool.handler(
       { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
-      testContext({ http })
+      testContext({ http, allowWrites: false })
     );
 
     expect(result.isError).toBe(true);
@@ -104,11 +112,11 @@ describe('xyte_api_call', () => {
     expect(http.calls).toHaveLength(0);
   });
 
-  it('performs the mutating call once writes are enabled', async () => {
+  it('performs the mutating call under the default write posture', async () => {
     const http = stubHttp(() => ({ status: 201, data: { id: 'cmd1' } }));
     const result = await apiCallTool.handler(
       { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
-      testContext({ http, allowWrites: true })
+      testContext({ http })
     );
 
     expect(result.isError).toBeUndefined();

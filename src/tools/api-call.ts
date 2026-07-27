@@ -41,8 +41,8 @@ export const apiCallTool = defineTool({
   title: 'Call a Xyte API endpoint',
   description:
     'Invoke a Xyte platform API endpoint by key. Use xyte_endpoint_describe first if ' +
-    'you are unsure of the parameters. Mutating endpoints are rejected unless the ' +
-    'server was started with writes enabled; DELETE additionally requires confirm.',
+    'you are unsure of the parameters. Mutating endpoints run unless the server was ' +
+    'started read-only; DELETE additionally requires confirm.',
   inputSchema,
   outputSchema,
   annotations: (context) => ({

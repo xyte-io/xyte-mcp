@@ -1,0 +1,60 @@
+{
+  "name": "@xyteai/mcp",
+  "version": "0.1.0",
+  "description": "MCP server for the Xyte platform API",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xyte-io/xyte-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/xyte-io/xyte-mcp/issues"
+  },
+  "homepage": "https://github.com/xyte-io/xyte-mcp#readme",
+  "keywords": [
+    "xyte",
+    "mcp",
+    "model-context-protocol",
+    "agent"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "xyte-mcp": "dist/index.js"
+  },
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && vitest run",
+    "test:unit": "vitest run",
+    "lint": "eslint src tests scripts",
+    "catalog:generate": "node scripts/generate-catalog.mjs",
+    "smoke:live": "npm run build && node scripts/live-smoke.mjs",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.10.2",
+    "@usebruno/lang": "^0.38.0",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^4.1.4"
+  }
+}

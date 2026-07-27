@@ -1,0 +1,1439 @@
+{
+  "catalogVersion": 1,
+  "generatedFrom": "hub:docs/api/Xyte Public/Xyte Platform API - Documentation",
+  "endpoints": [
+    {
+      "key": "organization.assets.createAsset",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "createAsset",
+      "title": "Create Asset",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Asset name\",\n  \"serial_number\": \"SN-000123\",\n  \"space_id\": 100,\n  \"purchased_at\": \"2024-01-15T00:00:00Z\",\n  \"comments\": \"Optional free text\",\n  \"icon_name\": \"projector\",\n  \"manufacturer\": \"Sony\",\n  \"device_model\": { \"id\": \"entity-label-uuid\" },\n  \"device_type\": { \"id\": \"entity-label-uuid\" },\n  \"status\": { \"id\": \"entity-label-uuid\" }\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Assets/Create Asset.bru"
+    },
+    {
+      "key": "organization.assets.deleteAsset",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "deleteAsset",
+      "title": "Delete Asset",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets/:asset_id",
+      "pathParams": [
+        "asset_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Assets/Delete Asset.bru"
+    },
+    {
+      "key": "organization.assets.getAsset",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "getAsset",
+      "title": "Get Asset",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets/:asset_id",
+      "pathParams": [
+        "asset_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Assets/Get Asset.bru"
+    },
+    {
+      "key": "organization.assets.getAssetLabels",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "getAssetLabels",
+      "title": "Get Asset Labels",
+      "description": "Lists the organization's asset entity labels for a category. `:category` is one of\n`manufacturer`, `device_model`, `device_type`, `status`. Returns `{ items: [{ id, name }] }`.\n\nOn Create/Update Asset, each of these label fields accepts either the returned `{ \"id\": ... }`\nor a plain name string (e.g. `\"manufacturer\": \"Sony\"`) — a name is resolved to an existing\nlabel or a new one is created for the organization.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets/labels/:category",
+      "pathParams": [
+        "category"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Assets/Get Asset Labels.bru"
+    },
+    {
+      "key": "organization.assets.getAssets",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "getAssets",
+      "title": "Get Assets",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "name",
+        "serial_number",
+        "space_id"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Assets/Get Assets.bru"
+    },
+    {
+      "key": "organization.assets.updateAsset",
+      "namespace": "organization",
+      "group": "assets",
+      "action": "updateAsset",
+      "title": "Update Asset",
+      "method": "PUT",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/assets/:asset_id",
+      "pathParams": [
+        "asset_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Asset name\",\n  \"serial_number\": \"SN-000123\",\n  \"space_id\": 100,\n  \"purchased_at\": \"2024-01-15T00:00:00Z\",\n  \"comments\": \"Optional free text\",\n  \"icon_name\": \"projector\",\n  \"manufacturer\": \"Sony\",\n  \"device_model\": { \"id\": \"entity-label-uuid\" },\n  \"device_type\": { \"id\": \"entity-label-uuid\" },\n  \"status\": { \"id\": \"entity-label-uuid\" }\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Assets/Update Asset.bru"
+    },
+    {
+      "key": "organization.commands.cancelCommand",
+      "namespace": "organization",
+      "group": "commands",
+      "action": "cancelCommand",
+      "title": "Cancel Command",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/commands/:command_id",
+      "pathParams": [
+        "device_id",
+        "command_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"reboot\",\n  \"friendly_name\": \"Reboot\",\n  \"file_id\": \"optional\",\n  \"extra_params\": {}\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Commands/Cancel Command.bru"
+    },
+    {
+      "key": "organization.commands.getCommands",
+      "namespace": "organization",
+      "group": "commands",
+      "action": "getCommands",
+      "title": "Get Commands",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/commands",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Commands/Get Commands.bru"
+    },
+    {
+      "key": "organization.commands.sendCommand",
+      "namespace": "organization",
+      "group": "commands",
+      "action": "sendCommand",
+      "title": "Send Command",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/commands",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"reboot\",\n  \"friendly_name\": \"Reboot\",\n  \"file_id\": \"optional\",\n  \"extra_params\": {}\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Commands/Send Command.bru"
+    },
+    {
+      "key": "organization.devices.claimDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "claimDevice",
+      "title": "Claim Device",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/claim",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"name\": \"Friendly device name\",\n    \"space_id\": 13244,\n    \"mac\": null,\n    \"sn\": null,\n    \"cloud_id\": \"\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Claim Device.bru"
+    },
+    {
+      "key": "organization.devices.deleteDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "deleteDevice",
+      "title": "Delete Device",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Delete Device.bru"
+    },
+    {
+      "key": "organization.devices.getDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "getDevice",
+      "title": "Get Device",
+      "description": "## Success\n**200 OK** — a single device object.\n```json\n{\n  \"id\": \"1ad4e4e4-99b4-...\",\n  \"name\": \"DSP-X200\",\n  \"sn\": \"5pOLfS-...\",\n  \"mac\": null,\n  \"cloud_id\": \"...\",\n  \"status\": \"online\",\n  \"effective_status\": \"ok\",\n  \"merged_effective_status\": \"ok\",\n  \"last_seen_at\": \"2024-07-29T10:18:39.267Z\",\n  \"details\": null,\n  \"state\": {},\n  \"model\": { \"id\": \"...\", \"name\": \"DSP-X200\", \"sub_model\": null },\n  \"firmware\": { \"version\": \"1.0.0\" },\n  \"space\": { \"id\": 16138, \"full_path\": \"Green Energy Corp/United Kingdom/London/Executive Suite\" }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the primary/standalone device. Mirrors `effective_status` for unmerged devices.\n\n## Custom parameters (edge devices only)\nFor edge devices, the response includes a `custom_parameters` object — the device's current custom parameter values keyed by the field's human-readable label. This mirrors the `custom_parameters` object accepted by **Update Device**, so the object round-trips: read it, edit it, send it back. The field is omitted entirely for non-edge devices.\n\n- **Password-type** parameters are never echoed back: a set password is masked as `\"*****\"`, and an unset password is returned as an empty string `\"\"`.\n- Non-password parameters with **no value set** are returned as `null`.\n\n```json\n{\n  \"custom_parameters\": {\n    \"SNMP community\": \"public\",\n    \"Port\": \"161\",\n    \"Password\": \"*****\"\n  }\n}\n```",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Devices/Get Device.bru"
+    },
+    {
+      "key": "organization.devices.getDevices",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "getDevices",
+      "title": "Get Devices",
+      "description": "## Query parameters\n- `page` — page number (default `1`).\n- `per_page` — results per page (default `100`, **max `100`**). Values above `100` are rejected with `422 Unprocessable Entity`.\n- `space_id` — optional, filter to a single space.\n\n## Success\n**200 OK** — paginated list of devices.\n```json\n{\n  \"items\": [\n    {\n      \"id\": \"c66308c8-1d12-...\",\n      \"name\": \"Digital Media Player 2\",\n      \"sn\": \"Q3RzbMS8-...\",\n      \"mac\": null,\n      \"cloud_id\": \"...\",\n      \"status\": \"online\",\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2024-07-24T07:22:20.037Z\",\n      \"details\": null,\n      \"model\": { \"id\": \"...\", \"name\": \"Digital Media Player\", \"sub_model\": null },\n      \"firmware\": { \"version\": \"1.0.0\" },\n      \"space\": { \"id\": 17517, \"full_path\": \"Green Energy Corp/France/Paris Demo Conference Room\" }\n    }\n  ],\n  \"has_next_page\": true\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the primary/standalone device. Mirrors `effective_status` for unmerged devices.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "space_id"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Devices/Get Devices.bru"
+    },
+    {
+      "key": "organization.devices.getHistories",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "getHistories",
+      "title": "Get Histories",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/histories",
+      "pathParams": [],
+      "queryParams": [
+        "status",
+        "from",
+        "to",
+        "device_id",
+        "space_id",
+        "name"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Devices/Get Histories.bru"
+    },
+    {
+      "key": "organization.devices.mergeDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "mergeDevice",
+      "title": "Merge Device",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/merge",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"with_device_ids\": [\"<shadow_device_id>\"]\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Merge Device.bru"
+    },
+    {
+      "key": "organization.devices.moveDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "moveDevice",
+      "title": "Move Device",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/move",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"space_id\": 10000\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Move Device.bru"
+    },
+    {
+      "key": "organization.devices.resumeIncidents",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "resumeIncidents",
+      "title": "Resume Incidents",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/resume_incidents",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Resume Incidents.bru"
+    },
+    {
+      "key": "organization.devices.splitDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "splitDevice",
+      "title": "Split Device",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/split",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"shadow_device_id\": \"<shadow_device_id>\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Split Device.bru"
+    },
+    {
+      "key": "organization.devices.suspendIncidents",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "suspendIncidents",
+      "title": "Suspend Incidents",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/suspend_incidents",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Suspend Incidents.bru"
+    },
+    {
+      "key": "organization.devices.updateDevice",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "updateDevice",
+      "title": "Update Device",
+      "method": "PATCH",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"configuration\": {\n        \"a\": 1\n    },\n    \"custom_parameters\": {\n        \"SNMP community\": \"public\",\n        \"Port\": \"161\"\n    },\n    \"name\": \"My Device\",\n    \"device_host_address\": \"192.168.1.100\",\n    \"sub_model\": \"model-v2\",\n    \"sn\": \"SN-12345\",\n    \"mac\": \"00:11:22:33:44:55\",\n    \"custom_model_name\": \"My Custom Model\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Devices/Update Device.bru"
+    },
+    {
+      "key": "organization.edges.devices.getClaimStatus",
+      "namespace": "organization",
+      "group": "edges.devices",
+      "action": "getClaimStatus",
+      "title": "Get Claim Status",
+      "description": "## Success\n**200 OK**\n```json\n{\n    \"result\": \"success\"\n}\n```\nPossible `result` values depend on the claim state returned by Zabbix.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**422 Unprocessable Entity** — `device_ip` not found or claim not initiated.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges/devices/get_claim_status",
+      "pathParams": [],
+      "queryParams": [
+        "proxy_id",
+        "device_ip"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Edges/Devices/Get Claim Status.bru"
+    },
+    {
+      "key": "organization.edges.devices.getPingStatus",
+      "namespace": "organization",
+      "group": "edges.devices",
+      "action": "getPingStatus",
+      "title": "Get Ping Status",
+      "description": "## Success\n**200 OK**\n```json\n{\n    \"status\": \"online\"\n}\n```\nPossible `status` values depend on the ping result returned by Zabbix.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**422 Unprocessable Entity** — `device_ip` not found or ping not initiated.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges/devices/get_ping_status",
+      "pathParams": [],
+      "queryParams": [
+        "proxy_id",
+        "device_ip"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Edges/Devices/Get Ping Status.bru"
+    },
+    {
+      "key": "organization.edges.devices.startClaim",
+      "namespace": "organization",
+      "group": "edges.devices",
+      "action": "startClaim",
+      "title": "Start Claim",
+      "description": "## Success\n**204 No Content** — Claim process started successfully. No response body.\n\n## Optional fields\n- `mac` — MAC address of the device. Accepted in any common format (e.g. `aa:bb:cc:dd:ee:ff`, `AA-BB-CC-DD-EE-FF`, `aabbccddeeff`); it is normalized to `aa:bb:cc:dd:ee:ff` before being stored.\n- `sn` — Serial number to assign to the device. When omitted, the device's serial defaults to its generated UUID.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**422 Unprocessable Entity** — Invalid parameters (e.g. unknown `device_model_id`, unreachable `device_ip`, malformed `mac`).",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges/devices/start_claim",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"proxy_id\": \"\",\n    \"device_model_id\": \"\",\n    \"space_id\": null,\n    \"device_ip\": \"\",\n    \"display_name\": \"\",\n    \"custom_parameters\": {},\n    \"custom_partner_name\": null,\n    \"custom_model_name\": null,\n    \"mac\": null,\n    \"sn\": null,\n    \"skip_connectivity_check\": false\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Edges/Devices/Start Claim.bru"
+    },
+    {
+      "key": "organization.edges.devices.startPing",
+      "namespace": "organization",
+      "group": "edges.devices",
+      "action": "startPing",
+      "title": "Start Ping",
+      "description": "## Success\n**204 No Content** — Ping process started successfully. No response body.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**422 Unprocessable Entity** — Invalid `device_ip` or unreachable proxy.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges/devices/start_ping",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"proxy_id\": \"\",\n    \"device_ip\": \"\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Edges/Devices/Start Ping.bru"
+    },
+    {
+      "key": "organization.edges.devices.updateHostname",
+      "namespace": "organization",
+      "group": "edges.devices",
+      "action": "updateHostname",
+      "title": "Update Hostname",
+      "description": "Updates the IP address or hostname an edge device is reachable on. The new address is synced to the monitoring server and stored on the device. The device's custom parameter values are preserved.\n\nUnless `skip_connectivity_check` is `true`, a successful connectivity check for the new address must be performed first (see Start Ping / Get Ping Status).\n\n## Success\n**200 OK** — `{ \"success\": true }`\n\n## Errors\n**400 Bad Request** — Missing `device_ip`, or the new address has not passed a connectivity check.\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**404 Not Found** — Device not found in the organization.\n**422 Unprocessable Entity** — Malformed `device_ip` (must contain only letters, digits, dots, and hyphens).",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges/devices/:device_id/update_hostname",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"device_ip\": \"\",\n    \"skip_connectivity_check\": false\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Edges/Devices/Update Hostname.bru"
+    },
+    {
+      "key": "organization.edges.getEdges",
+      "namespace": "organization",
+      "group": "edges",
+      "action": "getEdges",
+      "title": "Get Edges",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/edges",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Edges/Get Edges.bru"
+    },
+    {
+      "key": "organization.getOrganizationInfo",
+      "namespace": "organization",
+      "group": "",
+      "action": "getOrganizationInfo",
+      "title": "Get Organization Info",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/info",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n   \"device_id\": \"xxxxx\"\n}",
+      "mutating": false,
+      "sourceFile": "Organization API/Get Organization Info.bru"
+    },
+    {
+      "key": "organization.groups.addExternalUserToGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "addExternalUserToGroup",
+      "title": "Add External User to Group",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id/add_external_user",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"email\": \"external.user@example.com\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Add External User to Group.bru"
+    },
+    {
+      "key": "organization.groups.addUsersToGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "addUsersToGroup",
+      "title": "Add Users to Group",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id/add_users",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"user_ids\": [\"<user-id>\"]\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Add Users to Group.bru"
+    },
+    {
+      "key": "organization.groups.createGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "createGroup",
+      "title": "Create Group",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"My Group\",\n  \"user_ids\": [\"<user-id>\"]\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Create Group.bru"
+    },
+    {
+      "key": "organization.groups.deleteGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "deleteGroup",
+      "title": "Delete Group",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Delete Group.bru"
+    },
+    {
+      "key": "organization.groups.getGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "getGroup",
+      "title": "Get Group",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Groups/Get Group.bru"
+    },
+    {
+      "key": "organization.groups.getGroups",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "getGroups",
+      "title": "Get Groups",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Groups/Get Groups.bru"
+    },
+    {
+      "key": "organization.groups.removeUsersFromGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "removeUsersFromGroup",
+      "title": "Remove Users from Group",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id/remove_users",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"user_ids\": [\"<user-id>\"]\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Remove Users from Group.bru"
+    },
+    {
+      "key": "organization.groups.updateGroup",
+      "namespace": "organization",
+      "group": "groups",
+      "action": "updateGroup",
+      "title": "Update Group",
+      "method": "PUT",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/groups/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Updated Group Name\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Groups/Update Group.bru"
+    },
+    {
+      "key": "organization.incidents.deleteIncident",
+      "namespace": "organization",
+      "group": "incidents",
+      "action": "deleteIncident",
+      "title": "Delete Incident",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Incidents/Delete Incident.bru"
+    },
+    {
+      "key": "organization.incidents.getIncidents",
+      "namespace": "organization",
+      "group": "incidents",
+      "action": "getIncidents",
+      "title": "Get Incidents",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Incidents/Get Incidents.bru"
+    },
+    {
+      "key": "organization.models.getModel",
+      "namespace": "organization",
+      "group": "models",
+      "action": "getModel",
+      "title": "Get Model",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/models/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Models/Get Model.bru"
+    },
+    {
+      "key": "organization.models.getModels",
+      "namespace": "organization",
+      "group": "models",
+      "action": "getModels",
+      "title": "Get Models",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/models",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "search",
+        "edge_only"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Models/Get Models.bru"
+    },
+    {
+      "key": "organization.notes.createDeviceNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "createDeviceNote",
+      "title": "Create Device Note",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/notes",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"content\": \"Replaced PSU on 2026-06-01. Next maintenance due in 12 months.\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Create Device Note.bru"
+    },
+    {
+      "key": "organization.notes.createSpaceNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "createSpaceNote",
+      "title": "Create Space Note",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id/notes",
+      "pathParams": [
+        "space_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"content\": \"Room rewired 2026-06-01. Patch panel map is on the inside of the rack door.\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Create Space Note.bru"
+    },
+    {
+      "key": "organization.notes.deleteDeviceNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "deleteDeviceNote",
+      "title": "Delete Device Note",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/notes/:id",
+      "pathParams": [
+        "device_id",
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Delete Device Note.bru"
+    },
+    {
+      "key": "organization.notes.deleteSpaceNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "deleteSpaceNote",
+      "title": "Delete Space Note",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id/notes/:id",
+      "pathParams": [
+        "space_id",
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Delete Space Note.bru"
+    },
+    {
+      "key": "organization.notes.getAllDeviceNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getAllDeviceNotes",
+      "title": "Get All Device Notes",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/notes",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get All Device Notes.bru"
+    },
+    {
+      "key": "organization.notes.getAllSpaceNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getAllSpaceNotes",
+      "title": "Get All Space Notes",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/notes",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get All Space Notes.bru"
+    },
+    {
+      "key": "organization.notes.getDeviceNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getDeviceNotes",
+      "title": "Get Device Notes",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/notes",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get Device Notes.bru"
+    },
+    {
+      "key": "organization.notes.getSpaceNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getSpaceNotes",
+      "title": "Get Space Notes",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id/notes",
+      "pathParams": [
+        "space_id"
+      ],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get Space Notes.bru"
+    },
+    {
+      "key": "organization.spaces.createSpace",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "createSpace",
+      "title": "Create Space",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Space name\",\n  \"parent_id\": 100,\n  \"config\": {\n    \"img\": \"https://example.com/space.png\",\n    \"inherit_img\": true,\n    \"location\": {\n      \"location\": {\"lat\": 51.5223258, \"lng\": -0.0834298},\n      \"utc_offset\": 0,\n      \"description\": \"London, UK\",\n      \"region_name\": \"Europe/London\"\n    },\n    \"inherit_location\": true,\n    \"temperature_units\": \"celsius\",\n    \"inherit_temperature_units\": true,\n    \"notification_delay\": 30,\n    \"inherit_notification_delay\": true,\n    \"priority_factor\": 0\n  }\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Spaces/Create Space.bru"
+    },
+    {
+      "key": "organization.spaces.deleteSpace",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "deleteSpace",
+      "title": "Delete Space",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id",
+      "pathParams": [
+        "space_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Spaces/Delete Space.bru"
+    },
+    {
+      "key": "organization.spaces.findOrCreateSpace",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "findOrCreateSpace",
+      "title": "Find or Create Space",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/find_or_create",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Building/Floor/Room\",\n  \"parent_id\": 100,\n  \"config\": {}\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Spaces/Find or Create Space.bru"
+    },
+    {
+      "key": "organization.spaces.getSpace",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "getSpace",
+      "title": "Get Space",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id",
+      "pathParams": [
+        "space_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Spaces/Get Space.bru"
+    },
+    {
+      "key": "organization.spaces.getSpaces",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "getSpaces",
+      "title": "Get Spaces",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "id",
+        "parent_id",
+        "name",
+        "path_includes",
+        "space_type",
+        "created_before",
+        "created_after"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Spaces/Get Spaces.bru"
+    },
+    {
+      "key": "organization.spaces.updateSpace",
+      "namespace": "organization",
+      "group": "spaces",
+      "action": "updateSpace",
+      "title": "Update Space",
+      "method": "PUT",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/spaces/:space_id",
+      "pathParams": [
+        "space_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Space name\",\n  \"parent_id\": 100,\n  \"config\": {\n    \"img\": \"https://example.com/space.png\",\n    \"inherit_img\": true,\n    \"location\": {\n      \"location\": {\"lat\": 51.5223258, \"lng\": -0.0834298},\n      \"utc_offset\": 0,\n      \"description\": \"London, UK\",\n      \"region_name\": \"Europe/London\"\n    },\n    \"inherit_location\": true,\n    \"temperature_units\": \"celsius\",\n    \"inherit_temperature_units\": true,\n    \"notification_delay\": 30,\n    \"inherit_notification_delay\": true,\n    \"priority_factor\": 0\n  }\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Spaces/Update Space.bru"
+    },
+    {
+      "key": "organization.tickets.getTicket",
+      "namespace": "organization",
+      "group": "tickets",
+      "action": "getTicket",
+      "title": "Get Ticket",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/tickets/:ticket_id",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Tickets/Get Ticket.bru"
+    },
+    {
+      "key": "organization.tickets.getTickets",
+      "namespace": "organization",
+      "group": "tickets",
+      "action": "getTickets",
+      "title": "Get Tickets",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/tickets",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Tickets/Get Tickets.bru"
+    },
+    {
+      "key": "organization.tickets.markResolved",
+      "namespace": "organization",
+      "group": "tickets",
+      "action": "markResolved",
+      "title": "Mark Resolved",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/tickets/:ticket_id/resolved",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Tickets/Mark Resolved.bru"
+    },
+    {
+      "key": "organization.tickets.sendMessage",
+      "namespace": "organization",
+      "group": "tickets",
+      "action": "sendMessage",
+      "title": "Send Message",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/tickets/:ticket_id/message",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"message\": \"Hello!\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Tickets/Send Message.bru"
+    },
+    {
+      "key": "organization.tickets.updateTicket",
+      "namespace": "organization",
+      "group": "tickets",
+      "action": "updateTicket",
+      "title": "Update Ticket",
+      "method": "PUT",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/tickets/:ticket_id",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"title\": \"New title\",\n    \"description\": \"New description\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Tickets/Update Ticket.bru"
+    },
+    {
+      "key": "organization.users.createUser",
+      "namespace": "organization",
+      "group": "users",
+      "action": "createUser",
+      "title": "Create User",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/users",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"email\": \"user@example.com\",\n  \"name\": \"Jane Doe\",\n  \"group_ids\": [\"<group-id>\"]\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Users/Create User.bru"
+    },
+    {
+      "key": "organization.users.deactivateUser",
+      "namespace": "organization",
+      "group": "users",
+      "action": "deactivateUser",
+      "title": "Deactivate User",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/users/:id/deactivate",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Users/Deactivate User.bru"
+    },
+    {
+      "key": "organization.users.getUser",
+      "namespace": "organization",
+      "group": "users",
+      "action": "getUser",
+      "title": "Get User",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/users/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Users/Get User.bru"
+    },
+    {
+      "key": "organization.users.getUsers",
+      "namespace": "organization",
+      "group": "users",
+      "action": "getUsers",
+      "title": "Get Users",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/users",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Users/Get Users.bru"
+    },
+    {
+      "key": "organization.users.resendWelcomeEmail",
+      "namespace": "organization",
+      "group": "users",
+      "action": "resendWelcomeEmail",
+      "title": "Resend Welcome Email",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/users/:id/resend_welcome",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Users/Resend Welcome Email.bru"
+    },
+    {
+      "key": "partner.devices.deleteDevice",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "deleteDevice",
+      "title": "Delete Device",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Devices/Delete Device.bru"
+    },
+    {
+      "key": "partner.devices.getCommands",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getCommands",
+      "title": "Get Commands",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id/commands",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get Commands.bru"
+    },
+    {
+      "key": "partner.devices.getConfiguration",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getConfiguration",
+      "title": "Get Configuration",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id/config",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get Configuration.bru"
+    },
+    {
+      "key": "partner.devices.getDeviceInfo",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getDeviceInfo",
+      "title": "Get Device Info",
+      "description": "## Success\n**200 OK** — the requested device.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ]\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the primary/standalone device. Mirrors `effective_status` for unmerged devices.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get Device Info.bru"
+    },
+    {
+      "key": "partner.devices.getDevices",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getDevices",
+      "title": "Get Devices",
+      "description": "## Success\n**200 OK** — paginated list of the partner's devices.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 32 }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the primary/standalone device. Mirrors `effective_status` for unmerged devices.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get Devices.bru"
+    },
+    {
+      "key": "partner.devices.getStateHistory",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getStateHistory",
+      "title": "Get State History",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id/history",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get State History.bru"
+    },
+    {
+      "key": "partner.devices.getStateHistoryMultiDevices",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getStateHistoryMultiDevices",
+      "title": "Get State History (multi-devices)",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/histories",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get State History (multi-devices).bru"
+    },
+    {
+      "key": "partner.devices.getTelemetries",
+      "namespace": "partner",
+      "group": "devices",
+      "action": "getTelemetries",
+      "title": "Get Telemetries",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/devices/:device_id/telemetries",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Devices/Get Telemetries.bru"
+    },
+    {
+      "key": "partner.organizations.createOrganization",
+      "namespace": "partner",
+      "group": "organizations",
+      "action": "createOrganization",
+      "title": "Create Organization",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Acme Corp\",\n  \"admin_contact_email\": \"admin@acme.com\",\n  \"admin_contact_name\": \"Alice Smith\",\n  \"finance_contact_email\": \"finance@acme.com\",\n  \"finance_contact_name\": \"Bob Jones\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Organizations/Create Organization.bru"
+    },
+    {
+      "key": "partner.tickets.addComment",
+      "namespace": "partner",
+      "group": "tickets",
+      "action": "addComment",
+      "title": "Add Comment",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/tickets/:ticket_id/message",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"message\": \"New chat message\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Tickets/Add Comment.bru"
+    },
+    {
+      "key": "partner.tickets.closeTicket",
+      "namespace": "partner",
+      "group": "tickets",
+      "action": "closeTicket",
+      "title": "Close Ticket",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/tickets/:ticket_id/resolved",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Tickets/Close Ticket.bru"
+    },
+    {
+      "key": "partner.tickets.getTicket",
+      "namespace": "partner",
+      "group": "tickets",
+      "action": "getTicket",
+      "title": "Get Ticket",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/tickets/:ticket_id",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Tickets/Get Ticket.bru"
+    },
+    {
+      "key": "partner.tickets.getTickets",
+      "namespace": "partner",
+      "group": "tickets",
+      "action": "getTickets",
+      "title": "Get Tickets",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/tickets",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Tickets/Get Tickets.bru"
+    },
+    {
+      "key": "partner.tickets.updateTicket",
+      "namespace": "partner",
+      "group": "tickets",
+      "action": "updateTicket",
+      "title": "Update Ticket",
+      "method": "PUT",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/tickets/:ticket_id",
+      "pathParams": [
+        "ticket_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n    \"title\": \"New Title\",\n    \"description\": \"New Description\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Tickets/Update Ticket.bru"
+    }
+  ]
+}

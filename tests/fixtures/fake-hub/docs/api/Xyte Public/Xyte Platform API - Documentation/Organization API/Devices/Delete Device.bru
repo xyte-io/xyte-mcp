@@ -1,0 +1,15 @@
+meta {
+  name: Delete Device
+  type: http
+  seq: 4
+}
+
+delete {
+  url: {{hub_url}}/core/v1/organization/devices/{{device_id}}
+  body: none
+  auth: none
+}
+
+headers {
+  Authorization: {{org_api}}
+}

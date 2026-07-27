@@ -1,0 +1,25 @@
+meta {
+  name: Get Devices
+  type: http
+  seq: 1
+}
+
+get {
+  url: https://hub.xyte.io/core/v1/organization/devices
+  body: none
+  auth: none
+}
+
+params:query {
+  ~page:
+  ~per_page:
+  ~name:
+}
+
+headers {
+  Authorization: {{org_api}}
+}
+
+docs {
+  Returns every device in the organization.
+}

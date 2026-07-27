@@ -1,0 +1,26 @@
+meta {
+  name: Send Command
+  type: http
+  seq: 2
+}
+
+post {
+  url: https://hub.xyte.io/core/v1/organization/devices/:device_id/commands
+  body: json
+  auth: none
+}
+
+params:path {
+  device_id:
+}
+
+headers {
+  Authorization: {{org_api}}
+}
+
+body:json {
+  {
+    "name": "reboot",
+    "extra_params": {}
+  }
+}

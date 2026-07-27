@@ -1,0 +1,130 @@
+name: Publish
+
+# Releases are cut by pushing a semver tag. Everything below runs against the
+# tag itself, never a branch, so what gets published is exactly what was tagged.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. 0.1.0 or v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # npm provenance
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          TAG="${TAG#refs/tags/}"
+          VERSION="${TAG#v}"
+
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' is not a valid semver tag."
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+  # Installs the packed tarball into a scratch project and drives the installed
+  # binary — the `npx -y @xyteai/mcp` path, on every OS a host may run on.
+  packaged-install-smoke:
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ needs.meta.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      - name: Secretless packaged install smoke
+        run: npm run smoke:pack-install
+
+  publish:
+    needs: [meta, packaged-install-smoke]
+    runs-on: ubuntu-latest
+    # The npm token lives on this environment, not on the repo, so it is not
+    # readable from a workflow run on an arbitrary branch.
+    environment: ci
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ needs.meta.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      # The check that stops a mistagged release: the tag is what users will
+      # ask npm for, package.json is what npm records.
+      - name: Validate package version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          TAG_VERSION="${{ needs.meta.outputs.version }}"
+          if [[ "${PACKAGE_VERSION}" != "${TAG_VERSION}" ]]; then
+            echo "::error::package.json version (${PACKAGE_VERSION}) does not match tag (${TAG_VERSION})."
+            exit 1
+          fi
+
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      # After the build: the protocol test spawns the real server from dist/.
+      - run: npx vitest run
+
+      # Same gate as CI: only what ships. A devDependency advisory must not
+      # block a release of unaffected shipped code.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Publish to npm
+        run: npm publish --access public --tag latest --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

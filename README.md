@@ -1,10 +1,23 @@
 # xyte-mcp
 
-An [MCP](https://modelcontextprotocol.io) server for the Xyte platform API. It gives an AI
-agent typed, validated access to the public Xyte REST API — endpoint discovery plus a
-generic call tool — over a local stdio transport.
+An [MCP](https://modelcontextprotocol.io) server for the [Xyte](https://www.xyte.io) platform
+API. It gives an AI agent typed, validated access to the public Xyte REST API — endpoint
+discovery plus a generic call tool — over a local stdio transport.
 
-Read-only by default.
+**Read-only by default.**
+
+Xyte is a device management platform: connected device fleets, the spaces they live in,
+their telemetry and incidents, service tickets, commands, models and warranties. This server
+puts that API in front of an agent as three tools instead of 77 hand-written ones — it can
+discover the right endpoint, read its exact contract, and call it with arguments validated
+against that contract before a request goes out.
+
+Useful for asking an agent to investigate a fleet ("which devices in the Tel Aviv office
+went offline this week, and what do their open tickets say"), to script routine operations,
+or to work against the Xyte API without you writing the client.
+
+It runs locally as a subprocess of your MCP host and talks to `hub.xyte.io` directly — there
+is nothing to deploy and no third party in the path.
 
 ## Install
 
@@ -25,6 +38,30 @@ Or configure a host directly:
 
 Requires Node.js 22 or newer.
 
+MCP servers are loaded when a session starts, so restart your host — or open a new session —
+after adding it.
+
+## Getting an API key
+
+Create one in the Xyte portal under **Settings → API Keys**; see
+[Core API Keys](https://docs.xyte.io/reference/core-api-keys) for the walkthrough. An
+organization key acts as that organization, a partner key as the partner — set whichever
+scopes you need, or both.
+
+The key is all the tenancy there is: it is bound to its tenant server-side, so there is no
+tenant or URL to configure.
+
+## Documentation
+
+| | |
+| --- | --- |
+| [docs.xyte.io](https://docs.xyte.io) | Platform documentation — concepts, portal guides, how the pieces fit together. |
+| [API reference](https://docs.xyte.io/reference) | The REST API this server wraps: authentication, pagination, every endpoint. |
+| [llms.txt](https://docs.xyte.io/llms.txt) | The whole documentation set as Markdown, plus the endpoints as OpenAPI — written for agents. Worth pointing your agent at alongside this server. |
+| [github.com/xyte-io/xyte-mcp](https://github.com/xyte-io/xyte-mcp) | This server's source, issues and releases. |
+
+Everything below is about running the server itself.
+
 ## Configuration
 
 | Variable | Purpose |
@@ -36,8 +73,7 @@ Requires Node.js 22 or newer.
 | `XYTE_ENTRY_URL` | Override the entry base URL. |
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
 
-There is no tenant setting: a Xyte API key is already bound to its tenant server-side.
-The key you supply determines which organization or partner you are acting as.
+The last three are escape hatches for non-production hubs; the defaults are what you want.
 
 ## Tools
 
@@ -76,8 +112,8 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 `src/catalog/endpoints.generated.json` holds 77 endpoints (63 organization, 14 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
-upstream source the public API reference is built from, and committed so this repo has no
-dependency on a hub checkout at runtime.
+upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
+committed so this repo has no dependency on a hub checkout at runtime.
 
 Device API endpoints are deliberately excluded: they authenticate as a device with a device
 access token, not as an operator.

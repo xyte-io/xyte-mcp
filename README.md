@@ -132,6 +132,45 @@ Two invariants are enforced by lint rather than convention, because both erode s
 
 That second rule is what keeps the door open for a remote transport (see below).
 
+## Releasing
+
+A release is a pushed semver tag. `.github/workflows/publish.yml` then packs the tarball,
+installs and runs it on Linux, macOS and Windows, re-checks the gates, and publishes to npm
+with provenance. The npm token lives on the repo's `ci` GitHub environment, so it is not
+reachable from a run on an arbitrary branch.
+
+Checklist, from `main` with a clean tree:
+
+```bash
+# 1. Refresh the endpoint catalog. CI cannot do this — it has no hub checkout —
+#    so a stale catalog is the one release defect nothing else will catch.
+npm run catalog:generate -- --hub-path ../hub
+git diff src/catalog/endpoints.generated.json    # review, commit if changed
+
+# 2. Verify everything the publish job will verify, locally.
+npm run typecheck && npm run lint && npm test
+npm run smoke:pack-install                       # packs, installs, runs the binary
+
+# 3. Bump the version and tag it. The publish job refuses to ship a tag that
+#    disagrees with package.json.
+npm version 0.1.0 --no-git-tag-version
+git commit -am "Release v0.1.0" && git push origin main
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`node scripts/generate-catalog.mjs --hub-path ../hub --check` exits non-zero when the
+committed catalog is stale, if you would rather assert than diff.
+
+Then verify from a machine that has never seen the repo:
+
+```bash
+npx -y @xyteai/mcp --version
+claude mcp add xyte --scope user -e XYTE_ORG_API_KEY=<key> -- npx -y @xyteai/mcp
+claude mcp list | grep -i xyte      # expect: ✔ Connected
+```
+
+MCP servers load at session start, so confirm the tools in a *new* session.
+
 ## Why stdio only, and what about OAuth
 
 MCP's OAuth 2.1 authorization applies to HTTP transports; for stdio the specification

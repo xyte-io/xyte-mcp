@@ -1,0 +1,21 @@
+meta {
+  name: Register Device
+  type: http
+  seq: 1
+}
+
+post {
+  url: https://entry.xyte.io/v1/devices/register
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: {{authorization}}
+}
+
+body:json {
+  {
+    "mac": "00:00:00:00:00:00"
+  }
+}

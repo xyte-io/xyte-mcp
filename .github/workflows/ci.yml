@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+      # Includes the protocol smoke test, which spawns a real stdio server.
+      - run: npx vitest run
+      - run: npm pack --dry-run
+
+  catalog-shape:
+    # The generator needs a hub checkout, which CI does not have, so validate the
+    # committed artifact's shape instead of regenerating it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Validate committed catalog
+        run: |
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const { catalogVersion, endpoints } = JSON.parse(
+              readFileSync("src/catalog/endpoints.generated.json", "utf8")
+            );
+            const fail = (m) => { console.error("FAIL " + m); process.exit(1); };
+
+            if (catalogVersion !== 1) fail("unexpected catalogVersion " + catalogVersion);
+            if (!Array.isArray(endpoints) || endpoints.length < 50) {
+              fail("expected at least 50 endpoints, got " + endpoints?.length);
+            }
+
+            const keys = new Set();
+            for (const e of endpoints) {
+              if (keys.has(e.key)) fail("duplicate key " + e.key);
+              keys.add(e.key);
+              if (!["organization", "partner"].includes(e.authScope)) {
+                fail(e.key + " has non-operator authScope " + e.authScope);
+              }
+              if (!e.pathTemplate.startsWith("/")) fail(e.key + " path is not absolute");
+              if (e.pathTemplate.includes("{{")) fail(e.key + " path has an unresolved variable");
+              const inTemplate = [...e.pathTemplate.matchAll(/:(\w+)/g)].map((m) => m[1]);
+              if (JSON.stringify(inTemplate) !== JSON.stringify(e.pathParams)) {
+                fail(e.key + " pathParams disagree with pathTemplate");
+              }
+              if (e.mutating !== !["GET", "HEAD"].includes(e.method)) {
+                fail(e.key + " mutating flag disagrees with method");
+              }
+            }
+            console.error("OK " + endpoints.length + " endpoints validated");
+          '
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm audit --audit-level=high

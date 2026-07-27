@@ -41,7 +41,7 @@ describe('evaluateWritePolicy', () => {
       expect(decision.allowed).toBe(false);
       if (decision.allowed) return;
       expect(decision.reason).toContain('read-only');
-      expect(decision.hints.join(' ')).toContain('XYTE_MCP_ALLOW_WRITES=1');
+      expect(decision.hints.join(' ')).toContain('XYTE_MCP_READ_ONLY=1');
     }
   );
 

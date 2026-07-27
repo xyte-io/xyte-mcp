@@ -15,7 +15,7 @@ Usage:
 Environment:
   ${ENV.orgKey}        Organization-scoped API key.
   ${ENV.partnerKey}    Partner-scoped API key. Set either or both.
-  ${ENV.allowWrites}   Set to 1 to permit mutating endpoints. Off by default.
+  ${ENV.readOnly}     Set to 1 to refuse all mutating endpoints. Writes are on by default.
   ${ENV.hubUrl}            Override the hub base URL (default https://hub.xyte.io).
   ${ENV.entryUrl}          Override the entry base URL.
   ${ENV.timeoutMs}     Per-request timeout in ms (default 15000).

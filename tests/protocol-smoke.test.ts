@@ -127,7 +127,8 @@ describe('stdio protocol', () => {
     expect(response.error).toBeUndefined();
     expect(response.result?.protocolVersion).toBeDefined();
     expect(response.result?.serverInfo).toMatchObject({ name: 'xyte-mcp' });
-    expect(response.result?.instructions).toContain('READ-ONLY');
+    // Writes are the default posture, and the host is told so.
+    expect(response.result?.instructions).toContain('ENABLED');
   });
 
   it('advertises exactly the three tools, with schemas', async () => {
@@ -152,8 +153,9 @@ describe('stdio protocol', () => {
 
     const apiCall = tools.find((tool) => tool.name === 'xyte_api_call');
     expect(apiCall?.inputSchema.properties).toHaveProperty('key');
-    // Read-only server: the host should be told the tool cannot mutate.
-    expect(apiCall?.annotations?.readOnlyHint).toBe(true);
+    // Default server: the host should be told the tool can mutate, so it prompts.
+    expect(apiCall?.annotations?.readOnlyHint).toBe(false);
+    expect(apiCall?.annotations?.destructiveHint).toBe(true);
   });
 
   it('runs a discovery tool end to end', async () => {
@@ -174,8 +176,8 @@ describe('stdio protocol', () => {
     expect(result.content[0]?.text).toContain('partner.');
   });
 
-  it('rejects a mutating call through the real protocol path', async () => {
-    const server = start();
+  it('rejects a mutating call through the real protocol path when read-only', async () => {
+    const server = start({ XYTE_MCP_READ_ONLY: '1' });
     await server.handshake();
     const response = await server.request(4, 'tools/call', {
       name: 'xyte_api_call',
@@ -204,10 +206,30 @@ describe('stdio protocol', () => {
     expect(failed).toBe(true);
   });
 
-  it('advertises writes in its instructions when enabled', async () => {
-    const server = start({ XYTE_MCP_ALLOW_WRITES: '1' });
+  it('advertises read-only in its instructions when asked for it', async () => {
+    const server = start({ XYTE_MCP_READ_ONLY: '1' });
     const response = await server.handshake();
-    expect(response.result?.instructions).toContain('ENABLED');
+    expect(response.result?.instructions).toContain('READ-ONLY');
+  });
+
+  // Upgrading from 0.1.x must not widen a server an operator pinned shut.
+  it('honours the legacy allow-writes variable set to 0', async () => {
+    const server = start({ XYTE_MCP_ALLOW_WRITES: '0' });
+    const response = await server.handshake();
+    expect(response.result?.instructions).toContain('READ-ONLY');
+  });
+
+  it('refuses DELETE without confirm even with writes enabled', async () => {
+    const server = start();
+    await server.handshake();
+    const response = await server.request(6, 'tools/call', {
+      name: 'xyte_api_call',
+      arguments: { key: 'organization.devices.deleteDevice', path: { device_id: 'd1' } }
+    });
+
+    const result = response.result as { isError?: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('confirmation');
   });
 
   it('writes only JSON-RPC to stdout and diagnostics to stderr', async () => {

@@ -35,7 +35,7 @@ export function testContext(overrides: Partial<ToolContext> = {}): ToolContext {
     http: overrides.http ?? stubHttp(() => ({ data: {} })),
     credentials,
     baseUrls: overrides.baseUrls ?? { hub: DEFAULT_HUB_URL, entry: DEFAULT_ENTRY_URL },
-    allowWrites: overrides.allowWrites ?? false,
+    allowWrites: overrides.allowWrites ?? true,
     secrets:
       overrides.secrets ??
       Object.values(credentials).filter((value): value is string => typeof value === 'string')

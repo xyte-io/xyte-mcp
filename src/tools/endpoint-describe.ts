@@ -87,7 +87,7 @@ export const endpointDescribeTool = defineTool({
               ? requiresConfirm
                 ? ` Writes are enabled; pass confirm: "${endpoint.key}" to run it.`
                 : ' Writes are enabled.'
-              : ' Writes are currently disabled on this server.'
+              : ' This server is running read-only, so the call will be refused.'
           }`
         : ''
     ].filter(Boolean);

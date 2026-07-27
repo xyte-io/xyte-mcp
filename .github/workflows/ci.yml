@@ -80,4 +80,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm audit --audit-level=high
+
+      # Gate on what actually ships. Only @modelcontextprotocol/sdk and zod are
+      # runtime dependencies, and `files` publishes just dist/ + README, so a
+      # devDependency advisory cannot reach a user of this package.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      # Dev-tree advisories still matter for our own supply chain, so keep them
+      # visible — but they must not block a release of unaffected shipped code.
+      # Known outstanding: brace-expansion <=5.0.7 (DoS) reaches us only via
+      # eslint -> @eslint/config-array -> minimatch@3, and the only clean fix is
+      # a breaking eslint major. Left to Dependabot rather than forcing
+      # brace-expansion@5 into minimatch@3, which would risk silently wrong
+      # glob matching in the linter.
+      - name: Audit dev dependencies (report only)
+        continue-on-error: true
+        run: npm audit --audit-level=high

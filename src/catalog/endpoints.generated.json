@@ -378,7 +378,7 @@
       "queryParams": [],
       "authScope": "organization",
       "bodyType": "json",
-      "bodyExample": "{\n    \"configuration\": {\n        \"a\": 1\n    },\n    \"custom_parameters\": {\n        \"SNMP community\": \"public\",\n        \"Port\": \"161\"\n    },\n    \"name\": \"My Device\",\n    \"device_host_address\": \"192.168.1.100\",\n    \"sub_model\": \"model-v2\",\n    \"sn\": \"SN-12345\",\n    \"mac\": \"00:11:22:33:44:55\",\n    \"custom_model_name\": \"My Custom Model\"\n}",
+      "bodyExample": "{\n    \"configuration\": {\n        \"a\": 1\n    },\n    \"custom_parameters\": {\n        \"SNMP community\": \"public\",\n        \"Port\": \"161\"\n    },\n    \"name\": \"My Device\",\n    \"device_host_address\": \"192.168.1.100\",\n    \"sub_model\": \"model-v2\",\n    \"sn\": \"SN-12345\",\n    \"mac\": \"00:11:22:33:44:55\",\n    \"custom_model_name\": \"My Custom Model\",\n    \"custom_vendor_name\": \"My Custom Vendor\"\n}",
       "mutating": true,
       "sourceFile": "Organization API/Devices/Update Device.bru"
     },

@@ -30,6 +30,9 @@ import { log, logError } from '../log.js';
  * spec still requires the *client* to send
  * `Accept: application/json, text/event-stream`.
  *
+ * Because there is no session, there is nothing for the server to push, so
+ * `/mcp` answers only POST — see the 405 below for what goes wrong otherwise.
+ *
  * **Auth is a single static bearer** (`XYTE_MCP_HTTP_TOKEN`), and the API key it
  * fronts is per-process. So every caller shares one identity and one blast
  * radius — that is the deliberate ceiling of this phase, and the reason to run
@@ -113,6 +116,20 @@ async function handle(
 
   if (path !== MCP_PATH) {
     respondJsonRpcError(res, 404, -32601, `no such path — MCP is served at ${MCP_PATH}`);
+    return;
+  }
+
+  // POST is the whole protocol here, and the spec lets a server say so.
+  //
+  // Without this the SDK answers GET with an SSE stream that can never emit —
+  // a stateless server has no session to push to — so every connected client
+  // parks an idle stream on the dyno until Heroku's 55s router timeout kills it,
+  // and reconnects. Observed with Claude Code: one GET held open for 2.9s and
+  // closed with H27. DELETE is the same kind of lie: it reports 200 for
+  // terminating a session that was never created.
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
     return;
   }
 

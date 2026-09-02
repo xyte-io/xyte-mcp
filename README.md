@@ -185,10 +185,17 @@ and a restart costs a client nothing.
 
 | Route | Auth | Purpose |
 | --- | --- | --- |
-| `POST /mcp` | bearer | The MCP endpoint. |
+| `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
 | `GET /healthz` | none | Platform health probe. Reveals nothing a port scan would not. |
 
-Anything else is `404`; a missing or wrong token is `401` with no `WWW-Authenticate` header
+`GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
+server that offers no SSE stream. Do not "fix" this by letting the SDK handle them: a
+stateless server has no session to push to, so its `GET` answers with a stream that can
+never emit, and every connected client then parks an idle connection until the platform
+times it out (Heroku's router: 55s, then a reconnect). Observed with Claude Code before the
+405 was added.
+
+Any other path is `404`; a missing or wrong token is `401` with no `WWW-Authenticate` header
 (a challenge makes `mcp-remote` open a browser for an OAuth flow that does not exist yet).
 
 ### Run it
@@ -211,11 +218,19 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run bu
 ```bash
 heroku create <app> --region eu --team xyte
 heroku config:edit -a <app>    # XYTE_MCP_HTTP_TOKEN, XYTE_ORG_API_KEY, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
-git push heroku HEAD:main
+git push heroku HEAD:main       # HEAD, so a branch can be deployed without merging it
 ```
 
 `config:edit` rather than `config:set`: the latter puts the API key in your shell history
 and in `ps` while it runs.
+
+`HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
+own `main`, which has nothing to do with the GitHub branch you are on.
+
+The DEV-6742 POC runs at **`xyte-mcp-aran`** (Heroku team `xyte`, EU), pointed at
+`hub-aran.xyte.io` and read-only:
+`https://xyte-mcp-aran-6f8c801d1b74.herokuapp.com`. It holds one org API key and one bearer
+token, so treat the URL as a shared dev credential, not a service.
 
 ### Connect a client
 

@@ -122,6 +122,17 @@ check('an authenticated request to another path is 404', async ({ base, token })
   return '404';
 });
 
+check('GET and DELETE on /mcp are 405', async ({ base, token }) => {
+  for (const method of ['GET', 'DELETE']) {
+    const response = await request(`${base}/mcp`, {
+      method,
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${token}` }
+    });
+    if (response.status !== 405) throw new Error(`${method}: expected 405, got ${response.status}`);
+  }
+  return '405 on both';
+});
+
 check('initialize handshake', async ({ base, token }) => {
   const result = await call(base, token, 'initialize', {
     protocolVersion: PROTOCOL_VERSION,

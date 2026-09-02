@@ -167,6 +167,29 @@ describe('http transport', () => {
     expect(response.status).toBe(404);
   });
 
+  // Otherwise the SDK opens an SSE stream a stateless server can never write to,
+  // and every client parks an idle connection until the platform times it out.
+  it('405s GET and DELETE on /mcp rather than opening a dead stream', async () => {
+    const server = await start();
+
+    for (const method of ['GET', 'DELETE']) {
+      const response = await fetch(`${server.base}/mcp`, {
+        method,
+        headers: { Authorization: `Bearer ${TOKEN}`, ...MCP_HEADERS }
+      });
+      expect(response.status, method).toBe(405);
+      expect(response.headers.get('allow'), method).toBe('POST');
+      expect(response.headers.get('content-type'), method).toContain('application/json');
+    }
+  });
+
+  it('still requires a token for a non-POST method', async () => {
+    const server = await start();
+    const response = await fetch(`${server.base}/mcp`, { method: 'GET', headers: MCP_HEADERS });
+
+    expect(response.status).toBe(401);
+  });
+
   it('completes the initialize handshake', async () => {
     const server = await start();
     const response = await server.call(1, 'initialize', {

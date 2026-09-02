@@ -41,6 +41,7 @@
     "lint": "eslint src tests scripts",
     "catalog:generate": "node scripts/generate-catalog.mjs",
     "smoke:live": "npm run build && node scripts/live-smoke.mjs",
+    "smoke:remote": "node scripts/remote-smoke.mjs",
     "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
     "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
     "prepare": "npm run build",

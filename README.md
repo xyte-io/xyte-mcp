@@ -2,7 +2,8 @@
 
 An [MCP](https://modelcontextprotocol.io) server for the [Xyte](https://www.xyte.io) platform
 API. It gives an AI agent typed, validated access to the public Xyte REST API — endpoint
-discovery plus a generic call tool — over a local stdio transport.
+discovery plus a generic call tool — over stdio locally, or over Streamable HTTP as a
+remote server.
 
 Reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it a
 read-only server.
@@ -17,8 +18,10 @@ Useful for asking an agent to investigate a fleet ("which devices in the Tel Avi
 went offline this week, and what do their open tickets say"), to script routine operations,
 or to work against the Xyte API without you writing the client.
 
-It runs locally as a subprocess of your MCP host and talks to `hub.xyte.io` directly — there
-is nothing to deploy and no third party in the path.
+By default it runs locally as a subprocess of your MCP host and talks to `hub.xyte.io`
+directly — nothing to deploy and no third party in the path. `--http` serves the same tools
+over the network for clients that only support remote servers; see
+[Remote HTTP transport](#remote-http-transport).
 
 ## Install
 
@@ -73,8 +76,11 @@ Everything below is about running the server itself.
 | `XYTE_HUB_URL` | Override the hub base URL. Defaults to `https://hub.xyte.io`. |
 | `XYTE_ENTRY_URL` | Override the entry base URL. |
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
+| `XYTE_MCP_HTTP_TOKEN` | **`--http` only, required.** The static bearer every request must present. |
+| `PORT` | **`--http` only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
-The last three are escape hatches for non-production hubs; the defaults are what you want.
+`XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for
+non-production hubs; the defaults are what you want.
 
 `XYTE_MCP_ALLOW_WRITES` from 0.1.x is still honoured with its original meaning: if it is set
 at all, it decides, so a server pinned shut with `XYTE_MCP_ALLOW_WRITES=0` stays shut across
@@ -165,6 +171,85 @@ exercised, and the key is never printed — this runs against production, so it 
 anything. A pass means the whole path works; if this passes but your host still shows
 nothing, the problem is the host registration, not the server.
 
+## Remote HTTP transport
+
+`xyte-mcp --http` serves the same three tools over MCP's Streamable HTTP transport, for
+clients that cannot spawn a local subprocess. Auth today is **one static bearer token** in
+front of **one API key** held by the server, which is what makes the rest of this section
+short — and what makes it a dev-environment tool rather than a product. See
+[What about OAuth](#what-about-oauth).
+
+It is **stateless**: no session ids, no session table, every POST a complete
+request/response. So there is nothing to keep warm, any instance can answer any request,
+and a restart costs a client nothing.
+
+| Route | Auth | Purpose |
+| --- | --- | --- |
+| `POST /mcp` | bearer | The MCP endpoint. |
+| `GET /healthz` | none | Platform health probe. Reveals nothing a port scan would not. |
+
+Anything else is `404`; a missing or wrong token is `401` with no `WWW-Authenticate` header
+(a challenge makes `mcp-remote` open a browser for an OAuth flow that does not exist yet).
+
+### Run it
+
+```bash
+npm run build
+XYTE_MCP_HTTP_TOKEN=$(node -e "console.log('xmcp_'+require('node:crypto').randomBytes(32).toString('base64url'))") \
+  XYTE_ORG_API_KEY=<key> XYTE_MCP_READ_ONLY=1 PORT=3000 \
+  node dist/index.js --http
+```
+
+`XYTE_MCP_READ_ONLY=1` is strongly advised: on stdio the blast radius of a write is one
+laptop, here it is whoever holds the token. The server logs a warning if you leave writes on.
+
+### Deploy it
+
+The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run build` and
+`engines.node` pins the runtime.
+
+```bash
+heroku create <app> --region eu --team xyte
+heroku config:edit -a <app>    # XYTE_MCP_HTTP_TOKEN, XYTE_ORG_API_KEY, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
+git push heroku HEAD:main
+```
+
+`config:edit` rather than `config:set`: the latter puts the API key in your shell history
+and in `ps` while it runs.
+
+### Connect a client
+
+```bash
+claude mcp add --transport http --scope user xyte-dev \
+  https://<app>.herokuapp.com/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+Then restart the client and check `/mcp` reports Connected. By hand — note that the MCP
+spec requires the client to accept both content types, whichever one comes back:
+
+```bash
+curl -sS -X POST https://<app>.herokuapp.com/mcp \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[].name'
+```
+
+No `initialize` handshake is needed, because there is no session to establish.
+
+### Verify a deploy
+
+```bash
+XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -- https://<app>.herokuapp.com
+```
+
+`scripts/remote-smoke.mjs` asserts the positives (health, handshake, tool list, a real read
+against the configured org) *and* the denials that fail silently otherwise: no token, wrong
+token, unknown path, and a mutating endpoint refused. The denials are the point — a server
+that answers everything with `200` passes a happy-path check and is still wide open. Run it
+after every deploy, and add a case whenever you touch the boundary.
+
 ## Development
 
 ```bash
@@ -224,18 +309,22 @@ claude mcp list | grep -i xyte      # expect: ✔ Connected
 
 MCP servers load at session start, so confirm the tools in a *new* session.
 
-## Why stdio only, and what about OAuth
+## What about OAuth
 
 MCP's OAuth 2.1 authorization applies to HTTP transports; for stdio the specification
-directs servers to take credentials from the environment, which is what this server does.
-Supporting OAuth is therefore not an additive feature — it means running as a remote HTTP
-service, which additionally needs an authorization server (Xyte has none today; hub's
-`oauth2` gem is a *client* for Zoho/Salesforce/Zoom), a hosted deployment, and a decision
-about whether hub accepts OAuth tokens directly or this server holds customer API keys.
+directs servers to take credentials from the environment, which is what stdio mode does.
 
-That is a separate program, so v1 ships stdio. The tool layer is written to be
-transport-agnostic so it can be reused unchanged: adding `src/transports/http.ts` plus a
-resource-server layer would not touch any tool.
+`--http` does not implement it. It authenticates with a single static bearer and holds a
+single API key, so **every caller shares one identity and one blast radius** — there is no
+user to scope anything to. That is a deliberate ceiling, not an oversight, and it is why
+that mode belongs on a dev hub, read-only, behind a token you can revoke by redeploying.
+
+Real OAuth needs an authorization server (Xyte has none today; hub's `oauth2` gem is a
+*client* for Zoho/Salesforce/Zoom) and a decision about whether hub accepts OAuth tokens
+directly or this server holds customer API keys. That is a separate program. What makes it
+tractable is that it replaces `src/transports/http.ts` and nothing else: a per-request
+context built from a validated token is the same `createToolContext` call, and no tool
+changes.
 
 ## Security notes
 

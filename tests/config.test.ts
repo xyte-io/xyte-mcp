@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_ENTRY_URL, DEFAULT_HUB_URL, ENV, resolveConfig } from '../src/config.js';
+import {
+  DEFAULT_ENTRY_URL,
+  DEFAULT_HTTP_PORT,
+  DEFAULT_HUB_URL,
+  ENV,
+  resolveConfig,
+  resolveHttpConfig
+} from '../src/config.js';
 import { XyteError } from '../src/http/errors.js';
 
 const withOrgKey = { [ENV.orgKey]: 'org-key-abcdef123456' };
@@ -91,5 +98,44 @@ describe('resolveConfig', () => {
     expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '5000' }).timeoutMs).toBe(5000);
     expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '-1' }).timeoutMs).toBe(15_000);
     expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: 'abc' }).timeoutMs).toBe(15_000);
+  });
+});
+
+describe('resolveHttpConfig', () => {
+  const token = 'xmcp_test_token_0123456789abcdef';
+
+  it('reads the token and the platform port', () => {
+    expect(resolveHttpConfig({ [ENV.httpToken]: token, [ENV.httpPort]: '5001' })).toEqual({
+      token,
+      port: 5001
+    });
+  });
+
+  it('defaults the port', () => {
+    expect(resolveHttpConfig({ [ENV.httpToken]: token }).port).toBe(DEFAULT_HTTP_PORT);
+  });
+
+  // Serving with auth disabled would publish a live API key to anyone with the
+  // URL, so a missing token must stop the boot rather than widen the server.
+  it('refuses a missing token and names the variable', () => {
+    const error = (() => {
+      try {
+        resolveHttpConfig({});
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(XyteError);
+    expect((error as XyteError).kind).toBe('config');
+    expect((error as XyteError).message).toContain(ENV.httpToken);
+  });
+
+  it('refuses a whitespace-only token', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: '   ' })).toThrow(XyteError);
+  });
+
+  it('refuses a guessably short token', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: 'short' })).toThrow(/too short/);
   });
 });

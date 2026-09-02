@@ -1,4 +1,4 @@
-import { ENV } from '../config.js';
+import { ENV, type HubUserCredential } from '../config.js';
 import { XyteError } from './errors.js';
 import type { EndpointSpec } from '../catalog/types.js';
 import type { ToolContext } from '../context.js';
@@ -94,12 +94,27 @@ export function buildRequest(
     url: url.toString(),
     headers: {
       Accept: 'application/json',
-      // The hub expects the bare key — no "Bearer" scheme.
-      Authorization: credential,
+      ...authHeaders(credential),
       ...(hasBody ? { 'Content-Type': 'application/json' } : {})
     },
     ...(hasBody ? { body: JSON.stringify(args.body) } : {}),
     endpointKey: endpoint.key
+  };
+}
+
+/**
+ * An API key goes in `Authorization` (the hub expects the bare key — no
+ * "Bearer" scheme). A hub user session goes in devise_token_auth's header
+ * triplet, plus `tenant` to pick the organization; the hub then enforces that
+ * user's role instead of granting org-wide API-key power.
+ */
+function authHeaders(credential: string | HubUserCredential): Record<string, string> {
+  if (typeof credential === 'string') return { Authorization: credential };
+  return {
+    'access-token': credential.accessToken,
+    client: credential.client,
+    uid: credential.uid,
+    ...(credential.tenant ? { tenant: credential.tenant } : {})
   };
 }
 

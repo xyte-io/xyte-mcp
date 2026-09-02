@@ -76,7 +76,9 @@ Everything below is about running the server itself.
 | `XYTE_HUB_URL` | Override the hub base URL. Defaults to `https://hub.xyte.io`. |
 | `XYTE_ENTRY_URL` | Override the entry base URL. |
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
-| `XYTE_MCP_HTTP_TOKEN` | **`--http` only, required.** The static bearer every request must present. |
+| `XYTE_MCP_HTTP_TOKEN` | **`--http` only.** Static bearer fronting the process API key (dev/CI). At least one of this and `XYTE_MCP_ISSUER_URL` is required. |
+| `XYTE_MCP_ISSUER_URL` | **`--http` only.** This deployment's public https URL; setting it enables OAuth 2.1. |
+| `DATABASE_URL` | **`--http` + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. |
 | `PORT` | **`--http` only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
 `XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for
@@ -174,10 +176,16 @@ nothing, the problem is the host registration, not the server.
 ## Remote HTTP transport
 
 `xyte-mcp --http` serves the same three tools over MCP's Streamable HTTP transport, for
-clients that cannot spawn a local subprocess. Auth today is **one static bearer token** in
-front of **one API key** held by the server, which is what makes the rest of this section
-short — and what makes it a dev-environment tool rather than a product. See
-[What about OAuth](#what-about-oauth).
+clients that cannot spawn a local subprocess. Two authentication modes exist, independently
+switchable and composable:
+
+- **Static bearer** (`XYTE_MCP_HTTP_TOKEN`): one token in front of one API key held by the
+  server. Every caller shares one identity — a dev/CI mode, not a product. Keep it on a dev
+  hub, read-only.
+- **OAuth 2.1** (`XYTE_MCP_ISSUER_URL`): the real thing — see
+  [OAuth 2.1](#oauth-21). Users add the URL as a custom connector (claude.ai web included),
+  log in with their hub credentials, and every call runs under *their* hub user with their
+  role enforced by the hub.
 
 It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
@@ -187,6 +195,7 @@ and a restart costs a client nothing.
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
 | `GET /healthz` | none | Platform health probe. Reveals nothing a port scan would not. |
+| `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /login` | — | OAuth mode only; served by the MCP SDK's auth router plus our login page. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
 server that offers no SSE stream. Do not "fix" this by letting the SDK handle them: a
@@ -195,8 +204,10 @@ never emit, and every connected client then parks an idle connection until the p
 times it out (Heroku's router: 55s, then a reconnect). Observed with Claude Code before the
 405 was added.
 
-Any other path is `404`; a missing or wrong token is `401` with no `WWW-Authenticate` header
-(a challenge makes `mcp-remote` open a browser for an OAuth flow that does not exist yet).
+Any other path is `404`. A missing or wrong token is `401` — with a `WWW-Authenticate`
+challenge pointing at the resource metadata when OAuth is on (RFC 9728, how clients discover
+the flow), and deliberately *without* one in static-only mode (a challenge makes
+`mcp-remote` open a browser for an OAuth flow that does not exist there).
 
 ### Run it
 
@@ -217,7 +228,9 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run bu
 
 ```bash
 heroku create <app> --region eu --team xyte
-heroku config:edit -a <app>    # XYTE_MCP_HTTP_TOKEN, XYTE_ORG_API_KEY, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
+heroku addons:create heroku-postgresql:essential-0 -a <app>   # OAuth token store (sets DATABASE_URL)
+heroku config:edit -a <app>    # XYTE_MCP_ISSUER_URL, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
+                                # (+ XYTE_MCP_HTTP_TOKEN and XYTE_ORG_API_KEY for the static mode)
 git push heroku HEAD:main       # HEAD, so a branch can be deployed without merging it
 ```
 
@@ -257,13 +270,17 @@ No `initialize` handshake is needed, because there is no session to establish.
 
 ```bash
 XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -- https://<app>.herokuapp.com
+
+# With hub credentials, the OAuth surface is smoked end to end too:
+XYTE_SMOKE_EMAIL=<email> XYTE_SMOKE_PASSWORD=<pw> npm run smoke:remote -- https://<app>...
 ```
 
 `scripts/remote-smoke.mjs` asserts the positives (health, handshake, tool list, a real read
-against the configured org) *and* the denials that fail silently otherwise: no token, wrong
-token, unknown path, and a mutating endpoint refused. The denials are the point — a server
-that answers everything with `200` passes a happy-path check and is still wide open. Run it
-after every deploy, and add a case whenever you touch the boundary.
+against the configured org — and, with credentials, registration → login → PKCE exchange →
+a read as the logged-in user) *and* the denials that fail silently otherwise: no token,
+wrong token, unknown path, a revoked token, and a mutating endpoint refused. The denials are
+the point — a server that answers everything with `200` passes a happy-path check and is
+still wide open. Run it after every deploy, and add a case whenever you touch the boundary.
 
 ## Development
 
@@ -324,22 +341,33 @@ claude mcp list | grep -i xyte      # expect: ✔ Connected
 
 MCP servers load at session start, so confirm the tools in a *new* session.
 
-## What about OAuth
+## OAuth 2.1
 
 MCP's OAuth 2.1 authorization applies to HTTP transports; for stdio the specification
 directs servers to take credentials from the environment, which is what stdio mode does.
 
-`--http` does not implement it. It authenticates with a single static bearer and holds a
-single API key, so **every caller shares one identity and one blast radius** — there is no
-user to scope anything to. That is a deliberate ceiling, not an oversight, and it is why
-that mode belongs on a dev hub, read-only, behind a token you can revoke by redeploying.
+Setting `XYTE_MCP_ISSUER_URL` (the deployment's public https URL) makes `--http` a full
+authorization server. The protocol surface is the MCP TypeScript SDK's `mcpAuthRouter` —
+RFC 8414 metadata, RFC 7591 dynamic client registration, `/authorize` + `/token` with PKCE,
+revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind it:
 
-Real OAuth needs an authorization server (Xyte has none today; hub's `oauth2` gem is a
-*client* for Zoho/Salesforce/Zoom) and a decision about whether hub accepts OAuth tokens
-directly or this server holds customer API keys. That is a separate program. What makes it
-tractable is that it replaces `src/transports/http.ts` and nothing else: a per-request
-context built from a validated token is the same `createToolContext` call, and no tool
-changes.
+- **Login delegation.** `/authorize` renders a login page; the credentials are checked
+  against the hub's own `POST /auth/sign_in` (devise_token_auth). A success becomes a
+  **grant** storing that user's hub token triplet (`access-token`/`client`/`uid`) plus their
+  tenant.
+- **Audience-bound tokens.** The access/refresh tokens we mint are our own, hashed at rest,
+  and bound to this server as the RFC 8707 resource. A client's token is **never forwarded
+  to the hub** — each request resolves its grant and calls the hub with the stored user
+  credential (the classic confused-deputy guard).
+- **Per-user enforcement.** Calls carry the devise headers plus `tenant`, so the hub's core
+  org API authenticates the *user* and applies their role — unlike an org API key, which is
+  org-wide by construction.
+- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
+  across dyno restarts; without it an in-memory store logs a loud warning and every restart
+  logs users out. Revoking any token revokes its whole grant.
+
+The static-bearer mode stays available alongside (set both env vars) or instead (unset the
+issuer); the two map to different upstream identities and neither weakens the other.
 
 ## Security notes
 

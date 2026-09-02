@@ -10,6 +10,10 @@ export const ENV = {
   entryUrl: 'XYTE_ENTRY_URL',
   timeoutMs: 'XYTE_MCP_TIMEOUT_MS',
   httpToken: 'XYTE_MCP_HTTP_TOKEN',
+  /** Public base URL of this deployment; setting it turns OAuth on. */
+  issuerUrl: 'XYTE_MCP_ISSUER_URL',
+  /** Set by Heroku Postgres; the OAuth token store. Absent → in-memory store. */
+  databaseUrl: 'DATABASE_URL',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;
@@ -21,15 +25,35 @@ export const DEFAULT_HTTP_PORT = 3000;
 /** Short enough to fit any sane generator, long enough not to be guessed. */
 const MIN_TOKEN_LENGTH = 24;
 
+/**
+ * A hub user session, as returned by hub's devise_token_auth `POST /auth/sign_in`.
+ * The alternative to an org API key: hub resolves the user and enforces their
+ * role. `tenant` selects the organization when the user belongs to several.
+ */
+export interface HubUserCredential {
+  accessToken: string;
+  client: string;
+  uid: string;
+  tenant?: string;
+}
+
 export interface Credentials {
-  organization?: string;
+  organization?: string | HubUserCredential;
   partner?: string;
+}
+
+export interface OAuthConfig {
+  /** Public https base URL of this deployment (RFC 8414 issuer). */
+  issuerUrl: string;
+  /** Postgres DSN for the token store; absent → in-memory (dev only). */
+  databaseUrl?: string;
 }
 
 /** Configuration of the HTTP listener itself, as opposed to of a tool call. */
 export interface HttpConfig {
-  /** The single static bearer every request must present. */
-  token: string;
+  /** Static bearer for dev/CI; optional once OAuth is configured. */
+  staticToken?: string;
+  oauth?: OAuthConfig;
   port: number;
 }
 
@@ -48,11 +72,16 @@ export interface ServerConfig {
  * context. That separation is what lets a future HTTP/OAuth transport supply
  * per-request credentials without any tool changes.
  */
-export function resolveConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+export function resolveConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { requireCredentials?: boolean } = {}
+): ServerConfig {
   const organization = trimmed(env[ENV.orgKey]);
   const partner = trimmed(env[ENV.partnerKey]);
 
-  if (!organization && !partner) {
+  // An OAuth-only HTTP server has no process-level key: every request brings
+  // its own hub user credential, so an empty credential set is valid there.
+  if (!organization && !partner && (options.requireCredentials ?? true)) {
     throw new XyteError(
       'config',
       `No Xyte API key configured. Set ${ENV.orgKey} and/or ${ENV.partnerKey}.`,
@@ -84,33 +113,81 @@ export function resolveConfig(env: NodeJS.ProcessEnv = process.env): ServerConfi
  * of the listener, not of a tool call — and keeping every environment read in
  * this module is what lets `src/transports/` stay free of `process.env`.
  *
- * A missing token is fatal rather than "auth off". This transport is reachable
- * from the internet and holds a live API key, so defaulting open would publish
- * that key to anyone who found the URL. Same reason for the length floor: a
- * two-character token is a typo, not a credential, and it would be brute-forced
- * before anyone noticed.
+ * No auth at all is fatal rather than "auth off". This transport is reachable
+ * from the internet, so defaulting open would publish whatever credentials the
+ * process holds to anyone who found the URL. Same reason for the length floor
+ * on the static token: a two-character token is a typo, not a credential, and
+ * it would be brute-forced before anyone noticed.
  */
 export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpConfig {
-  const token = trimmed(env[ENV.httpToken]);
-  if (!token) {
+  const staticToken = trimmed(env[ENV.httpToken]);
+  const issuerUrl = trimmed(env[ENV.issuerUrl]);
+
+  if (!staticToken && !issuerUrl) {
     throw new XyteError(
       'config',
-      `No bearer token configured. Set ${ENV.httpToken} to serve over HTTP.`,
+      `No authentication configured. Set ${ENV.httpToken} (static bearer) and/or ${ENV.issuerUrl} (OAuth) to serve over HTTP.`,
       [
-        `Mint one: node -e "console.log('xmcp_' + require('crypto').randomBytes(32).toString('base64url'))"`,
-        'Every request must then send: Authorization: Bearer <token>'
+        `Mint a static token: node -e "console.log('xmcp_' + require('crypto').randomBytes(32).toString('base64url'))"`,
+        `Or set ${ENV.issuerUrl} to this deployment's public https URL to enable OAuth 2.1.`
       ]
     );
   }
-  if (token.length < MIN_TOKEN_LENGTH) {
+  if (staticToken && staticToken.length < MIN_TOKEN_LENGTH) {
     throw new XyteError(
       'config',
       `${ENV.httpToken} is too short — ${MIN_TOKEN_LENGTH} characters minimum.`,
       ['A guessable bearer token is the same as no authentication at all.']
     );
   }
+  // The static bearer fronts the process-level org/partner key, so one without
+  // the other is a misconfiguration, not a mode.
+  if (staticToken && !trimmed(env[ENV.orgKey]) && !trimmed(env[ENV.partnerKey])) {
+    throw new XyteError(
+      'config',
+      `${ENV.httpToken} is set but no API key is configured for it to front.`,
+      [`Set ${ENV.orgKey} and/or ${ENV.partnerKey}, or unset ${ENV.httpToken} and use OAuth only.`]
+    );
+  }
 
-  return { token, port: parsePositiveInt(env[ENV.httpPort]) ?? DEFAULT_HTTP_PORT };
+  let oauth: OAuthConfig | undefined;
+  if (issuerUrl) {
+    validateIssuerUrl(issuerUrl);
+    oauth = {
+      issuerUrl: stripTrailingSlash(issuerUrl),
+      ...(trimmed(env[ENV.databaseUrl]) ? { databaseUrl: trimmed(env[ENV.databaseUrl]) } : {})
+    };
+  }
+
+  return {
+    ...(staticToken ? { staticToken } : {}),
+    ...(oauth ? { oauth } : {}),
+    port: parsePositiveInt(env[ENV.httpPort]) ?? DEFAULT_HTTP_PORT
+  };
+}
+
+/**
+ * Fail at boot, not on the first /authorize: tokens minted under an http or
+ * malformed issuer would be rejected by clients after a working-looking start.
+ * Localhost is exempt so tests and local runs don't need TLS (the SDK's
+ * metadata router applies the same exemption).
+ */
+function validateIssuerUrl(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new XyteError('config', `${ENV.issuerUrl} is not a valid URL: ${value}`);
+  }
+  const localhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  if (url.protocol !== 'https:' && !localhost) {
+    throw new XyteError('config', `${ENV.issuerUrl} must be https (got ${url.protocol}//).`, [
+      'OAuth tokens over plain http are readable by every hop on the path.'
+    ]);
+  }
+  if (url.search || url.hash) {
+    throw new XyteError('config', `${ENV.issuerUrl} must not have a query string or fragment.`);
+  }
 }
 
 function trimmed(value: string | undefined): string | undefined {

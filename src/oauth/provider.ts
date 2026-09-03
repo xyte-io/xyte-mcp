@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { Response } from 'express';
 import {
   InvalidClientError,
@@ -17,6 +17,7 @@ import type {
   OAuthTokens
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HubUserCredential } from '../config.js';
+import type { DescopeLogin } from './descope.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 
 /**
@@ -50,14 +51,33 @@ export interface LoginForm {
 
 export type LoginResult = { redirectTo: string } | { html: string; status: number };
 
+/** An /authorize request parked while the user logs in at Descope. */
+interface PendingAuthorization {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  state?: string;
+  resource?: string;
+  /** Our PKCE verifier for the Descope leg. */
+  descopeVerifier: string;
+  expiresAt: number;
+}
+
+const PENDING_TTL_SECONDS = 10 * 60;
+
 export class XyteOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
+  // ponytail: in-memory — a dyno restart mid-login just makes the user retry.
+  // Move into the store if this ever runs on more than one dyno.
+  private readonly pending = new Map<string, PendingAuthorization>();
 
   constructor(
     private readonly store: OAuthStore,
     private readonly signIn: HubSignIn,
     /** e.g. https://xyte-mcp-aran.herokuapp.com — no trailing slash. */
-    private readonly issuerUrl: string
+    private readonly issuerUrl: string,
+    /** When set, /authorize delegates login to Descope instead of the password form. */
+    private readonly descope?: DescopeLogin
   ) {
     this.clientsStore = {
       getClient: (clientId) => this.store.getClient(clientId),
@@ -80,6 +100,28 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
+    if (this.descope) {
+      const pendingId = randomBytes(24).toString('base64url');
+      const descopeVerifier = randomBytes(32).toString('base64url');
+      this.prunePending();
+      this.pending.set(pendingId, {
+        clientId: client.client_id,
+        redirectUri: params.redirectUri,
+        codeChallenge: params.codeChallenge,
+        ...(params.state ? { state: params.state } : {}),
+        ...(params.resource ? { resource: params.resource.href } : {}),
+        descopeVerifier,
+        expiresAt: nowSeconds() + PENDING_TTL_SECONDS
+      });
+      res.redirect(
+        this.descope.authorizeRedirect({
+          state: pendingId,
+          codeChallenge: createHash('sha256').update(descopeVerifier).digest('base64url')
+        })
+      );
+      return;
+    }
+
     res
       .status(200)
       .type('html')
@@ -138,22 +180,63 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     const hub = await this.signIn(email, password);
     if (!hub) return retry('Wrong email or password.');
 
-    const grantId = await this.store.createGrant(client.client_id, hub);
+    return this.issueCode(client.client_id, hub, {
+      redirectUri: redirect_uri,
+      codeChallenge: code_challenge,
+      ...(state ? { state } : {}),
+      ...(resource ? { resource } : {})
+    });
+  }
+
+  /**
+   * The GET /oauth/callback handler's logic (Descope mode): resolve the parked
+   * /authorize request by state, run the code -> Descope JWT -> hub triplet
+   * exchange, and mint the single-use code for the original MCP client.
+   */
+  async completeDescopeCallback(state?: string, code?: string): Promise<LoginResult> {
+    const parked = state ? this.pending.get(state) : undefined;
+    // Single-use either way: a replayed callback must not mint twice.
+    if (state) this.pending.delete(state);
+    if (!parked || parked.expiresAt <= nowSeconds() || !code) {
+      return { html: errorPage('Login expired or invalid. Restart the connection.'), status: 400 };
+    }
+
+    const hub = await this.descope!.exchange(code, parked.descopeVerifier);
+    if (!hub) {
+      return { html: errorPage('Your Xyte account was not accepted. Contact your administrator.'), status: 401 };
+    }
+
+    return this.issueCode(parked.clientId, hub, parked);
+  }
+
+  private async issueCode(
+    clientId: string,
+    hub: HubUserCredential,
+    request: { redirectUri: string; codeChallenge: string; state?: string; resource?: string }
+  ): Promise<LoginResult> {
+    const grantId = await this.store.createGrant(clientId, hub);
     const code = mintToken('ac');
     await this.store.saveToken({
       token: code,
       kind: 'code',
       grantId,
-      codeChallenge: code_challenge,
-      redirectUri: redirect_uri,
-      ...(resource ? { resource } : {}),
+      codeChallenge: request.codeChallenge,
+      redirectUri: request.redirectUri,
+      ...(request.resource ? { resource: request.resource } : {}),
       expiresAt: nowSeconds() + CODE_TTL_SECONDS
     });
 
-    const target = new URL(redirect_uri);
+    const target = new URL(request.redirectUri);
     target.searchParams.set('code', code);
-    if (state) target.searchParams.set('state', state);
+    if (request.state) target.searchParams.set('state', request.state);
     return { redirectTo: target.toString() };
+  }
+
+  private prunePending(): void {
+    const now = nowSeconds();
+    for (const [key, value] of this.pending) {
+      if (value.expiresAt <= now) this.pending.delete(key);
+    }
   }
 
   async challengeForAuthorizationCode(

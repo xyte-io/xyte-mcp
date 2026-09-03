@@ -14,11 +14,16 @@ export const ENV = {
   issuerUrl: 'XYTE_MCP_ISSUER_URL',
   /** Set by Heroku Postgres; the OAuth token store. Absent → in-memory store. */
   databaseUrl: 'DATABASE_URL',
+  /** Descope project id; setting it delegates OAuth login to Descope's hosted flow. */
+  descopeProjectId: 'XYTE_MCP_DESCOPE_PROJECT_ID',
+  /** Descope OIDC base; only needed when it isn't the default auth.xyte.io. */
+  descopeBaseUrl: 'XYTE_MCP_DESCOPE_BASE_URL',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;
 
 export const DEFAULT_HUB_URL = 'https://hub.xyte.io';
+export const DEFAULT_DESCOPE_BASE_URL = 'https://auth.xyte.io';
 export const DEFAULT_ENTRY_URL = 'https://entry.xyte.io';
 export const DEFAULT_HTTP_PORT = 3000;
 
@@ -47,6 +52,8 @@ export interface OAuthConfig {
   issuerUrl: string;
   /** Postgres DSN for the token store; absent → in-memory (dev only). */
   databaseUrl?: string;
+  /** When set, login happens at Descope's hosted flow instead of a password form. */
+  descope?: { projectId: string; baseUrl: string };
 }
 
 /** Configuration of the HTTP listener itself, as opposed to of a tool call. */
@@ -153,9 +160,18 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
   let oauth: OAuthConfig | undefined;
   if (issuerUrl) {
     validateIssuerUrl(issuerUrl);
+    const descopeProjectId = trimmed(env[ENV.descopeProjectId]);
     oauth = {
       issuerUrl: stripTrailingSlash(issuerUrl),
-      ...(trimmed(env[ENV.databaseUrl]) ? { databaseUrl: trimmed(env[ENV.databaseUrl]) } : {})
+      ...(trimmed(env[ENV.databaseUrl]) ? { databaseUrl: trimmed(env[ENV.databaseUrl]) } : {}),
+      ...(descopeProjectId
+        ? {
+            descope: {
+              projectId: descopeProjectId,
+              baseUrl: stripTrailingSlash(trimmed(env[ENV.descopeBaseUrl]) ?? DEFAULT_DESCOPE_BASE_URL)
+            }
+          }
+        : {})
     };
   }
 

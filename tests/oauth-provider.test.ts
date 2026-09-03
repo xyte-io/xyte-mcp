@@ -278,3 +278,95 @@ describe('XyteOAuthProvider', () => {
     ).rejects.toThrow(/resource/);
   });
 });
+
+describe('XyteOAuthProvider with Descope login', () => {
+  function makeDescopeProvider(options: { exchangeOk?: boolean } = {}) {
+    const store = new MemoryOAuthStore();
+    const signIn = vi.fn(async () => HUB_USER);
+    const exchange = vi.fn(async () => ((options.exchangeOk ?? true) ? HUB_USER : undefined));
+    const authorizeRedirect = vi.fn(
+      ({ state, codeChallenge }: { state: string; codeChallenge: string }) =>
+        `https://descope.test/authorize?state=${state}&code_challenge=${codeChallenge}`
+    );
+    const provider = new XyteOAuthProvider(store, signIn, ISSUER, { authorizeRedirect, exchange });
+    return { provider, store, exchange, authorizeRedirect };
+  }
+
+  function fakeRes() {
+    const redirects: string[] = [];
+    return {
+      redirects,
+      res: { redirect: (url: string) => void redirects.push(url) } as unknown as Response
+    };
+  }
+
+  async function startAuthorize(provider: XyteOAuthProvider, client: OAuthClientInformationFull) {
+    const { redirects, res } = fakeRes();
+    await provider.authorize(
+      client,
+      {
+        redirectUri: REDIRECT,
+        codeChallenge: 'client-challenge',
+        state: 'client-state',
+        resource: new URL(`${ISSUER}/mcp`)
+      } as Parameters<XyteOAuthProvider['authorize']>[1],
+      res
+    );
+    const url = new URL(redirects[0]!);
+    return { descopeState: url.searchParams.get('state')!, url };
+  }
+
+  it('redirects /authorize to Descope with a fresh PKCE challenge', async () => {
+    const { provider, authorizeRedirect } = makeDescopeProvider();
+    const client = await registeredClient(provider);
+    const { url } = await startAuthorize(provider, client);
+
+    expect(url.origin).toBe('https://descope.test');
+    expect(authorizeRedirect).toHaveBeenCalledOnce();
+    const challenge = url.searchParams.get('code_challenge')!;
+    // Our own challenge toward Descope, not the MCP client's.
+    expect(challenge).not.toBe('client-challenge');
+    expect(challenge.length).toBeGreaterThan(20);
+  });
+
+  it('callback mints a code for the original client, bound to its challenge and state', async () => {
+    const { provider, store, exchange } = makeDescopeProvider();
+    const client = await registeredClient(provider);
+    const { descopeState } = await startAuthorize(provider, client);
+
+    const result = await provider.completeDescopeCallback(descopeState, 'descope-code');
+    if (!('redirectTo' in result)) throw new Error(result.html);
+    const url = new URL(result.redirectTo);
+    expect(url.origin + url.pathname).toBe(REDIRECT);
+    expect(url.searchParams.get('state')).toBe('client-state');
+    expect(exchange).toHaveBeenCalledWith('descope-code', expect.any(String));
+
+    const code = url.searchParams.get('code')!;
+    const record = await store.getToken(code, 'code');
+    expect(record?.codeChallenge).toBe('client-challenge');
+    const grant = await store.getGrant(record!.grantId);
+    expect(grant?.hub).toEqual(HUB_USER);
+  });
+
+  it('rejects a replayed or unknown callback state', async () => {
+    const { provider } = makeDescopeProvider();
+    const client = await registeredClient(provider);
+    const { descopeState } = await startAuthorize(provider, client);
+
+    const first = await provider.completeDescopeCallback(descopeState, 'descope-code');
+    expect('redirectTo' in first).toBe(true);
+    const replay = await provider.completeDescopeCallback(descopeState, 'descope-code');
+    expect(replay).toMatchObject({ status: 400 });
+    const unknown = await provider.completeDescopeCallback('never-issued', 'descope-code');
+    expect(unknown).toMatchObject({ status: 400 });
+  });
+
+  it('a refused hub login yields 401 and no code', async () => {
+    const { provider } = makeDescopeProvider({ exchangeOk: false });
+    const client = await registeredClient(provider);
+    const { descopeState } = await startAuthorize(provider, client);
+
+    const result = await provider.completeDescopeCallback(descopeState, 'descope-code');
+    expect(result).toMatchObject({ status: 401 });
+  });
+});

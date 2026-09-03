@@ -78,6 +78,8 @@ Everything below is about running the server itself.
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
 | `XYTE_MCP_HTTP_TOKEN` | **`--http` only.** Static bearer fronting the process API key (dev/CI). At least one of this and `XYTE_MCP_ISSUER_URL` is required. |
 | `XYTE_MCP_ISSUER_URL` | **`--http` only.** This deployment's public https URL; setting it enables OAuth 2.1. |
+| `XYTE_MCP_DESCOPE_PROJECT_ID` | **`--http` + OAuth only.** Descope project id of the hub environment; setting it delegates `/authorize` login to Descope's hosted flow (the same login the portal uses). Without it, a legacy email/password form posts to hub's `POST /auth/sign_in` — which only works for users that predate Descope. |
+| `XYTE_MCP_DESCOPE_BASE_URL` | Descope OIDC base URL. Defaults to `https://auth.xyte.io`. |
 | `DATABASE_URL` | **`--http` + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. |
 | `PORT` | **`--http` only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
@@ -351,10 +353,14 @@ authorization server. The protocol surface is the MCP TypeScript SDK's `mcpAuthR
 RFC 8414 metadata, RFC 7591 dynamic client registration, `/authorize` + `/token` with PKCE,
 revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind it:
 
-- **Login delegation.** `/authorize` renders a login page; the credentials are checked
-  against the hub's own `POST /auth/sign_in` (devise_token_auth). A success becomes a
-  **grant** storing that user's hub token triplet (`access-token`/`client`/`uid`) plus their
-  tenant.
+- **Login delegation.** With `XYTE_MCP_DESCOPE_PROJECT_ID` set, `/authorize` redirects to
+  Descope's hosted flow (the portal's own login — SSO/MFA included, we never see a
+  password); `/oauth/callback` exchanges the code (PKCE, public client) and swaps the
+  Descope session JWT for a devise token triplet at hub's `POST /auth/descope/login`.
+  Without it, a legacy email/password form posts to hub's `POST /auth/sign_in` — only
+  useful against hubs whose users still have database passwords. Either way a success
+  becomes a **grant** storing that user's hub triplet (`access-token`/`client`/`uid`) plus
+  their tenant.
 - **Audience-bound tokens.** The access/refresh tokens we mint are our own, hashed at rest,
   and bound to this server as the RFC 8707 resource. A client's token is **never forwarded
   to the hub** — each request resolves its grant and calls the hub with the stored user

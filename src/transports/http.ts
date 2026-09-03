@@ -12,6 +12,7 @@ import {
 } from '../config.js';
 import { createToolContext, type ToolContext } from '../context.js';
 import { createHttpClient } from '../http/client.js';
+import { createDescopeLogin } from '../oauth/descope.js';
 import { createHubSignIn } from '../oauth/hub-login.js';
 import { hubCredentialOf, XyteOAuthProvider, type LoginForm } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
@@ -52,6 +53,7 @@ import { log, logError } from '../log.js';
 export const MCP_PATH = '/mcp';
 const HEALTH_PATH = '/healthz';
 const LOGIN_PATH = '/login';
+const CALLBACK_PATH = '/oauth/callback';
 
 /** Caller-controlled strings are capped before they reach the log stream. */
 const MAX_LOGGED_PATH = 64;
@@ -90,7 +92,19 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         'WARNING: no DATABASE_URL — OAuth tokens are held in memory and every restart logs all users out.'
       );
     }
-    provider = new XyteOAuthProvider(store, createHubSignIn(config.baseUrls.hub), oauth.issuerUrl);
+    const descope = oauth.descope
+      ? createDescopeLogin({
+          ...oauth.descope,
+          callbackUrl: `${oauth.issuerUrl}${CALLBACK_PATH}`,
+          hubUrl: config.baseUrls.hub
+        })
+      : undefined;
+    provider = new XyteOAuthProvider(
+      store,
+      createHubSignIn(config.baseUrls.hub),
+      oauth.issuerUrl,
+      descope
+    );
 
     app.use(
       mcpAuthRouter({
@@ -105,6 +119,20 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     app.post(LOGIN_PATH, express.urlencoded({ extended: false }), (req, res) => {
       void handleLogin(loginProvider, req, res);
     });
+    if (descope) {
+      app.get(CALLBACK_PATH, (req, res) => {
+        void (async () => {
+          const state = typeof req.query.state === 'string' ? req.query.state : undefined;
+          const code = typeof req.query.code === 'string' ? req.query.code : undefined;
+          const result = await loginProvider.completeDescopeCallback(state, code).catch((error) => {
+            logError(`descope callback failed: ${String(error)}`);
+            return { html: 'Login failed. Restart the connection and try again.', status: 502 } as const;
+          });
+          if ('redirectTo' in result) res.redirect(302, result.redirectTo);
+          else res.status(result.status).type('html').send(result.html);
+        })();
+      });
+    }
   }
 
   app.post(MCP_PATH, (req, res) => {
@@ -145,7 +173,10 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   });
   listener.once('close', () => void store?.close());
 
-  const auth = [staticToken ? 'static bearer' : '', oauth ? `oauth (${oauth.issuerUrl})` : '']
+  const auth = [
+    staticToken ? 'static bearer' : '',
+    oauth ? `oauth (${oauth.issuerUrl}, login: ${oauth.descope ? 'descope' : 'password form'})` : ''
+  ]
     .filter(Boolean)
     .join(' + ');
   log(

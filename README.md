@@ -9,7 +9,7 @@ read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
-puts that API in front of an agent as three tools instead of 77 hand-written ones — it can
+puts that API in front of an agent as three tools instead of 78 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
 
@@ -126,7 +126,7 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 77 endpoints (63 organization, 14 partner). It
+`src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.

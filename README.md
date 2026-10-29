@@ -9,9 +9,9 @@ read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
-puts that API in front of an agent as three tools instead of 78 hand-written ones — it can
-discover the right endpoint, read its exact contract, and call it with arguments validated
-against that contract before a request goes out.
+puts that API in front of an agent as three tools instead of one hand-written tool per
+endpoint — it can discover the right endpoint, read its exact contract, and call it with
+arguments validated against that contract before a request goes out.
 
 Useful for asking an agent to investigate a fleet ("which devices in the Tel Aviv office
 went offline this week, and what do their open tickets say"), to script routine operations,

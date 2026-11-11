@@ -63,8 +63,11 @@ export interface OAuthStore {
 
   saveToken(token: NewToken): Promise<void>;
   getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined>;
-  /** Codes are single-use: the exchange deletes, never marks. */
-  deleteToken(token: string, kind: TokenKind): Promise<void>;
+  /**
+   * Codes and refresh tokens are single-use: the exchange deletes, never
+   * marks. True only for the one caller whose delete removed the row.
+   */
+  deleteToken(token: string, kind: TokenKind): Promise<boolean>;
 
   close(): Promise<void>;
 }
@@ -137,8 +140,8 @@ export class MemoryOAuthStore implements OAuthStore {
     return this.tokens.get(`${kind}:${hashToken(token)}`);
   }
 
-  async deleteToken(token: string, kind: TokenKind): Promise<void> {
-    this.tokens.delete(`${kind}:${hashToken(token)}`);
+  async deleteToken(token: string, kind: TokenKind): Promise<boolean> {
+    return this.tokens.delete(`${kind}:${hashToken(token)}`);
   }
 
   async close(): Promise<void> {

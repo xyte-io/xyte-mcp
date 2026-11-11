@@ -223,11 +223,12 @@ export class PgOAuthStore implements OAuthStore {
     };
   }
 
-  async deleteToken(token: string, kind: TokenKind): Promise<void> {
-    await this.pool.query('DELETE FROM oauth_tokens WHERE kind = $1 AND token_hash = $2', [
-      kind,
-      hashToken(token)
-    ]);
+  async deleteToken(token: string, kind: TokenKind): Promise<boolean> {
+    const result = await this.pool.query(
+      'DELETE FROM oauth_tokens WHERE kind = $1 AND token_hash = $2 RETURNING 1',
+      [kind, hashToken(token)]
+    );
+    return result.rowCount === 1;
   }
 
   async close(): Promise<void> {

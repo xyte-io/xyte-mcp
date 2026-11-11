@@ -386,6 +386,26 @@ describe('XyteOAuthProvider: our tokens', () => {
     ).rejects.toThrow(/redirect_uri/);
   });
 
+  it('lets only one of two concurrent exchanges of a code or refresh token mint', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { code } = await signIn(provider, client);
+    const codeRuns = await Promise.allSettled([
+      provider.exchangeAuthorizationCode(client, code),
+      provider.exchangeAuthorizationCode(client, code)
+    ]);
+    expect(codeRuns.map((run) => run.status).sort()).toEqual(['fulfilled', 'rejected']);
+
+    const tokens = (codeRuns.find((run) => run.status === 'fulfilled') as PromiseFulfilledResult<
+      Awaited<ReturnType<typeof provider.exchangeAuthorizationCode>>
+    >)!.value;
+    const refreshRuns = await Promise.allSettled([
+      provider.exchangeRefreshToken(client, tokens.refresh_token!),
+      provider.exchangeRefreshToken(client, tokens.refresh_token!)
+    ]);
+    expect(refreshRuns.map((run) => run.status).sort()).toEqual(['fulfilled', 'rejected']);
+  });
+
   it('rotates refresh tokens and kills the old one', async () => {
     const { provider } = makeProvider();
     const client = await registeredClient(provider);

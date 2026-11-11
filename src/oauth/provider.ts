@@ -388,8 +388,11 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     if (resource && resource.href !== (record.resource ?? this.expectedResource)) {
       throw new InvalidGrantError('resource does not match the authorization request');
     }
-    // Single-use: a replayed code must fail, per OAuth 2.1.
-    await this.store.deleteToken(authorizationCode, 'code');
+    // Single-use: a replayed code must fail, per OAuth 2.1 — and of two
+    // concurrent exchanges, only the one whose delete took the row mints.
+    if (!(await this.store.deleteToken(authorizationCode, 'code'))) {
+      throw new InvalidGrantError('authorization code is invalid or expired');
+    }
     return this.mintTokenPair(record.grantId, record.resource);
   }
 
@@ -410,8 +413,10 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     if (resource && resource.href !== (record.resource ?? this.expectedResource)) {
       throw new InvalidGrantError('resource does not match the original grant');
     }
-    // Rotation: the old refresh token dies with the exchange.
-    await this.store.deleteToken(refreshToken, 'refresh');
+    // Rotation: the old refresh token dies with the exchange, once.
+    if (!(await this.store.deleteToken(refreshToken, 'refresh'))) {
+      throw new InvalidGrantError('refresh token is invalid or expired');
+    }
     return this.mintTokenPair(record.grantId, record.resource);
   }
 

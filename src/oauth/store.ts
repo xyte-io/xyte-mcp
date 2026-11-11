@@ -1,15 +1,15 @@
 import { createHash } from 'node:crypto';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { HubUserCredential } from '../config.js';
+import type { HubSignIn, HubTokens } from './hub-oauth.js';
 
 /**
  * Persistence for the OAuth server: registered clients, grants (one per
- * successful hub login, holding the hub credential every later call runs
- * under), and the tokens hanging off each grant.
+ * successful hub sign-in, holding the hub tokens every later call runs under),
+ * and the tokens hanging off each grant.
  *
- * Tokens are stored as SHA-256 hashes — a leaked database row must not be a
- * usable credential. The hub access token inside a grant is the exception: it
- * has to be sent upstream verbatim, so it is stored as-is. Revocation is
+ * Our tokens are stored as SHA-256 hashes — a leaked database row must not be
+ * a usable credential. The hub tokens inside a grant are the exception: they
+ * have to be sent to the hub verbatim, so they are stored as-is. Revocation is
  * grant-level on purpose: revoking any one token kills the login it came from,
  * which is the behavior a "disconnect" button needs.
  */
@@ -19,7 +19,8 @@ export type TokenKind = 'code' | 'access' | 'refresh';
 export interface GrantRecord {
   id: string;
   clientId: string;
-  hub: HubUserCredential;
+  /** Absent on grants from the old devise-triplet login: those are dead. */
+  hub?: HubSignIn;
   revoked: boolean;
 }
 
@@ -45,9 +46,20 @@ export interface OAuthStore {
   getClient(clientId: string): Promise<OAuthClientInformationFull | undefined>;
   saveClient(client: OAuthClientInformationFull): Promise<void>;
 
-  createGrant(clientId: string, hub: HubUserCredential): Promise<string>;
+  createGrant(clientId: string, hub: HubSignIn): Promise<string>;
   getGrant(grantId: string): Promise<GrantRecord | undefined>;
   revokeGrant(grantId: string): Promise<void>;
+  /**
+   * Store a rotated hub token pair — only if the grant still holds
+   * `previousRefreshToken`. False means someone else rotated first.
+   */
+  rotateHubTokens(
+    grantId: string,
+    previousRefreshToken: string,
+    next: HubTokens
+  ): Promise<boolean>;
+  /** Whether a live grant other than `exceptGrantId` rides the same hub sign-in. */
+  hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean>;
 
   saveToken(token: NewToken): Promise<void>;
   getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined>;
@@ -79,19 +91,42 @@ export class MemoryOAuthStore implements OAuthStore {
     this.clients.set(client.client_id, client);
   }
 
-  async createGrant(clientId: string, hub: HubUserCredential): Promise<string> {
+  async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
     const id = String(this.nextGrantId++);
     this.grants.set(id, { id, clientId, hub, revoked: false });
     return id;
   }
 
   async getGrant(grantId: string): Promise<GrantRecord | undefined> {
-    return this.grants.get(grantId);
+    // A copy, like a row read from Postgres: callers compare snapshots across awaits.
+    const grant = this.grants.get(grantId);
+    return grant && { ...grant };
   }
 
   async revokeGrant(grantId: string): Promise<void> {
     const grant = this.grants.get(grantId);
     if (grant) grant.revoked = true;
+  }
+
+  async rotateHubTokens(
+    grantId: string,
+    previousRefreshToken: string,
+    next: HubTokens
+  ): Promise<boolean> {
+    const grant = this.grants.get(grantId);
+    if (!grant?.hub || grant.hub.refreshToken !== previousRefreshToken) return false;
+    grant.hub = { ...grant.hub, ...next };
+    return true;
+  }
+
+  async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
+    return [...this.grants.values()].some(
+      (grant) =>
+        grant.id !== exceptGrantId &&
+        !grant.revoked &&
+        grant.hub?.sub === sub &&
+        grant.hub.tenantId === tenantId
+    );
   }
 
   async saveToken({ token, ...record }: NewToken): Promise<void> {

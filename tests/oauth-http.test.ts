@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import {
   createServer,
   type IncomingMessage,
@@ -12,9 +12,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 /**
  * The whole OAuth dance against a real `--http` child process, with a fake hub
- * behind it: discovery → dynamic registration → /authorize → login form →
- * code → /token with PKCE → an authenticated MCP tool call that reaches the
- * hub under the *user's* credential → revocation. One sequential suite,
+ * behind it: discovery → dynamic registration → /authorize consent page →
+ * approve → hub /oauth/authorize → callback → code → /token with PKCE → an
+ * authenticated MCP tool call that reaches the hub under the grant's hub
+ * token → revocation, at hub too. One sequential suite,
  * because each step consumes the previous one's output — exactly like a real
  * client.
  */
@@ -22,8 +23,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
 const STATIC_TOKEN = 'xmcp_static_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
-const HUB_USER = { email: 'user@example.com', password: 'pw-123', tenant: 'tenant-1' };
-const HUB_TOKENS = { 'access-token': 'hub-at-1', client: 'hub-client-1', uid: HUB_USER.email };
+const VERSION = (
+  JSON.parse(readFileSync(path.resolve(import.meta.dirname, '..', 'package.json'), 'utf8')) as {
+    version: string;
+  }
+).version;
+const ID_TOKEN = `h.${Buffer.from(
+  JSON.stringify({ sub: 'user-1', xyte_tenant_id: 'org-1', email: 'user@example.com' })
+).toString('base64url')}.s`;
 const MCP_HEADERS = {
   'Content-Type': 'application/json',
   Accept: 'application/json, text/event-stream'
@@ -37,25 +44,32 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-/** Just enough hub: devise sign_in plus one org API read that echoes headers. */
+/** Just enough hub: OAuth token + revoke, plus one org API read that echoes headers. */
 function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> } {
   const requests: Array<Record<string, unknown>> = [];
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let body = '';
     req.on('data', (chunk: string) => (body += chunk));
     req.on('end', () => {
-      if (req.method === 'POST' && req.url === '/auth/sign_in') {
-        const { email, password } = JSON.parse(body || '{}') as Record<string, string>;
-        if (email === HUB_USER.email && password === HUB_USER.password) {
-          res.writeHead(200, { 'Content-Type': 'application/json', ...HUB_TOKENS });
-          res.end(JSON.stringify({ data: { last_tenant_id: HUB_USER.tenant } }));
-        } else {
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ errors: ['Invalid login credentials.'] }));
-        }
+      requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
+      if (req.method === 'POST' && req.url === '/oauth/token') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            access_token: 'xoat_1',
+            refresh_token: 'xort_1',
+            expires_in: 3600,
+            token_type: 'Bearer',
+            id_token: ID_TOKEN
+          })
+        );
         return;
       }
-      requests.push({ method: req.method, url: req.url, headers: { ...req.headers } });
+      if (req.method === 'POST' && req.url === '/oauth/revoke') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ devices: [] }));
     });
@@ -83,6 +97,8 @@ beforeAll(async () => {
       ...process.env,
       PORT: String(port),
       XYTE_MCP_ISSUER_URL: base,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
       XYTE_MCP_HTTP_TOKEN: STATIC_TOKEN,
       XYTE_ORG_API_KEY: ORG_KEY,
       XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
@@ -122,6 +138,39 @@ async function mcp(token: string | null, body: unknown): Promise<Response> {
     headers: { ...MCP_HEADERS, ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body)
   });
+}
+
+/** `name=value` of the first Set-Cookie, as a browser would send it back. */
+function cookieOf(response: Response): string {
+  return response.headers.getSetCookie()[0]!.split(';')[0]!;
+}
+
+function authorizeUrl(): URL {
+  const url = new URL(`${base}/authorize`);
+  url.search = form({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: REDIRECT,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: 'st4te'
+  });
+  return url;
+}
+
+/** GET /authorize, then Approve; returns hub's state and the browser cookie. */
+async function approve(): Promise<{ hubUrl: URL; cookie: string }> {
+  const page = await fetch(authorizeUrl());
+  const html = await page.text();
+  const field = (name: string) => new RegExp(`name="${name}" value="([^"]+)"`).exec(html)![1]!;
+  const response = await fetch(`${base}/oauth/consent`, {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Cookie: cookieOf(page) },
+    body: form({ pending: field('pending'), csrf: field('csrf'), decision: 'approve' })
+  });
+  expect(response.status).toBe(302);
+  return { hubUrl: new URL(response.headers.get('location')!), cookie: cookieOf(response) };
 }
 
 // State threaded through the sequential dance.
@@ -176,59 +225,55 @@ describe('oauth over http, in order', () => {
     expect(clientId).toBeTruthy();
   });
 
-  it('serves the login form from /authorize', async () => {
-    const url = new URL(`${base}/authorize`);
-    url.search = form({
-      response_type: 'code',
-      client_id: clientId,
-      redirect_uri: REDIRECT,
-      code_challenge: challenge,
-      code_challenge_method: 'S256',
-      state: 'st4te'
-    });
-    const response = await fetch(url);
+  it('serves a consent page from /authorize — never a redirect, never framable', async () => {
+    const response = await fetch(authorizeUrl(), { redirect: 'manual' });
     expect(response.status).toBe(200);
+    expect(response.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+    expect(response.headers.get('x-frame-options')).toBe('DENY');
+    expect(response.headers.getSetCookie()[0]).toMatch(
+      /^__Host-xmcp_[^=]+=[^;]+;.*Path=\/;.*HttpOnly;.*Secure;.*SameSite=Lax/
+    );
     const html = await response.text();
-    expect(html).toContain('Sign in to Xyte');
-    expect(html).toContain(challenge);
+    expect(html).toContain('test-connector');
+    expect(html).toContain('127.0.0.1:9');
   });
 
-  it('rejects a wrong password by re-rendering the form', async () => {
-    const response = await fetch(`${base}/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form({
-        email: HUB_USER.email,
-        password: 'wrong',
-        client_id: clientId,
-        redirect_uri: REDIRECT,
-        code_challenge: challenge
-      })
-    });
-    expect(response.status).toBe(401);
-    expect(await response.text()).toContain('Wrong email or password');
+  it('refuses a callback from a browser that did not approve, issuing nothing', async () => {
+    const { hubUrl } = await approve();
+    const before = hub.requests.length;
+    const response = await fetch(
+      `${base}/oauth/callback?state=${hubUrl.searchParams.get('state')}&code=hub-code`,
+      { redirect: 'manual' }
+    );
+    expect(response.status).toBe(400);
+    expect(hub.requests.length).toBe(before);
   });
 
-  it('logs in against the hub and redirects with a code', async () => {
-    const response = await fetch(`${base}/login`, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form({
-        email: HUB_USER.email,
-        password: HUB_USER.password,
-        client_id: clientId,
-        redirect_uri: REDIRECT,
-        code_challenge: challenge,
-        state: 'st4te'
-      })
-    });
+  it('approve redirects to hub with our PKCE, then the callback mints a code', async () => {
+    const { hubUrl, cookie } = await approve();
+    expect(hubUrl.pathname).toBe('/oauth/authorize');
+    expect(hubUrl.searchParams.get('client_id')).toBe('mcp-client');
+    expect(hubUrl.searchParams.get('scope')).toBe('openid email profile');
+    expect(hubUrl.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(hubUrl.searchParams.get('code_challenge')).toBeTruthy();
+    expect(hubUrl.searchParams.get('redirect_uri')).toBe(`${base}/oauth/callback`);
+
+    const response = await fetch(
+      `${base}/oauth/callback?state=${hubUrl.searchParams.get('state')}&code=hub-code`,
+      { redirect: 'manual', headers: { Cookie: cookie } }
+    );
     expect(response.status).toBe(302);
     const location = new URL(response.headers.get('location')!);
     expect(location.origin + location.pathname).toBe(REDIRECT);
     expect(location.searchParams.get('state')).toBe('st4te');
     code = location.searchParams.get('code')!;
     expect(code).toMatch(/^xmcp_ac_/);
+
+    const exchange = hub.requests.find((request) => request.url === '/oauth/token')!;
+    expect((exchange.headers as Record<string, string>).authorization).toBe(
+      `Basic ${Buffer.from('mcp-client:mcp-secret').toString('base64')}`
+    );
+    expect(new URLSearchParams(exchange.body as string).get('code')).toBe('hub-code');
   });
 
   it('refuses the token exchange with a wrong PKCE verifier', async () => {
@@ -265,7 +310,7 @@ describe('oauth over http, in order', () => {
     expect(accessToken).toMatch(/^xmcp_at_/);
   });
 
-  it('calls a hub endpoint under the logged-in user, not the org key', async () => {
+  it('calls a hub endpoint with the hub OAuth token, not the org key', async () => {
     const listed = await mcp(accessToken, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
     expect(listed.status).toBe(200);
 
@@ -280,12 +325,11 @@ describe('oauth over http, in order', () => {
     expect(result.result?.isError).toBeFalsy();
 
     const hubRequest = hub.requests.at(-1)!;
+    expect(hubRequest.url).toMatch(/^\/core\/v1\/organization\/devices/);
     const headers = hubRequest.headers as Record<string, string>;
-    expect(headers['access-token']).toBe(HUB_TOKENS['access-token']);
-    expect(headers.client).toBe(HUB_TOKENS.client);
-    expect(headers.uid).toBe(HUB_TOKENS.uid);
-    expect(headers.tenant).toBe(HUB_USER.tenant);
-    expect(headers.authorization).toBeUndefined();
+    expect(headers.authorization).toBe('Bearer xoat_1');
+    expect(headers['x-xyte-client']).toBe(`xyte-mcp/${VERSION}`);
+    expect(headers.tenant).toBeUndefined();
   });
 
   it('still accepts the phase-1 static bearer alongside OAuth', async () => {
@@ -313,6 +357,8 @@ describe('oauth over http, in order', () => {
       body: form({ token: refreshToken, client_id: clientId })
     });
     expect(revoke.status).toBe(200);
+    const hubRevoke = hub.requests.find((request) => request.url === '/oauth/revoke')!;
+    expect(new URLSearchParams(hubRevoke.body as string).get('token')).toBe('xort_1');
 
     expect((await mcp(accessToken, { jsonrpc: '2.0', id: 4, method: 'tools/list' })).status).toBe(
       401

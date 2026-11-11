@@ -147,18 +147,39 @@ describe('resolveHttpConfig', () => {
     expect(() => resolveHttpConfig({ [ENV.httpToken]: token })).toThrow(/no API key/);
   });
 
+  const hubClientEnv = {
+    [ENV.hubOAuthClientId]: 'hub-id',
+    [ENV.hubOAuthClientSecret]: 'hub-secret'
+  };
+  const hubClient = { id: 'hub-id', secret: 'hub-secret' };
+
   it('enables OAuth from the issuer URL, with and without a database', () => {
     const issuer = 'https://mcp.example.com';
-    expect(resolveHttpConfig({ [ENV.issuerUrl]: `${issuer}/` }).oauth).toEqual({
-      issuerUrl: issuer
+    expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: `${issuer}/` }).oauth).toEqual({
+      issuerUrl: issuer,
+      hubClient
     });
     expect(
-      resolveHttpConfig({ [ENV.issuerUrl]: issuer, [ENV.databaseUrl]: 'postgres://x' }).oauth
-    ).toEqual({ issuerUrl: issuer, databaseUrl: 'postgres://x' });
+      resolveHttpConfig({
+        ...hubClientEnv,
+        [ENV.issuerUrl]: issuer,
+        [ENV.databaseUrl]: 'postgres://x'
+      }).oauth
+    ).toEqual({ issuerUrl: issuer, databaseUrl: 'postgres://x', hubClient });
+  });
+
+  it('refuses OAuth without the hub client credentials', () => {
+    expect(() =>
+      resolveHttpConfig({ [ENV.issuerUrl]: 'https://mcp.example.com', [ENV.hubOAuthClientId]: 'x' })
+    ).toThrow(new RegExp(ENV.hubOAuthClientSecret));
   });
 
   it('accepts static + OAuth together', () => {
-    const config = resolveHttpConfig({ ...staticEnv, [ENV.issuerUrl]: 'https://mcp.example.com' });
+    const config = resolveHttpConfig({
+      ...staticEnv,
+      ...hubClientEnv,
+      [ENV.issuerUrl]: 'https://mcp.example.com'
+    });
     expect(config.staticToken).toBe(token);
     expect(config.oauth?.issuerUrl).toBe('https://mcp.example.com');
   });
@@ -169,9 +190,10 @@ describe('resolveHttpConfig', () => {
     expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'http://mcp.example.com' })).toThrow(
       /https/
     );
-    expect(resolveHttpConfig({ [ENV.issuerUrl]: 'http://127.0.0.1:8080' }).oauth?.issuerUrl).toBe(
-      'http://127.0.0.1:8080'
-    );
+    expect(
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'http://127.0.0.1:8080' }).oauth
+        ?.issuerUrl
+    ).toBe('http://127.0.0.1:8080');
   });
 
   it('refuses an issuer with a query or fragment', () => {

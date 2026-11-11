@@ -5,11 +5,9 @@
  *   XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -- https://<app>.herokuapp.com
  *   npm run smoke:remote -- https://<app>.herokuapp.com --token-stdin
  *
- * With hub credentials, also smokes the OAuth 2.1 surface end to end —
- * discovery, dynamic registration, login, PKCE token exchange, a call under
- * the minted token, and revocation:
- *
- *   XYTE_SMOKE_EMAIL=<email> XYTE_SMOKE_PASSWORD=<pw> npm run smoke:remote -- https://<app>...
+ * When OAuth is on, also smokes its browser-free part: discovery, dynamic
+ * registration and the consent page. Signing in happens at hub in a browser,
+ * so the rest of the dance is verified by connecting a real client.
  *
  * Asserts the positives (health, handshake, tool list, a real read against the
  * configured org) *and* the denials that fail silently otherwise: no token,
@@ -19,9 +17,9 @@
  *
  * Read-only by construction: nothing here can mutate hub state. The write
  * check expects a refusal, and treats a success as a failed test. (The OAuth
- * dance does mint and revoke tokens on the MCP server itself.)
+ * check does register a client on the MCP server itself.)
  *
- * No token or password is ever printed, not even on failure.
+ * No token is ever printed, not even on failure.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -105,8 +103,8 @@ async function call(base, token, method, params) {
 const checks = [];
 const check = (name, fn, when) => checks.push({ name, fn, when });
 
-/** The token authenticated checks run under: static if set, else OAuth-minted. */
-const authToken = (ctx) => ctx.token ?? ctx.minted?.access;
+/** The token authenticated checks run under. */
+const authToken = (ctx) => ctx.token;
 
 check('GET /healthz answers without a token', async ({ base }) => {
   const response = await request(`${base}/healthz`, { method: 'GET' });
@@ -139,16 +137,10 @@ check('POST with a wrong token is 401', async ({ base }) => {
   return '401';
 });
 
-// ---- The OAuth dance runs early so later checks can use its minted token ----
-
-const OAUTH_WHEN = (ctx) => ctx.oauth && ctx.login;
-
 check(
-  'OAuth: discovery, registration, login, PKCE exchange',
-  async (ctx) => {
-    const { base, login } = ctx;
+  'OAuth: registration, then /authorize shows a consent page (never a redirect)',
+  async ({ base }) => {
     const redirectUri = 'http://127.0.0.1:9/smoke-callback';
-
     const registered = await request(`${base}/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -163,40 +155,20 @@ check(
     if (registered.status !== 201) throw new Error(`register: ${registered.status}`);
     const { client_id: clientId } = await registered.json();
 
-    const verifier = randomBytes(32).toString('base64url');
-    const challenge = createHash('sha256').update(verifier).digest('base64url');
-    const loggedIn = await request(`${base}/login`, {
-      method: 'POST',
-      redirect: 'manual',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        email: login.email,
-        password: login.password,
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        code_challenge: challenge
-      }).toString()
-    });
-    if (loggedIn.status !== 302) throw new Error(`login: expected 302, got ${loggedIn.status}`);
-    const code = new URL(loggedIn.headers.get('location')).searchParams.get('code');
-
-    const exchanged = await request(`${base}/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-        code_verifier: verifier,
-        client_id: clientId,
-        redirect_uri: redirectUri
-      }).toString()
-    });
-    if (exchanged.status !== 200) throw new Error(`token: ${exchanged.status}`);
-    const tokens = await exchanged.json();
-    ctx.minted = { access: tokens.access_token, refresh: tokens.refresh_token, clientId };
-    return 'registered, logged in, exchanged';
+    const authorize = new URL(`${base}/authorize`);
+    authorize.search = new URLSearchParams({
+      response_type: 'code',
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      code_challenge: createHash('sha256').update(randomBytes(32)).digest('base64url'),
+      code_challenge_method: 'S256'
+    }).toString();
+    const page = await request(authorize.toString(), { method: 'GET', redirect: 'manual' });
+    if (page.status !== 200) throw new Error(`authorize: expected 200, got ${page.status}`);
+    if (page.headers.get('x-frame-options') !== 'DENY') throw new Error('consent page is framable');
+    return 'registered, consent page served';
   },
-  OAUTH_WHEN
+  (ctx) => ctx.oauth
 );
 
 check('an authenticated request to another path is 404', async (ctx) => {
@@ -273,61 +245,20 @@ check('a mutating endpoint is refused', async (ctx) => {
   return 'refused';
 });
 
-check(
-  'OAuth: a read under the minted token succeeds',
-  async (ctx) => {
-    const result = await call(ctx.base, ctx.minted.access, 'tools/call', {
-      name: 'xyte_api_call',
-      arguments: { key: 'organization.devices.getDevices', query: { page: 1, per_page: 1 } }
-    });
-    if (result.isError) throw new Error(result.content?.[0]?.text ?? 'tool returned isError');
-    const status = result.structuredContent?.status;
-    if (status !== 200) throw new Error(`hub returned ${status ?? 'no status'}`);
-    return 'hub 200 as the logged-in user';
-  },
-  (ctx) => Boolean(ctx.minted)
-);
-
-check(
-  'OAuth: revocation kills the token',
-  async ({ base, minted }) => {
-    const revoked = await request(`${base}/revoke`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: minted.refresh, client_id: minted.clientId }).toString()
-    });
-    if (revoked.status !== 200) throw new Error(`revoke: ${revoked.status}`);
-    const after = await post(base, minted.access, { jsonrpc: '2.0', id: 0, method: 'tools/list' });
-    if (after.status !== 401) throw new Error(`expected 401 after revoke, got ${after.status}`);
-    return 'revoked → 401';
-  },
-  (ctx) => Boolean(ctx.minted)
-);
-
 async function main() {
   const argv = process.argv.slice(2);
   const base = resolveBase(argv);
   const token = await resolveToken(argv);
   const oauth = await detectOAuth(base);
-  const email = process.env.XYTE_SMOKE_EMAIL?.trim();
-  const password = process.env.XYTE_SMOKE_PASSWORD?.trim();
-  const login = email && password ? { email, password } : undefined;
 
-  if (!token && !(oauth && login)) {
-    throw new Error(
-      'No way to authenticate. Set XYTE_MCP_HTTP_TOKEN (or --token-stdin) for the static\n' +
-        'bearer, and/or XYTE_SMOKE_EMAIL + XYTE_SMOKE_PASSWORD for the OAuth flow.'
-    );
+  if (!token) {
+    throw new Error('No way to authenticate. Set XYTE_MCP_HTTP_TOKEN (or --token-stdin).');
   }
 
-  const ctx = { base, token, oauth, login };
-  process.stderr.write(
-    `smoking ${base} — static bearer: ${token ? 'yes' : 'no'}, oauth: ${oauth ? 'served' : 'off'}${
-      oauth && !login ? ' (no XYTE_SMOKE_EMAIL/PASSWORD — dance skipped)' : ''
-    }\n\n`
-  );
+  const ctx = { base, token, oauth };
+  process.stderr.write(`smoking ${base} — oauth: ${oauth ? 'served' : 'off'}\n\n`);
 
-  const secrets = () => [token, ctx.minted?.access, ctx.minted?.refresh, password].filter(Boolean);
+  const secrets = () => [token];
   let failed = 0;
   let skipped = 0;
   for (const { name, fn, when } of checks) {

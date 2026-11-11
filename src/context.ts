@@ -25,7 +25,7 @@ export function createToolContext(config: ServerConfig, http?: HttpClient): Tool
     credentials: config.credentials,
     baseUrls: config.baseUrls,
     allowWrites: config.allowWrites,
-    // A credential is either a bare API key or a hub user session; in both
+    // A credential is either a bare API key or a hub OAuth token; in both
     // shapes the token values must never reach the caller.
     secrets: Object.values(config.credentials).flatMap((value) => {
       if (typeof value === 'string') return value.length > 0 ? [value] : [];

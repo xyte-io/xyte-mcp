@@ -26,7 +26,11 @@ Environment, --http only (set a static token, OAuth, or both):
   ${ENV.httpToken}   Static bearer token, fronting the process API key (dev/CI).
   ${ENV.issuerUrl}   Public https URL of this deployment; enables OAuth 2.1
                         (metadata, dynamic registration, authorize/token with
-                        PKCE, hub-login delegation).
+                        PKCE, sign-in via hub OAuth).
+  ${ENV.hubOAuthClientId}
+  ${ENV.hubOAuthClientSecret}
+                        This server's client credentials at hub's OAuth
+                        server; both required with OAuth.
   ${ENV.databaseUrl}          Postgres DSN for the OAuth token store. Without it,
                         tokens are in-memory and die with the process.
   ${ENV.httpPort}                     Port to listen on (default 3000).

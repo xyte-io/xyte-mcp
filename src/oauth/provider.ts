@@ -1,5 +1,5 @@
-import { createHash, randomBytes } from 'node:crypto';
-import type { Response } from 'express';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import type { Request, Response } from 'express';
 import {
   InvalidClientError,
   InvalidGrantError,
@@ -16,68 +16,67 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens
 } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { HubUserCredential } from '../config.js';
-import type { DescopeLogin } from './descope.js';
+import type { HttpClient } from '../http/client.js';
+import { XyteError, XyteHttpError } from '../http/errors.js';
+import { logError } from '../log.js';
+import { nowSeconds, type HubOAuth } from './hub-oauth.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 
 /**
- * The OAuth 2.1 authorization server, backed by hub logins.
+ * The OAuth 2.1 authorization server, backed by hub's own OAuth server.
  *
  * The protocol surface (metadata, DCR, /authorize, /token, PKCE verification)
  * is the SDK's `mcpAuthRouter`; this class is only the policy behind it:
- * `/authorize` renders a login form, a successful hub sign-in becomes a grant
- * holding that user's hub credential, and the tokens we mint are our own,
+ * `/authorize` shows our consent page, Approve sends the browser to hub's
+ * `/oauth/authorize` (we are a confidential client there), and the callback
+ * turns hub's tokens into a grant. The tokens we mint are our own,
  * audience-bound to this server. The client's token is never forwarded to the
- * hub — each request looks up the grant and uses the stored hub credential —
- * so a token stolen from a client is useless against the hub directly.
+ * hub — each request looks up the grant and uses the stored hub token — so a
+ * token stolen from a client is useless against the hub directly.
+ *
+ * A hub token carries its organization's full authority, like an org API key;
+ * the user who signed in is attribution only, not a role the hub enforces.
  */
 
 const CODE_TTL_SECONDS = 10 * 60;
 const ACCESS_TTL_SECONDS = 60 * 60;
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
+/** Refresh a hub access token this close to its expiry rather than risk a 401. */
+const HUB_REFRESH_SKEW_SECONDS = 60;
 
-/** Validates hub credentials; returns undefined on a wrong email/password. */
-export type HubSignIn = (email: string, password: string) => Promise<HubUserCredential | undefined>;
-
-export interface LoginForm {
-  email?: string;
-  password?: string;
-  client_id?: string;
-  redirect_uri?: string;
-  code_challenge?: string;
-  state?: string;
-  resource?: string;
-}
-
-export type LoginResult = { redirectTo: string } | { html: string; status: number };
-
-/** An /authorize request parked while the user logs in at Descope. */
+/** An /authorize request parked across our consent page and hub's sign-in. */
 interface PendingAuthorization {
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
   state?: string;
   resource?: string;
-  /** Our PKCE verifier for the Descope leg. */
-  descopeVerifier: string;
+  /** Echoed by the consent form. */
+  csrf: string;
+  /** Held by the consenting browser in a cookie; the callback must present it. */
+  browserKey: string;
+  approved: boolean;
+  /** Our PKCE verifier for the hub leg. */
+  hubVerifier: string;
   expiresAt: number;
 }
 
 const PENDING_TTL_SECONDS = 10 * 60;
+const COOKIE_PREFIX = '__Host-xmcp_';
+const EXPIRED = 'Authorization expired or invalid. Restart the connection.';
 
 export class XyteOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
-  // ponytail: in-memory — a dyno restart mid-login just makes the user retry.
-  // Move into the store if this ever runs on more than one dyno.
+  // ponytail: in-memory, as is the refresh single-flight below — which is why
+  // the Procfile pins one dyno. A restart mid-login just makes the user retry.
   private readonly pending = new Map<string, PendingAuthorization>();
+  private readonly refreshing = new Map<string, Promise<string>>();
 
   constructor(
     private readonly store: OAuthStore,
-    private readonly signIn: HubSignIn,
+    private readonly hub: HubOAuth,
     /** e.g. https://xyte-mcp-aran.herokuapp.com — no trailing slash. */
-    private readonly issuerUrl: string,
-    /** When set, /authorize delegates login to Descope instead of the password form. */
-    private readonly descope?: DescopeLogin
+    private readonly issuerUrl: string
   ) {
     this.clientsStore = {
       getClient: (clientId) => this.store.getClient(clientId),
@@ -95,141 +94,145 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     return `${this.issuerUrl}/mcp`;
   }
 
+  /**
+   * Never auto-approves: a DCR client names itself, so the user has to see
+   * that name and where the code will go before anything reaches the hub.
+   */
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
-    if (this.descope) {
-      const pendingId = randomBytes(24).toString('base64url');
-      const descopeVerifier = randomBytes(32).toString('base64url');
-      this.prunePending();
-      this.pending.set(pendingId, {
-        clientId: client.client_id,
-        redirectUri: params.redirectUri,
-        codeChallenge: params.codeChallenge,
-        ...(params.state ? { state: params.state } : {}),
-        ...(params.resource ? { resource: params.resource.href } : {}),
-        descopeVerifier,
-        expiresAt: nowSeconds() + PENDING_TTL_SECONDS
-      });
+    if (params.resource && params.resource.href !== this.expectedResource) {
+      res.status(400).type('html').send(errorPage('This authorization is for a different server.'));
+      return;
+    }
+    const pendingId = random();
+    const entry: PendingAuthorization = {
+      clientId: client.client_id,
+      redirectUri: params.redirectUri,
+      codeChallenge: params.codeChallenge,
+      ...(params.state ? { state: params.state } : {}),
+      ...(params.resource ? { resource: params.resource.href } : {}),
+      csrf: random(),
+      browserKey: random(),
+      approved: false,
+      hubVerifier: random(),
+      expiresAt: nowSeconds() + PENDING_TTL_SECONDS
+    };
+    this.prunePending();
+    this.pending.set(pendingId, entry);
+
+    // Set with the page, not only on Approve: a cross-site auto-submitted
+    // Approve carries no SameSite=Lax cookie, so it cannot skip this page.
+    setBrowserCookie(res, pendingId, entry.browserKey);
+    frameDeny(res)
+      .status(200)
+      .type('html')
+      .send(
+        consentPage({
+          clientName: typeof client.client_name === 'string' ? client.client_name : undefined,
+          redirectHost: new URL(params.redirectUri).host,
+          pendingId,
+          csrf: entry.csrf
+        })
+      );
+  }
+
+  /** POST /oauth/consent: Approve goes on to hub, Deny back to the client. */
+  async consent(req: Request, res: Response): Promise<void> {
+    const form = (req.body ?? {}) as Record<string, unknown>;
+    const pendingId = typeof form.pending === 'string' ? form.pending : '';
+    const entry = this.livePending(pendingId);
+    if (
+      !entry ||
+      !same(form.csrf, entry.csrf) ||
+      !same(readCookie(req, COOKIE_PREFIX + pendingId), entry.browserKey)
+    ) {
+      if (entry) this.pending.delete(pendingId);
+      res.status(400).type('html').send(errorPage(EXPIRED));
+      return;
+    }
+
+    if (form.decision !== 'approve') {
+      this.pending.delete(pendingId);
+      res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
+      return;
+    }
+
+    // Same key as set with the page, so a double-clicked Approve stays valid.
+    entry.approved = true;
+    setBrowserCookie(res, pendingId, entry.browserKey);
+    res.redirect(
+      302,
+      this.hub.authorizeUrl({
+        state: pendingId,
+        codeChallenge: createHash('sha256').update(entry.hubVerifier).digest('base64url')
+      })
+    );
+  }
+
+  /**
+   * GET /oauth/callback: hub's answer. Only the browser that approved our
+   * consent page may complete it — otherwise an attacker could approve their
+   * own consent and hand the hub URL to a victim, whose sign-in would then
+   * mint a code for the attacker's client.
+   */
+  async callback(req: Request, res: Response): Promise<void> {
+    const query = req.query as Record<string, unknown>;
+    const pendingId = typeof query.state === 'string' ? query.state : '';
+    const entry = this.livePending(pendingId);
+    // Single-use either way: a replayed callback must not mint twice.
+    if (entry) {
+      this.pending.delete(pendingId);
+      res.cookie(COOKIE_PREFIX + pendingId, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+    }
+    if (!entry?.approved || !same(readCookie(req, COOKIE_PREFIX + pendingId), entry.browserKey)) {
+      res.status(400).type('html').send(errorPage(EXPIRED));
+      return;
+    }
+
+    if (typeof query.error === 'string') {
+      const description = [query.error_reason, query.error_description]
+        .filter((part): part is string => typeof part === 'string' && part.length > 0)
+        .join(': ');
       res.redirect(
-        this.descope.authorizeRedirect({
-          state: pendingId,
-          codeChallenge: createHash('sha256').update(descopeVerifier).digest('base64url')
+        302,
+        clientRedirect(entry, {
+          error: query.error,
+          ...(description ? { error_description: description } : {})
         })
       );
       return;
     }
 
-    res
-      .status(200)
-      .type('html')
-      .send(
-        loginPage({
-          clientName: typeof client.client_name === 'string' ? client.client_name : client.client_id,
-          hidden: {
-            client_id: client.client_id,
-            redirect_uri: params.redirectUri,
-            code_challenge: params.codeChallenge,
-            ...(params.state ? { state: params.state } : {}),
-            ...(params.resource ? { resource: params.resource.href } : {})
-          }
-        })
+    try {
+      if (typeof query.code !== 'string') throw new Error('hub callback has no code or error');
+      const signIn = await this.hub.exchangeCode(query.code, entry.hubVerifier);
+      const grantId = await this.store.createGrant(entry.clientId, signIn);
+      const code = mintToken('ac');
+      await this.store.saveToken({
+        token: code,
+        kind: 'code',
+        grantId,
+        codeChallenge: entry.codeChallenge,
+        redirectUri: entry.redirectUri,
+        ...(entry.resource ? { resource: entry.resource } : {}),
+        expiresAt: nowSeconds() + CODE_TTL_SECONDS
+      });
+      res.redirect(302, clientRedirect(entry, { code }));
+    } catch (error) {
+      logError(`hub sign-in failed: ${error instanceof Error ? error.message : String(error)}`);
+      res.redirect(
+        302,
+        clientRedirect(entry, { error: 'server_error', error_description: 'Xyte sign-in failed' })
       );
+    }
   }
 
-  /**
-   * The POST /login handler's logic: validate the replayed OAuth parameters
-   * against the client's registration (they arrive from a browser form, so
-   * they are attacker-writable), check the credentials with the hub, and mint
-   * a single-use authorization code bound to the PKCE challenge.
-   */
-  async completeLogin(form: LoginForm): Promise<LoginResult> {
-    const { client_id, redirect_uri, code_challenge, state, resource, email, password } = form;
-
-    const client = client_id ? await this.store.getClient(client_id) : undefined;
-    // Registered redirect URIs only — anything else turns the login page into
-    // an open redirector that hands codes to whoever forged the form.
-    if (!client || !redirect_uri || !client.redirect_uris.includes(redirect_uri)) {
-      return { html: errorPage('Invalid authorization request. Restart the connection.'), status: 400 };
-    }
-    if (!code_challenge) {
-      return { html: errorPage('Missing PKCE challenge. Restart the connection.'), status: 400 };
-    }
-    if (resource && resource !== this.expectedResource) {
-      return { html: errorPage('This authorization is for a different server.'), status: 400 };
-    }
-
-    const retry = (message: string): LoginResult => ({
-      status: 401,
-      html: loginPage({
-        clientName: typeof client.client_name === 'string' ? client.client_name : client.client_id,
-        error: message,
-        hidden: {
-          client_id: client.client_id,
-          redirect_uri,
-          code_challenge,
-          ...(state ? { state } : {}),
-          ...(resource ? { resource } : {})
-        }
-      })
-    });
-
-    if (!email || !password) return retry('Email and password are required.');
-    const hub = await this.signIn(email, password);
-    if (!hub) return retry('Wrong email or password.');
-
-    return this.issueCode(client.client_id, hub, {
-      redirectUri: redirect_uri,
-      codeChallenge: code_challenge,
-      ...(state ? { state } : {}),
-      ...(resource ? { resource } : {})
-    });
-  }
-
-  /**
-   * The GET /oauth/callback handler's logic (Descope mode): resolve the parked
-   * /authorize request by state, run the code -> Descope JWT -> hub triplet
-   * exchange, and mint the single-use code for the original MCP client.
-   */
-  async completeDescopeCallback(state?: string, code?: string): Promise<LoginResult> {
-    const parked = state ? this.pending.get(state) : undefined;
-    // Single-use either way: a replayed callback must not mint twice.
-    if (state) this.pending.delete(state);
-    if (!parked || parked.expiresAt <= nowSeconds() || !code) {
-      return { html: errorPage('Login expired or invalid. Restart the connection.'), status: 400 };
-    }
-
-    const hub = await this.descope!.exchange(code, parked.descopeVerifier);
-    if (!hub) {
-      return { html: errorPage('Your Xyte account was not accepted. Contact your administrator.'), status: 401 };
-    }
-
-    return this.issueCode(parked.clientId, hub, parked);
-  }
-
-  private async issueCode(
-    clientId: string,
-    hub: HubUserCredential,
-    request: { redirectUri: string; codeChallenge: string; state?: string; resource?: string }
-  ): Promise<LoginResult> {
-    const grantId = await this.store.createGrant(clientId, hub);
-    const code = mintToken('ac');
-    await this.store.saveToken({
-      token: code,
-      kind: 'code',
-      grantId,
-      codeChallenge: request.codeChallenge,
-      redirectUri: request.redirectUri,
-      ...(request.resource ? { resource: request.resource } : {}),
-      expiresAt: nowSeconds() + CODE_TTL_SECONDS
-    });
-
-    const target = new URL(request.redirectUri);
-    target.searchParams.set('code', code);
-    if (request.state) target.searchParams.set('state', request.state);
-    return { redirectTo: target.toString() };
+  private livePending(pendingId: string): PendingAuthorization | undefined {
+    const entry = this.pending.get(pendingId);
+    return entry && entry.expiresAt > nowSeconds() ? entry : undefined;
   }
 
   private prunePending(): void {
@@ -237,6 +240,82 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     for (const [key, value] of this.pending) {
       if (value.expiresAt <= now) this.pending.delete(key);
     }
+  }
+
+  /**
+   * The hub client for one grant's tool calls: swaps in a fresh hub token
+   * before each call, and on a hub 401 (expired and revoked look the same)
+   * refreshes once and retries once.
+   */
+  hubHttp(grantId: string, upstream: HttpClient): HttpClient {
+    return {
+      request: async (request) => {
+        const send = (token: string) =>
+          upstream.request({
+            ...request,
+            headers: { ...request.headers, Authorization: `Bearer ${token}` }
+          });
+        const token = await this.hubAccessToken(grantId);
+        try {
+          return await send(token);
+        } catch (error) {
+          if (!(error instanceof XyteHttpError && error.status === 401)) throw error;
+          return send(await this.refreshHub(grantId, token));
+        }
+      }
+    };
+  }
+
+  private async hubAccessToken(grantId: string): Promise<string> {
+    const hub = (await this.store.getGrant(grantId))?.hub;
+    if (!hub) throw signInGone();
+    if (hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS) return hub.accessToken;
+    return this.refreshHub(grantId, hub.accessToken);
+  }
+
+  /**
+   * Single-flight per grant: hub refresh tokens are single-use, so concurrent
+   * calls must share one refresh rather than race (a loser's replay would be
+   * read by hub as theft). One process only — see the Procfile.
+   */
+  private refreshHub(grantId: string, staleAccessToken: string): Promise<string> {
+    let flight = this.refreshing.get(grantId);
+    if (!flight) {
+      flight = this.doRefresh(grantId, staleAccessToken).finally(() => {
+        this.refreshing.delete(grantId);
+      });
+      this.refreshing.set(grantId, flight);
+    }
+    return flight;
+  }
+
+  private async doRefresh(grantId: string, staleAccessToken: string): Promise<string> {
+    const grant = await this.store.getGrant(grantId);
+    if (!grant?.hub || grant.revoked) throw signInGone();
+    // An earlier flight already replaced the token this caller saw.
+    if (
+      grant.hub.accessToken !== staleAccessToken &&
+      grant.hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS
+    ) {
+      return grant.hub.accessToken;
+    }
+
+    const sent = grant.hub.refreshToken;
+    // Sent once, never retried: a 5xx or timeout throws straight to the tool
+    // call, and the grant survives for the next attempt.
+    const next = await this.hub.refresh(sent);
+    if (next === 'invalid_grant') {
+      const current = await this.store.getGrant(grantId);
+      if (current?.hub && !current.revoked && current.hub.refreshToken !== sent) {
+        return current.hub.accessToken; // Someone else rotated; theirs is good.
+      }
+      await this.store.revokeGrant(grantId);
+      throw signInGone();
+    }
+    if (!(await this.store.rotateHubTokens(grantId, sent, next))) {
+      logError(`grant ${grantId}: hub tokens rotated concurrently; keeping the stored pair`);
+    }
+    return next.accessToken;
   }
 
   async challengeForAuthorizationCode(
@@ -295,22 +374,26 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       throw new InvalidTokenError('access token is invalid or expired');
     }
     const grant = await this.store.getGrant(record.grantId);
-    if (!grant || grant.revoked) {
+    // No hub tokens = a grant from the retired devise-triplet login: re-auth.
+    if (!grant?.hub || grant.revoked) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
+    const hub: HubIdentity = { grantId: grant.id, accessToken: grant.hub.accessToken };
     return {
       token,
       clientId: grant.clientId,
       scopes: [],
       expiresAt: record.expiresAt,
       resource: new URL(record.resource ?? this.expectedResource),
-      extra: { hub: grant.hub }
+      extra: { hub }
     };
   }
 
   /**
    * Revoking either token kind revokes the whole grant — every token from that
-   * login stops working, which is what a "disconnect" must mean.
+   * login stops working, which is what a "disconnect" must mean. Hub's revoke
+   * ends that user's sign-in on the organization for every client, so it is
+   * only called when no other live grant rides the same sign-in.
    */
   async revokeToken(
     client: OAuthClientInformationFull,
@@ -321,8 +404,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       if (!record) continue;
       const grant = await this.store.getGrant(record.grantId);
       // Spec: revoking someone else's token is a silent no-op, not an oracle.
-      if (grant && grant.clientId === client.client_id) {
+      if (grant && grant.clientId === client.client_id && !grant.revoked) {
         await this.store.revokeGrant(grant.id);
+        const hub = grant.hub;
+        if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
+          await this.hub.revoke(hub.refreshToken);
+        }
       }
       return;
     }
@@ -371,19 +458,76 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   }
 }
 
-/** The hub credential attached to a verified token, typed out of `extra`. */
-export function hubCredentialOf(auth: AuthInfo): HubUserCredential {
-  const hub = auth.extra?.hub as HubUserCredential | undefined;
-  if (!hub) throw new InvalidTokenError('token carries no hub credential');
+/** What a verified token resolves to: its grant and that grant's hub token. */
+export interface HubIdentity {
+  grantId: string;
+  accessToken: string;
+}
+
+export function hubIdentityOf(auth: AuthInfo): HubIdentity {
+  const hub = auth.extra?.hub as HubIdentity | undefined;
+  if (!hub) throw new InvalidTokenError('token carries no hub identity');
   return hub;
+}
+
+function signInGone(): XyteError {
+  return new XyteError('auth', 'The Xyte sign-in behind this connection has ended.', [
+    'Reconnect the Xyte connector to sign in again.'
+  ]);
 }
 
 function mintToken(kind: 'ac' | 'at' | 'rt'): string {
   return `xmcp_${kind}_${randomBytes(32).toString('base64url')}`;
 }
 
-function nowSeconds(): number {
-  return Math.floor(Date.now() / 1000);
+function random(): string {
+  return randomBytes(24).toString('base64url');
+}
+
+/** Constant-time string comparison; anything that is not a string never matches. */
+function same(presented: unknown, expected: string): boolean {
+  if (typeof presented !== 'string') return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax',
+  path: '/'
+} as const;
+
+/** `__Host-` pins the cookie to this exact host over https, path /. */
+function setBrowserCookie(res: Response, pendingId: string, value: string): void {
+  res.cookie(COOKIE_PREFIX + pendingId, value, {
+    ...COOKIE_OPTIONS,
+    maxAge: PENDING_TTL_SECONDS * 1000
+  });
+}
+
+function readCookie(req: Request, name: string): string | undefined {
+  for (const part of (req.headers.cookie ?? '').split(';')) {
+    const [key, ...value] = part.trim().split('=');
+    if (key === name) return value.join('=');
+  }
+  return undefined;
+}
+
+/** Only ever to the redirect URI stored at /authorize, where the SDK checked it against the client. */
+function clientRedirect(entry: PendingAuthorization, params: Record<string, string>): string {
+  const target = new URL(entry.redirectUri);
+  for (const [key, value] of Object.entries(params)) target.searchParams.set(key, value);
+  if (entry.state) target.searchParams.set('state', entry.state);
+  return target.toString();
+}
+
+function frameDeny(res: Response): Response {
+  return res
+    .setHeader('Content-Security-Policy', "frame-ancestors 'none'")
+    .setHeader('X-Frame-Options', 'DENY')
+    .setHeader('Cache-Control', 'no-store');
 }
 
 function escapeHtml(value: string): string {
@@ -395,46 +539,50 @@ function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;');
 }
 
-function loginPage(options: {
-  clientName: string;
-  error?: string;
-  hidden: Record<string, string>;
+function consentPage(options: {
+  clientName?: string;
+  redirectHost: string;
+  pendingId: string;
+  csrf: string;
 }): string {
-  const hiddenFields = Object.entries(options.hidden)
-    .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
-    .join('\n      ');
+  const name = options.clientName
+    ? `<strong>${escapeHtml(options.clientName)}</strong> ` +
+      '<span class="note">(name chosen by the app itself)</span>'
+    : 'An unnamed app';
   return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in to Xyte</title>
+  <title>Connect to Xyte</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #f4f5f7; margin: 0;
            display: grid; place-items: center; min-height: 100vh; }
-    form { background: #fff; padding: 2rem; border-radius: 8px; width: min(22rem, 90vw);
+    form { background: #fff; padding: 2rem; border-radius: 8px; width: min(24rem, 90vw);
            box-shadow: 0 1px 4px rgba(0,0,0,.15); }
-    h1 { font-size: 1.1rem; margin: 0 0 .25rem; }
-    p { color: #555; font-size: .85rem; margin: 0 0 1rem; }
-    label { display: block; font-size: .8rem; margin: .75rem 0 .25rem; }
-    input[type=email], input[type=password] { width: 100%; box-sizing: border-box;
-      padding: .5rem; border: 1px solid #ccc; border-radius: 4px; }
-    button { margin-top: 1.25rem; width: 100%; padding: .6rem; border: 0; border-radius: 4px;
-             background: #2450ff; color: #fff; font-size: .95rem; cursor: pointer; }
-    .error { color: #b3261e; font-size: .85rem; margin: .75rem 0 0; }
+    h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+    p { color: #333; font-size: .9rem; margin: 0 0 .75rem; }
+    .note { color: #777; font-size: .8rem; }
+    .actions { display: flex; gap: .75rem; margin-top: 1.25rem; }
+    button { flex: 1; padding: .6rem; border: 1px solid #2450ff; border-radius: 4px;
+             font-size: .95rem; cursor: pointer; background: #fff; color: #2450ff; }
+    button[value=approve] { background: #2450ff; color: #fff; }
   </style>
 </head>
 <body>
-  <form method="post" action="/login">
-    <h1>Sign in to Xyte</h1>
-    <p>${escapeHtml(options.clientName)} is asking to access Xyte on your behalf.</p>
-    <label for="email">Email</label>
-    <input id="email" name="email" type="email" autocomplete="username" required autofocus>
-    <label for="password">Password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" required>
-    ${options.error ? `<p class="error">${escapeHtml(options.error)}</p>` : ''}
-    <button type="submit">Sign in</button>
-      ${hiddenFields}
+  <form method="post" action="/oauth/consent">
+    <h1>Connect to Xyte</h1>
+    <p>${name} wants to use the Xyte API on your behalf, with the full access of the
+      organization you pick next.</p>
+    <p>After you sign in, you will be sent back to
+      <strong>${escapeHtml(options.redirectHost)}</strong>.</p>
+    <p class="note">Only approve if you started this connection yourself.</p>
+    <input type="hidden" name="pending" value="${escapeHtml(options.pendingId)}">
+    <input type="hidden" name="csrf" value="${escapeHtml(options.csrf)}">
+    <div class="actions">
+      <button type="submit" name="decision" value="deny">Deny</button>
+      <button type="submit" name="decision" value="approve">Approve</button>
+    </div>
   </form>
 </body>
 </html>`;

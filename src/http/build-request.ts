@@ -1,4 +1,5 @@
-import { ENV, type HubUserCredential } from '../config.js';
+import { ENV, type HubOAuthCredential } from '../config.js';
+import { VERSION } from '../version.js';
 import { XyteError } from './errors.js';
 import type { EndpointSpec } from '../catalog/types.js';
 import type { ToolContext } from '../context.js';
@@ -103,18 +104,15 @@ export function buildRequest(
 }
 
 /**
- * An API key goes in `Authorization` (the hub expects the bare key — no
- * "Bearer" scheme). A hub user session goes in devise_token_auth's header
- * triplet, plus `tenant` to pick the organization; the hub then enforces that
- * user's role instead of granting org-wide API-key power.
+ * An API key goes in `Authorization` bare (the hub expects no "Bearer" scheme).
+ * A hub OAuth token goes as a Bearer — it already names its organization, so
+ * no `tenant` header — plus `X-Xyte-Client`, which hub's call log shows.
  */
-function authHeaders(credential: string | HubUserCredential): Record<string, string> {
+function authHeaders(credential: string | HubOAuthCredential): Record<string, string> {
   if (typeof credential === 'string') return { Authorization: credential };
   return {
-    'access-token': credential.accessToken,
-    client: credential.client,
-    uid: credential.uid,
-    ...(credential.tenant ? { tenant: credential.tenant } : {})
+    Authorization: `Bearer ${credential.accessToken}`,
+    'X-Xyte-Client': `xyte-mcp/${VERSION}`
   };
 }
 

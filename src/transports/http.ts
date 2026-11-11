@@ -12,9 +12,8 @@ import {
 } from '../config.js';
 import { createToolContext, type ToolContext } from '../context.js';
 import { createHttpClient } from '../http/client.js';
-import { createDescopeLogin } from '../oauth/descope.js';
-import { createHubSignIn } from '../oauth/hub-login.js';
-import { hubCredentialOf, XyteOAuthProvider, type LoginForm } from '../oauth/provider.js';
+import { createHubOAuth } from '../oauth/hub-oauth.js';
+import { hubIdentityOf, XyteOAuthProvider } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
 import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
 import { redactText } from '../redact.js';
@@ -41,9 +40,9 @@ import { log, logError } from '../log.js';
  *   so it belongs behind a dev hub with `XYTE_MCP_READ_ONLY=1`.
  * - An OAuth 2.1 access token (enabled by `XYTE_MCP_ISSUER_URL`). The SDK's
  *   `mcpAuthRouter` serves discovery metadata, dynamic client registration and
- *   the authorize/token/revoke endpoints; `XyteOAuthProvider` renders a login
- *   page that checks credentials against the hub, and every verified token
- *   resolves to that user's stored hub credential — built into a per-request
+ *   the authorize/token/revoke endpoints; `XyteOAuthProvider` renders a
+ *   consent page, delegates sign-in to hub's OAuth server, and every verified
+ *   token resolves to its grant's hub token — built into a per-request
  *   `createToolContext`, exactly as `context.ts` promised. Client tokens are
  *   never forwarded to the hub (confused-deputy). Tokens live in Postgres
  *   (`DATABASE_URL`) so they survive a dyno restart; without it, an in-memory
@@ -52,7 +51,8 @@ import { log, logError } from '../log.js';
 
 export const MCP_PATH = '/mcp';
 const HEALTH_PATH = '/healthz';
-const LOGIN_PATH = '/login';
+const CONSENT_PATH = '/oauth/consent';
+/** Registered at hub as `<issuer>/oauth/callback`. */
 const CALLBACK_PATH = '/oauth/callback';
 
 /** Caller-controlled strings are capped before they reach the log stream. */
@@ -60,7 +60,7 @@ const MAX_LOGGED_PATH = 64;
 
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const { staticToken, oauth, port } = resolveHttpConfig(env);
-  // OAuth requests carry their own hub credential, so only the static-bearer
+  // OAuth requests carry their own hub token, so only the static-bearer
   // mode needs a process-level API key (resolveHttpConfig enforces that pair).
   const config = resolveConfig(env, { requireCredentials: !oauth });
 
@@ -92,18 +92,16 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         'WARNING: no DATABASE_URL — OAuth tokens are held in memory and every restart logs all users out.'
       );
     }
-    const descope = oauth.descope
-      ? createDescopeLogin({
-          ...oauth.descope,
-          callbackUrl: `${oauth.issuerUrl}${CALLBACK_PATH}`,
-          hubUrl: config.baseUrls.hub
-        })
-      : undefined;
     provider = new XyteOAuthProvider(
       store,
-      createHubSignIn(config.baseUrls.hub),
-      oauth.issuerUrl,
-      descope
+      createHubOAuth({
+        hubUrl: config.baseUrls.hub,
+        clientId: oauth.hubClient.id,
+        clientSecret: oauth.hubClient.secret,
+        redirectUri: `${oauth.issuerUrl}${CALLBACK_PATH}`,
+        timeoutMs: config.timeoutMs
+      }),
+      oauth.issuerUrl
     );
 
     app.use(
@@ -115,24 +113,13 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       })
     );
 
-    const loginProvider = provider;
-    app.post(LOGIN_PATH, express.urlencoded({ extended: false }), (req, res) => {
-      void handleLogin(loginProvider, req, res);
+    const flow = provider;
+    app.post(CONSENT_PATH, express.urlencoded({ extended: false }), (req, res) => {
+      void flow.consent(req, res).catch((error: unknown) => failFlow(res, error));
     });
-    if (descope) {
-      app.get(CALLBACK_PATH, (req, res) => {
-        void (async () => {
-          const state = typeof req.query.state === 'string' ? req.query.state : undefined;
-          const code = typeof req.query.code === 'string' ? req.query.code : undefined;
-          const result = await loginProvider.completeDescopeCallback(state, code).catch((error) => {
-            logError(`descope callback failed: ${String(error)}`);
-            return { html: 'Login failed. Restart the connection and try again.', status: 502 } as const;
-          });
-          if ('redirectTo' in result) res.redirect(302, result.redirectTo);
-          else res.status(result.status).type('html').send(result.html);
-        })();
-      });
-    }
+    app.get(CALLBACK_PATH, (req, res) => {
+      void flow.callback(req, res).catch((error: unknown) => failFlow(res, error));
+    });
   }
 
   app.post(MCP_PATH, (req, res) => {
@@ -175,7 +162,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
 
   const auth = [
     staticToken ? 'static bearer' : '',
-    oauth ? `oauth (${oauth.issuerUrl}, login: ${oauth.descope ? 'descope' : 'password form'})` : ''
+    oauth ? `oauth (${oauth.issuerUrl}, sign-in: hub oauth)` : ''
   ]
     .filter(Boolean)
     .join(' + ');
@@ -256,9 +243,10 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
 
 /**
  * Map the presented bearer to an identity: the static token to the shared
- * process context, an OAuth token to a per-request context carrying that
- * user's hub credential. Order matters only for the static token's
- * constant-time comparison; OAuth tokens are random lookups by hash.
+ * process context, an OAuth token to a per-request context carrying its
+ * grant's hub token (refreshed on demand by the provider's hub client). Order
+ * matters only for the static token's constant-time comparison; OAuth tokens
+ * are random lookups by hash.
  */
 async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext | undefined> {
   const header = req.headers.authorization;
@@ -271,26 +259,21 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
 
   if (!auth.provider) return undefined;
   try {
-    const info = await auth.provider.verifyAccessToken(presented);
+    const hub = hubIdentityOf(await auth.provider.verifyAccessToken(presented));
     return createToolContext(
-      { ...auth.config, credentials: { organization: hubCredentialOf(info) } },
-      auth.upstream
+      { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
+      auth.provider.hubHttp(hub.grantId, auth.upstream)
     );
   } catch {
     return undefined;
   }
 }
 
-async function handleLogin(provider: XyteOAuthProvider, req: Request, res: Response): Promise<void> {
-  try {
-    const result = await provider.completeLogin(req.body as LoginForm);
-    if ('redirectTo' in result) res.redirect(302, result.redirectTo);
-    else res.status(result.status).type('html').send(result.html);
-  } catch (error) {
-    // Likely the hub being unreachable; the message never reaches the browser.
-    logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
-    res.status(502).type('html').send('<p>Sign-in is unavailable right now. Try again shortly.</p>');
-  }
+/** An unexpected throw in the consent/callback flow; the message never reaches the browser. */
+function failFlow(res: Response, error: unknown): void {
+  logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
+  if (res.headersSent) return;
+  res.status(500).type('html').send('<p>Sign-in failed. Restart the connection.</p>');
 }
 
 /**

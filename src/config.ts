@@ -14,16 +14,14 @@ export const ENV = {
   issuerUrl: 'XYTE_MCP_ISSUER_URL',
   /** Set by Heroku Postgres; the OAuth token store. Absent → in-memory store. */
   databaseUrl: 'DATABASE_URL',
-  /** Descope project id; setting it delegates OAuth login to Descope's hosted flow. */
-  descopeProjectId: 'XYTE_MCP_DESCOPE_PROJECT_ID',
-  /** Descope OIDC base; only needed when it isn't the default auth.xyte.io. */
-  descopeBaseUrl: 'XYTE_MCP_DESCOPE_BASE_URL',
+  /** This server's confidential-client credentials at hub's OAuth server; required with OAuth. */
+  hubOAuthClientId: 'XYTE_MCP_HUB_OAUTH_CLIENT_ID',
+  hubOAuthClientSecret: 'XYTE_MCP_HUB_OAUTH_CLIENT_SECRET',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;
 
 export const DEFAULT_HUB_URL = 'https://hub.xyte.io';
-export const DEFAULT_DESCOPE_BASE_URL = 'https://auth.xyte.io';
 export const DEFAULT_ENTRY_URL = 'https://entry.xyte.io';
 export const DEFAULT_HTTP_PORT = 3000;
 
@@ -31,19 +29,16 @@ export const DEFAULT_HTTP_PORT = 3000;
 const MIN_TOKEN_LENGTH = 24;
 
 /**
- * A hub user session, as returned by hub's devise_token_auth `POST /auth/sign_in`.
- * The alternative to an org API key: hub resolves the user and enforces their
- * role. `tenant` selects the organization when the user belongs to several.
+ * A hub OAuth access token (`xoat_…`), bound to the one organization picked on
+ * hub's consent screen. It carries that organization's full authority, like an
+ * org API key; the user who signed in for it is attribution only.
  */
-export interface HubUserCredential {
+export interface HubOAuthCredential {
   accessToken: string;
-  client: string;
-  uid: string;
-  tenant?: string;
 }
 
 export interface Credentials {
-  organization?: string | HubUserCredential;
+  organization?: string | HubOAuthCredential;
   partner?: string;
 }
 
@@ -52,8 +47,8 @@ export interface OAuthConfig {
   issuerUrl: string;
   /** Postgres DSN for the token store; absent → in-memory (dev only). */
   databaseUrl?: string;
-  /** When set, login happens at Descope's hosted flow instead of a password form. */
-  descope?: { projectId: string; baseUrl: string };
+  /** xyte-mcp's own client registration at hub's OAuth server (client_secret_basic). */
+  hubClient: { id: string; secret: string };
 }
 
 /** Configuration of the HTTP listener itself, as opposed to of a tool call. */
@@ -87,7 +82,7 @@ export function resolveConfig(
   const partner = trimmed(env[ENV.partnerKey]);
 
   // An OAuth-only HTTP server has no process-level key: every request brings
-  // its own hub user credential, so an empty credential set is valid there.
+  // its own hub OAuth token, so an empty credential set is valid there.
   if (!organization && !partner && (options.requireCredentials ?? true)) {
     throw new XyteError(
       'config',
@@ -160,18 +155,23 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
   let oauth: OAuthConfig | undefined;
   if (issuerUrl) {
     validateIssuerUrl(issuerUrl);
-    const descopeProjectId = trimmed(env[ENV.descopeProjectId]);
+    const id = trimmed(env[ENV.hubOAuthClientId]);
+    const secret = trimmed(env[ENV.hubOAuthClientSecret]);
+    if (!id || !secret) {
+      throw new XyteError(
+        'config',
+        `${ENV.issuerUrl} is set but ${ENV.hubOAuthClientId} / ${ENV.hubOAuthClientSecret} ` +
+          'are not.',
+        [
+          'Register this server at hub: GLOBAL=true rake ' +
+            `"oauth:register_application[Xyte MCP,,${stripTrailingSlash(issuerUrl)}/oauth/callback]"`
+        ]
+      );
+    }
     oauth = {
       issuerUrl: stripTrailingSlash(issuerUrl),
       ...(trimmed(env[ENV.databaseUrl]) ? { databaseUrl: trimmed(env[ENV.databaseUrl]) } : {}),
-      ...(descopeProjectId
-        ? {
-            descope: {
-              projectId: descopeProjectId,
-              baseUrl: stripTrailingSlash(trimmed(env[ENV.descopeBaseUrl]) ?? DEFAULT_DESCOPE_BASE_URL)
-            }
-          }
-        : {})
+      hubClient: { id, secret }
     };
   }
 

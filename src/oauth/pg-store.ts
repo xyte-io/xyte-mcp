@@ -1,6 +1,6 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { HubUserCredential } from '../config.js';
+import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
   type GrantRecord,
@@ -14,7 +14,9 @@ import {
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
  * Three tables, created at boot with IF NOT EXISTS instead of a migration
- * framework: this service owns its whole schema and the schema is additive.
+ * framework: this service owns its whole schema and the schema is additive —
+ * columns are only ever added (nullable), never dropped, so rolling back to an
+ * older build still boots against a newer database.
  * Client metadata is one jsonb blob because the server never queries inside
  * it — it goes back to the SDK exactly as registered.
  */
@@ -47,6 +49,14 @@ const SCHEMA = `
     created_at     timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (kind, token_hash)
   );
+  -- Hub OAuth sign-in (DEV-6746). hub_access_token and hub_tenant are reused;
+  -- hub_client / hub_uid belong to the retired devise triplet. A row without
+  -- hub_refresh_token is a triplet-era grant and is treated as dead.
+  ALTER TABLE oauth_grants
+    ADD COLUMN IF NOT EXISTS hub_refresh_token text,
+    ADD COLUMN IF NOT EXISTS hub_expires_at    timestamptz,
+    ADD COLUMN IF NOT EXISTS hub_sub           text,
+    ADD COLUMN IF NOT EXISTS hub_email         text;
 `;
 
 interface TokenRow {
@@ -62,9 +72,11 @@ interface GrantRow {
   id: string;
   client_id: string;
   hub_access_token: string;
-  hub_client: string;
-  hub_uid: string;
+  hub_refresh_token: string | null;
+  hub_expires_at: Date | null;
+  hub_sub: string | null;
   hub_tenant: string | null;
+  hub_email: string | null;
   revoked_at: Date | null;
 }
 
@@ -100,11 +112,22 @@ export class PgOAuthStore implements OAuthStore {
     );
   }
 
-  async createGrant(clientId: string, hub: HubUserCredential): Promise<string> {
+  async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
+    // ponytail: hub_client / hub_uid stay NOT NULL from the triplet schema, so
+    // they get '' rather than a constraint change an older build might trip on.
     const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_client, hub_uid, hub_tenant)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [clientId, hub.accessToken, hub.client, hub.uid, hub.tenant ?? null]
+      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_client, hub_uid, hub_tenant,
+                                 hub_refresh_token, hub_expires_at, hub_sub, hub_email)
+       VALUES ($1, $2, '', '', $3, $4, to_timestamp($5), $6, $7) RETURNING id`,
+      [
+        clientId,
+        hub.accessToken,
+        hub.tenantId,
+        hub.refreshToken,
+        hub.expiresAt,
+        hub.sub,
+        hub.email ?? null
+      ]
     );
     const row = result.rows[0];
     if (!row) throw new Error('grant insert returned no row');
@@ -120,12 +143,18 @@ export class PgOAuthStore implements OAuthStore {
     return {
       id: row.id,
       clientId: row.client_id,
-      hub: {
-        accessToken: row.hub_access_token,
-        client: row.hub_client,
-        uid: row.hub_uid,
-        ...(row.hub_tenant ? { tenant: row.hub_tenant } : {})
-      },
+      ...(row.hub_refresh_token && row.hub_expires_at && row.hub_sub && row.hub_tenant
+        ? {
+            hub: {
+              accessToken: row.hub_access_token,
+              refreshToken: row.hub_refresh_token,
+              expiresAt: Math.floor(row.hub_expires_at.getTime() / 1000),
+              sub: row.hub_sub,
+              tenantId: row.hub_tenant,
+              ...(row.hub_email ? { email: row.hub_email } : {})
+            }
+          }
+        : {}),
       revoked: row.revoked_at !== null
     };
   }
@@ -135,6 +164,29 @@ export class PgOAuthStore implements OAuthStore {
       'UPDATE oauth_grants SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL',
       [grantId]
     );
+  }
+
+  async rotateHubTokens(
+    grantId: string,
+    previousRefreshToken: string,
+    next: HubTokens
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE oauth_grants
+          SET hub_access_token = $3, hub_refresh_token = $4, hub_expires_at = to_timestamp($5)
+        WHERE id = $1 AND hub_refresh_token = $2`,
+      [grantId, previousRefreshToken, next.accessToken, next.refreshToken, next.expiresAt]
+    );
+    return result.rowCount === 1;
+  }
+
+  async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM oauth_grants
+        WHERE hub_sub = $1 AND hub_tenant = $2 AND id <> $3 AND revoked_at IS NULL LIMIT 1`,
+      [sub, tenantId, exceptGrantId]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 
   async saveToken(token: NewToken): Promise<void> {

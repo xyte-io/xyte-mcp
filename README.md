@@ -78,8 +78,8 @@ Everything below is about running the server itself.
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
 | `XYTE_MCP_HTTP_TOKEN` | **`--http` only.** Static bearer fronting the process API key (dev/CI). At least one of this and `XYTE_MCP_ISSUER_URL` is required. |
 | `XYTE_MCP_ISSUER_URL` | **`--http` only.** This deployment's public https URL; setting it enables OAuth 2.1. |
-| `XYTE_MCP_DESCOPE_PROJECT_ID` | **`--http` + OAuth only.** Descope project id of the hub environment; setting it delegates `/authorize` login to Descope's hosted flow (the same login the portal uses). Without it, a legacy email/password form posts to hub's `POST /auth/sign_in` — which only works for users that predate Descope. |
-| `XYTE_MCP_DESCOPE_BASE_URL` | Descope OIDC base URL. Defaults to `https://auth.xyte.io`. |
+| `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **`--http` + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
+| `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **`--http` + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
 | `DATABASE_URL` | **`--http` + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. |
 | `PORT` | **`--http` only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
@@ -186,8 +186,9 @@ switchable and composable:
   hub, read-only.
 - **OAuth 2.1** (`XYTE_MCP_ISSUER_URL`): the real thing — see
   [OAuth 2.1](#oauth-21). Users add the URL as a custom connector (claude.ai web included),
-  log in with their hub credentials, and every call runs under *their* hub user with their
-  role enforced by the hub.
+  sign in at hub and pick an organization, and every call runs with a hub OAuth token for
+  that organization. The token carries the organization's full authority, like an org API
+  key; the signed-in user is recorded for attribution, not used to narrow access.
 
 It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
@@ -197,7 +198,7 @@ and a restart costs a client nothing.
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
 | `GET /healthz` | none | Platform health probe. Reveals nothing a port scan would not. |
-| `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /login` | — | OAuth mode only; served by the MCP SDK's auth router plus our login page. |
+| `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /oauth/consent`, `GET /oauth/callback` | — | OAuth mode only; the MCP SDK's auth router plus our consent page and hub's callback. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
 server that offers no SSE stream. Do not "fix" this by letting the SDK handle them: a
@@ -231,7 +232,8 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run bu
 ```bash
 heroku create <app> --region eu --team xyte
 heroku addons:create heroku-postgresql:essential-0 -a <app>   # OAuth token store (sets DATABASE_URL)
-heroku config:edit -a <app>    # XYTE_MCP_ISSUER_URL, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
+heroku config:edit -a <app>    # XYTE_MCP_ISSUER_URL, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1,
+                                # XYTE_MCP_HUB_OAUTH_CLIENT_ID / _SECRET
                                 # (+ XYTE_MCP_HTTP_TOKEN and XYTE_ORG_API_KEY for the static mode)
 git push heroku HEAD:main       # HEAD, so a branch can be deployed without merging it
 ```
@@ -272,15 +274,13 @@ No `initialize` handshake is needed, because there is no session to establish.
 
 ```bash
 XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -- https://<app>.herokuapp.com
-
-# With hub credentials, the OAuth surface is smoked end to end too:
-XYTE_SMOKE_EMAIL=<email> XYTE_SMOKE_PASSWORD=<pw> npm run smoke:remote -- https://<app>...
 ```
 
 `scripts/remote-smoke.mjs` asserts the positives (health, handshake, tool list, a real read
-against the configured org — and, with credentials, registration → login → PKCE exchange →
-a read as the logged-in user) *and* the denials that fail silently otherwise: no token,
-wrong token, unknown path, a revoked token, and a mutating endpoint refused. The denials are
+against the configured org — and, with OAuth on, registration and the consent page) *and*
+the denials that fail silently otherwise: no token, wrong token, unknown path, and a
+mutating endpoint refused. The hub sign-in needs a browser, so verify the rest of the OAuth
+flow by connecting a real client. The denials are
 the point — a server that answers everything with `200` passes a happy-path check and is
 still wide open. Run it after every deploy, and add a case whenever you touch the boundary.
 
@@ -353,24 +353,57 @@ authorization server. The protocol surface is the MCP TypeScript SDK's `mcpAuthR
 RFC 8414 metadata, RFC 7591 dynamic client registration, `/authorize` + `/token` with PKCE,
 revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind it:
 
-- **Login delegation.** With `XYTE_MCP_DESCOPE_PROJECT_ID` set, `/authorize` redirects to
-  Descope's hosted flow (the portal's own login — SSO/MFA included, we never see a
-  password); `/oauth/callback` exchanges the code (PKCE, public client) and swaps the
-  Descope session JWT for a devise token triplet at hub's `POST /auth/descope/login`.
-  Without it, a legacy email/password form posts to hub's `POST /auth/sign_in` — only
-  useful against hubs whose users still have database passwords. Either way a success
-  becomes a **grant** storing that user's hub triplet (`access-token`/`client`/`uid`) plus
-  their tenant.
+- **Consent first.** `/authorize` never redirects straight away: it shows our own consent
+  page naming the registering client (its `client_name` is self-declared, and labelled so)
+  and the host the code will be sent to, with Approve / Deny. The page cannot be framed.
+  Approve binds the flow to that browser with a `__Host-` cookie and sends it on to hub;
+  the callback refuses any browser without the cookie, so an attacker cannot approve their
+  own consent and hand the hub URL to a victim.
+- **Sign-in at hub.** xyte-mcp is a confidential OAuth client of hub (`/oauth/authorize`,
+  `/oauth/token`, `/oauth/revoke`): authorization code with its own S256 PKCE,
+  `client_secret_basic`, `scope=openid email profile`. The user signs in and picks one
+  organization on hub's consent screen; the hub token is bound to it. A denial at hub
+  (`error`, plus `error_reason` such as `org_not_approved`) is passed back to the MCP
+  client's redirect URI. A success becomes a **grant** storing the hub access + refresh
+  token, and the `sub` / `xyte_tenant_id` / `email` from the id_token for attribution.
 - **Audience-bound tokens.** The access/refresh tokens we mint are our own, hashed at rest,
   and bound to this server as the RFC 8707 resource. A client's token is **never forwarded
-  to the hub** — each request resolves its grant and calls the hub with the stored user
-  credential (the classic confused-deputy guard).
-- **Per-user enforcement.** Calls carry the devise headers plus `tenant`, so the hub's core
-  org API authenticates the *user* and applies their role — unlike an org API key, which is
-  org-wide by construction.
+  to the hub** — each request resolves its grant and calls the hub with the stored hub
+  token (the classic confused-deputy guard).
+- **Organization authority.** Calls send `Authorization: Bearer xoat_…` and
+  `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The token carries the
+  organization's full authority, like an org API key; the user is attribution only.
+  `XYTE_MCP_READ_ONLY=1` is the control for what the agent may do.
+- **Hub token lifecycle.** A hub access token lives an hour; within a minute of expiry, or
+  after a hub `401`, it is refreshed once (one refresh per grant at a time — hub refresh
+  tokens are single-use, and a late replay revokes the user's sign-in) and the call retried
+  once. A refresh is never retried. Hub `invalid_grant` with the current refresh token
+  revokes the grant: that tool call errors and the next request gets a `401`, so the client
+  re-authorizes. A hub outage during refresh only fails the call. The chain ends 90 days
+  after the first sign-in.
+- **Disconnect.** Revoking any of our tokens revokes its grant, and calls hub's revoke —
+  which ends that user's sign-in on that organization for every client — only when no
+  other live grant rides the same sign-in.
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. Revoking any token revokes its whole grant.
+  logs users out. The schema is created at boot and only ever extended (nullable columns,
+  nothing dropped), so rolling back to an older build still boots. Grants from the earlier
+  password/Descope login hold no hub tokens and are treated as invalid: their clients get a
+  `401` and re-authorize.
+- **One dyno.** The pending consent state and the refresh single-flight are in memory, so
+  the app must run on a single dyno.
+
+**Registering at hub.** Once per hub environment, from a hub console:
+
+```bash
+GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://<host>/oauth/callback]"
+```
+
+It prints the client id and secret for `XYTE_MCP_HUB_OAUTH_CLIENT_ID` /
+`XYTE_MCP_HUB_OAUTH_CLIENT_SECRET`. The callback must match `XYTE_MCP_ISSUER_URL` +
+`/oauth/callback` exactly. Before any member of an organization can connect, an admin of
+that organization has to connect (approve) the app on hub's consent screen first — until
+then hub denies with `error_reason=org_not_approved`.
 
 The static-bearer mode stays available alongside (set both env vars) or instead (unset the
 issuer); the two map to different upstream identities and neither weakens the other.

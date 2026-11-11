@@ -161,7 +161,9 @@ export class PgOAuthStore implements OAuthStore {
 
   async revokeGrant(grantId: string): Promise<void> {
     await this.pool.query(
-      'UPDATE oauth_grants SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL',
+      `UPDATE oauth_grants
+          SET revoked_at = now(), hub_access_token = '', hub_refresh_token = NULL
+        WHERE id = $1 AND revoked_at IS NULL`,
       [grantId]
     );
   }
@@ -182,8 +184,10 @@ export class PgOAuthStore implements OAuthStore {
 
   async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
     const result = await this.pool.query(
-      `SELECT 1 FROM oauth_grants
-        WHERE hub_sub = $1 AND hub_tenant = $2 AND id <> $3 AND revoked_at IS NULL LIMIT 1`,
+      `SELECT 1 FROM oauth_grants g JOIN oauth_tokens t ON t.grant_id = g.id
+        WHERE g.hub_sub = $1 AND g.hub_tenant = $2 AND g.id <> $3 AND g.revoked_at IS NULL
+          AND t.kind IN ('access', 'refresh') AND t.revoked_at IS NULL AND t.expires_at > now()
+        LIMIT 1`,
       [sub, tenantId, exceptGrantId]
     );
     return (result.rowCount ?? 0) > 0;

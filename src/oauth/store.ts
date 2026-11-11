@@ -48,6 +48,7 @@ export interface OAuthStore {
 
   createGrant(clientId: string, hub: HubSignIn): Promise<string>;
   getGrant(grantId: string): Promise<GrantRecord | undefined>;
+  /** Also drops the grant's hub tokens: nothing may use them after this. */
   revokeGrant(grantId: string): Promise<void>;
   /**
    * Store a rotated hub token pair — only if the grant still holds
@@ -58,7 +59,10 @@ export interface OAuthStore {
     previousRefreshToken: string,
     next: HubTokens
   ): Promise<boolean>;
-  /** Whether a live grant other than `exceptGrantId` rides the same hub sign-in. */
+  /**
+   * Whether another grant on the same hub sign-in is still in use: not
+   * revoked, and holding an unexpired, unrevoked access or refresh token.
+   */
   hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean>;
 
   saveToken(token: NewToken): Promise<void>;
@@ -108,7 +112,10 @@ export class MemoryOAuthStore implements OAuthStore {
 
   async revokeGrant(grantId: string): Promise<void> {
     const grant = this.grants.get(grantId);
-    if (grant) grant.revoked = true;
+    if (grant) {
+      grant.revoked = true;
+      delete grant.hub;
+    }
   }
 
   async rotateHubTokens(
@@ -123,10 +130,17 @@ export class MemoryOAuthStore implements OAuthStore {
   }
 
   async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
+    const now = Math.floor(Date.now() / 1000);
+    const used = new Set(
+      [...this.tokens.values()]
+        .filter((token) => token.kind !== 'code' && !token.revoked && token.expiresAt > now)
+        .map((token) => token.grantId)
+    );
     return [...this.grants.values()].some(
       (grant) =>
         grant.id !== exceptGrantId &&
         !grant.revoked &&
+        used.has(grant.id) &&
         grant.hub?.sub === sub &&
         grant.hub.tenantId === tenantId
     );

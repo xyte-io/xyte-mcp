@@ -613,6 +613,20 @@ describe('XyteOAuthProvider: revocation', () => {
     await expect(provider.verifyAccessToken(second.tokens.access_token)).resolves.toBeTruthy();
   });
 
+  it('an abandoned sibling grant (no live tokens) does not block the hub revoke', async () => {
+    const { provider, store, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const first = await connected(provider, client);
+    const abandoned = await connected(provider, client);
+    await store.deleteToken(abandoned.tokens.access_token, 'access');
+    await store.deleteToken(abandoned.tokens.refresh_token!, 'refresh');
+
+    await provider.revokeToken(client, { token: first.tokens.access_token });
+
+    expect(hub.revokes()).toHaveLength(1);
+    expect((await store.getGrant(first.grantId))?.hub).toBeUndefined(); // hub tokens dropped
+  });
+
   it("revoking another client's token is a silent no-op", async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);

@@ -477,6 +477,39 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     ]);
   });
 
+  it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const http = provider.hubHttp(grantId, upstreamOk());
+    const get = () => http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+
+    await get();
+    expect(save).toHaveBeenCalledTimes(3); // the DB write is retried...
+    expect(hub.refreshes()).toHaveLength(1); // ...the hub POST is not
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
+
+    // Later calls use the unsaved pair instead of refreshing (or replaying xort_1).
+    await get();
+    expect(hub.refreshes()).toHaveLength(1);
+
+    // The next refresh sends the in-memory token and saves over the stored one.
+    save.mockRestore();
+    const upstream = stubHttp((request) =>
+      request.headers.Authorization === 'Bearer xoat_2'
+        ? new XyteHttpError(401, 'Unauthorized', {}, 'k')
+        : { data: {} }
+    );
+    await provider
+      .hubHttp(grantId, upstream)
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    expect(hub.refreshes()[1]!.form.get('refresh_token')).toBe('xort_2');
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_3');
+  });
+
   it('invalid_grant with a stale refresh token does not revoke: the rotated token is used', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;

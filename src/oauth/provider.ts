@@ -19,7 +19,8 @@ import type {
 import type { HttpClient } from '../http/client.js';
 import { XyteError, XyteHttpError } from '../http/errors.js';
 import { logError } from '../log.js';
-import { nowSeconds, type HubOAuth } from './hub-oauth.js';
+import { redactText } from '../redact.js';
+import { nowSeconds, type HubOAuth, type HubSignIn, type HubTokens } from './hub-oauth.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 
 /**
@@ -43,6 +44,8 @@ const ACCESS_TTL_SECONDS = 60 * 60;
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
 /** Refresh a hub access token this close to its expiry rather than risk a 401. */
 const HUB_REFRESH_SKEW_SECONDS = 60;
+/** Attempts at saving a rotated hub pair. Only the DB write repeats — never the hub POST. */
+const HUB_SAVE_ATTEMPTS = 3;
 
 /** An /authorize request parked across our consent page and hub's sign-in. */
 interface PendingAuthorization {
@@ -71,6 +74,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   // the Procfile pins one dyno. A restart mid-login just makes the user retry.
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly refreshing = new Map<string, Promise<string>>();
+  /** Rotated hub pairs the store failed to save, used in place of the stored ones. */
+  private readonly unsaved = new Map<string, HubTokens>();
 
   constructor(
     private readonly store: OAuthStore,
@@ -268,10 +273,20 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   }
 
   private async hubAccessToken(grantId: string): Promise<string> {
-    const hub = (await this.store.getGrant(grantId))?.hub;
+    const hub = (await this.liveHub(grantId))?.hub;
     if (!hub) throw signInGone();
     if (hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS) return hub.accessToken;
     return this.refreshHub(grantId, hub.accessToken);
+  }
+
+  /** The grant's current hub pair (an unsaved rotation wins), and the refresh token in the store. */
+  private async liveHub(grantId: string): Promise<{ hub: HubSignIn; stored: string } | undefined> {
+    const grant = await this.store.getGrant(grantId);
+    if (!grant?.hub || grant.revoked) {
+      this.unsaved.delete(grantId);
+      return undefined;
+    }
+    return { hub: { ...grant.hub, ...this.unsaved.get(grantId) }, stored: grant.hub.refreshToken };
   }
 
   /**
@@ -291,32 +306,63 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   }
 
   private async doRefresh(grantId: string, staleAccessToken: string): Promise<string> {
-    const grant = await this.store.getGrant(grantId);
-    if (!grant?.hub || grant.revoked) throw signInGone();
+    const live = await this.liveHub(grantId);
+    if (!live) throw signInGone();
+    const { hub, stored } = live;
     // An earlier flight already replaced the token this caller saw.
     if (
-      grant.hub.accessToken !== staleAccessToken &&
-      grant.hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS
+      hub.accessToken !== staleAccessToken &&
+      hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS
     ) {
-      return grant.hub.accessToken;
+      return hub.accessToken;
     }
 
-    const sent = grant.hub.refreshToken;
-    // Sent once, never retried: a 5xx or timeout throws straight to the tool
-    // call, and the grant survives for the next attempt.
+    const sent = hub.refreshToken;
+    // Sent once, never retried: once hub answers, `sent` is burned. A 5xx or
+    // timeout throws straight to the tool call and the grant is kept.
     const next = await this.hub.refresh(sent);
     if (next === 'invalid_grant') {
-      const current = await this.store.getGrant(grantId);
-      if (current?.hub && !current.revoked && current.hub.refreshToken !== sent) {
+      const current = await this.liveHub(grantId);
+      if (current && current.hub.refreshToken !== sent) {
         return current.hub.accessToken; // Someone else rotated; theirs is good.
       }
       await this.store.revokeGrant(grantId);
+      this.unsaved.delete(grantId);
       throw signInGone();
     }
-    if (!(await this.store.rotateHubTokens(grantId, sent, next))) {
-      logError(`grant ${grantId}: hub tokens rotated concurrently; keeping the stored pair`);
-    }
+    await this.saveHubTokens(grantId, stored, next);
     return next.accessToken;
+  }
+
+  /**
+   * Hub has already burned the old refresh token, so losing `next` would leave
+   * a replay-on-next-refresh that hub answers by ending the user's sign-in.
+   * The DB write is retried; if it still fails, the pair lives in memory for
+   * this process (a restart before the next successful save loses it).
+   */
+  private async saveHubTokens(grantId: string, stored: string, next: HubTokens): Promise<void> {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        if (!(await this.store.rotateHubTokens(grantId, stored, next))) {
+          logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
+        }
+        this.unsaved.delete(grantId);
+        return;
+      } catch (error) {
+        if (attempt < HUB_SAVE_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+          continue;
+        }
+        this.unsaved.set(grantId, next);
+        const detail = error instanceof Error ? error.message : String(error);
+        logError(
+          `ERROR grant ${grantId}: could not save rotated hub tokens after ${attempt} attempts ` +
+            `(${redactText(detail, [stored, next.accessToken, next.refreshToken])}); ` +
+            'holding them in memory until a later refresh saves'
+        );
+        return;
+      }
+    }
   }
 
   async challengeForAuthorizationCode(
@@ -407,7 +453,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       // Spec: revoking someone else's token is a silent no-op, not an oracle.
       if (grant && grant.clientId === client.client_id && !grant.revoked) {
         await this.store.revokeGrant(grant.id);
-        const hub = grant.hub;
+        const hub = grant.hub && { ...grant.hub, ...this.unsaved.get(grant.id) };
+        this.unsaved.delete(grant.id);
         if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
           await this.hub.revoke(hub.refreshToken);
         }

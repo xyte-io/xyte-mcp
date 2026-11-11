@@ -117,7 +117,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       csrf: random(),
       browserKey: random(),
       approved: false,
-      hubVerifier: random(),
+      // RFC 7636 4.1 (and hub) require 43-128 chars: 32 bytes is 43 in base64url.
+      hubVerifier: randomBytes(32).toString('base64url'),
       expiresAt: nowSeconds() + PENDING_TTL_SECONDS
     };
     this.prunePending();

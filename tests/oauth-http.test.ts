@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
+import { hubAcceptsPkce } from './support/pkce.js';
 import { existsSync, readFileSync } from 'node:fs';
 import {
   createServer,
@@ -53,6 +54,15 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
     req.on('end', () => {
       requests.push({ method: req.method, url: req.url, headers: { ...req.headers }, body });
       if (req.method === 'POST' && req.url === '/oauth/token') {
+        const tokenForm = new URLSearchParams(body);
+        if (
+          tokenForm.get('grant_type') === 'authorization_code' &&
+          !hubAcceptsPkce(tokenForm.get('code_verifier'), hubChallenge)
+        ) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid_grant' }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
@@ -78,6 +88,8 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
 }
 
 let child: ChildProcess | undefined;
+/** The challenge on the last hub authorize redirect; the fake hub checks verifiers against it. */
+let hubChallenge: string | undefined;
 let base = '';
 let hub: ReturnType<typeof fakeHub>;
 const stderr: string[] = [];
@@ -170,7 +182,9 @@ async function approve(): Promise<{ hubUrl: URL; cookie: string }> {
     body: form({ pending: field('pending'), csrf: field('csrf'), decision: 'approve' })
   });
   expect(response.status).toBe(302);
-  return { hubUrl: new URL(response.headers.get('location')!), cookie: cookieOf(response) };
+  const hubUrl = new URL(response.headers.get('location')!);
+  hubChallenge = hubUrl.searchParams.get('code_challenge') ?? undefined;
+  return { hubUrl, cookie: cookieOf(response) };
 }
 
 // State threaded through the sequential dance.

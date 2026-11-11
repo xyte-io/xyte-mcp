@@ -6,6 +6,7 @@ import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
 import { stubHttp } from './support/context.js';
+import { hubAcceptsPkce } from './support/pkce.js';
 
 const ISSUER = 'https://mcp.test';
 const HUB = 'https://hub.test';
@@ -15,7 +16,9 @@ const ID_TOKEN = `h.${Buffer.from(JSON.stringify(ID_CLAIMS)).toString('base64url
 
 /**
  * Hub's token and revoke endpoints behind a fetch mock. Every token response
- * mints a fresh pair; `onRefresh` overrides the refresh answer per test.
+ * mints a fresh pair; `onRefresh` overrides the refresh answer per test. A code
+ * exchange is refused unless its verifier fits `challenge`, the one sent on the
+ * last authorize redirect.
  */
 function fakeHub() {
   const calls: Array<{ path: string; form: URLSearchParams; auth: string }> = [];
@@ -33,6 +36,7 @@ function fakeHub() {
   const hub = {
     calls,
     expiresIn: 3600,
+    challenge: undefined as string | undefined,
     onRefresh: undefined as undefined | ((form: URLSearchParams) => Promise<Response> | Response),
     refreshes: () => calls.filter((call) => call.form.get('grant_type') === 'refresh_token'),
     revokes: () => calls.filter((call) => call.path === '/oauth/revoke'),
@@ -42,6 +46,12 @@ function fakeHub() {
       calls.push({ path, form, auth: String((init.headers as Record<string, string>).Authorization) });
       if (path === '/oauth/revoke') return new Response(null, { status: 200 });
       if (form.get('grant_type') === 'refresh_token' && hub.onRefresh) return hub.onRefresh(form);
+      if (
+        form.get('grant_type') === 'authorization_code' &&
+        !hubAcceptsPkce(form.get('code_verifier'), hub.challenge)
+      ) {
+        return json(400, { error: 'invalid_grant' });
+      }
       return pair(hub.expiresIn);
     }) as unknown as typeof fetch
   };
@@ -55,9 +65,12 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+let currentHub: ReturnType<typeof fakeHub> | undefined;
+
 function makeProvider() {
   const store = new MemoryOAuthStore();
   const hub = fakeHub();
+  currentHub = hub;
   const provider = new XyteOAuthProvider(
     store,
     createHubOAuth({
@@ -147,6 +160,7 @@ async function approve(provider: XyteOAuthProvider, client: OAuthClientInformati
     res
   );
   const [cookieName, cookie] = Object.entries(out.cookies)[0]!;
+  currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
   return { out, pending: consent.pending, cookie: `${cookieName}=${cookie.value}` };
 }
 
@@ -273,7 +287,7 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     const exchange = hub.calls[0]!;
     expect(exchange.path).toBe('/oauth/token');
     expect(exchange.form.get('grant_type')).toBe('authorization_code');
-    expect(exchange.form.get('code_verifier')).toBeTruthy();
+    expect(hubAcceptsPkce(exchange.form.get('code_verifier'), hub.challenge)).toBe(true);
     expect(exchange.auth).toBe(`Basic ${Buffer.from('mcp-client:s3cret').toString('base64')}`);
 
     const record = await store.getToken(code, 'code');

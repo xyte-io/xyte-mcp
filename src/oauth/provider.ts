@@ -138,7 +138,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       .send(
         consentPage({
           clientName: typeof client.client_name === 'string' ? client.client_name : undefined,
-          redirectHost: new URL(params.redirectUri).host,
+          redirectTarget: redirectTarget(params.redirectUri),
           pendingId,
           csrf: entry.csrf
         })
@@ -576,6 +576,12 @@ function clientRedirect(entry: PendingAuthorization, params: Record<string, stri
   return target.toString();
 }
 
+/** Scheme + host, or the whole URI when it has no host (e.g. `cursor:/callback`). */
+function redirectTarget(uri: string): string {
+  const url = new URL(uri);
+  return url.host ? `${url.protocol}//${url.host}` : url.href;
+}
+
 function frameDeny(res: Response): Response {
   return res
     .setHeader('Content-Security-Policy', "frame-ancestors 'none'")
@@ -594,7 +600,7 @@ function escapeHtml(value: string): string {
 
 function consentPage(options: {
   clientName?: string;
-  redirectHost: string;
+  redirectTarget: string;
   pendingId: string;
   csrf: string;
 }): string {
@@ -628,7 +634,7 @@ function consentPage(options: {
     <p>${name} wants to use the Xyte API on your behalf, with the full access of the
       organization you pick next.</p>
     <p>After you sign in, you will be sent back to
-      <strong>${escapeHtml(options.redirectHost)}</strong>.</p>
+      <strong>${escapeHtml(options.redirectTarget)}</strong>.</p>
     <p class="note">Only approve if you started this connection yourself.</p>
     <input type="hidden" name="pending" value="${escapeHtml(options.pendingId)}">
     <input type="hidden" name="csrf" value="${escapeHtml(options.csrf)}">

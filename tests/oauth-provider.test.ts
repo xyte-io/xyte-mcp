@@ -210,7 +210,7 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.html).toContain('&lt;b&gt;Test&lt;/b&gt; Client');
     expect(out.html).not.toContain('<b>Test</b>');
     expect(out.html).toContain('name chosen by the app itself');
-    expect(out.html).toContain('client.test');
+    expect(out.html).toContain('https://client.test');
     expect(out.html).toContain('action="/oauth/consent"');
     expect(out.headers['Content-Security-Policy']).toBe("frame-ancestors 'none'");
     expect(out.headers['X-Frame-Options']).toBe('DENY');
@@ -342,6 +342,14 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('state')).toBe('st4te');
     expect(url.searchParams.get('code')).toBeNull();
     expect(hub.calls).toHaveLength(0);
+  });
+
+  it('names a custom-scheme redirect by its whole URI on the consent page', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { out, res } = fakeRes();
+    await provider.authorize(client, { codeChallenge: 'c', redirectUri: 'cursor:/oauth/cb' }, res);
+    expect(out.html).toContain('<strong>cursor:/oauth/cb</strong>');
   });
 
   it('refuses an /authorize for another resource', async () => {

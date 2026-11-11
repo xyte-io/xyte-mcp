@@ -128,6 +128,14 @@ function substitutePath(endpoint: EndpointSpec, pathArgs: PathArgs): string {
         `${endpoint.key}: path parameter "${name}" is empty.`
       );
     }
+    // encodeURIComponent leaves dots alone, and URL normalisation then turns
+    // "/devices/.." into a different endpoint than the one the catalog names.
+    if (text === '.' || text === '..') {
+      throw new XyteError(
+        'validation',
+        `${endpoint.key}: path parameter "${name}" cannot be "${text}".`
+      );
+    }
     return encodeURIComponent(text);
   });
 }

@@ -76,6 +76,14 @@ describe('buildRequest', () => {
     );
   });
 
+  it('rejects "." and ".." path parameters, which traverse after URL normalisation', () => {
+    for (const value of ['.', '..', ' .. ']) {
+      expect(() => buildRequest(spec(), { path: { device_id: value } }, testContext())).toThrow(
+        /cannot be/
+      );
+    }
+  });
+
   it('rejects an unknown path parameter', () => {
     expect(() =>
       buildRequest(spec(), { path: { device_id: 'a', bogus: 'b' } }, testContext())

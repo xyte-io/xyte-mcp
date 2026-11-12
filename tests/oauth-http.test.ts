@@ -417,7 +417,8 @@ describe('oauth over http, in order', () => {
 
   // The request that started the refresh is gone (client hung up), so only
   // drain() stands between SIGTERM and an exit that loses the rotated pair.
-  it('on SIGTERM, waits for an in-flight hub refresh, then exits cleanly', async () => {
+  // Windows has no SIGTERM: kill() ends the child at once, so there is no shutdown to observe.
+  it.skipIf(process.platform === 'win32')('on SIGTERM, waits for an in-flight hub refresh, then exits cleanly', async () => {
     hubExpiresIn = 30; // this sign-in's hub token starts inside the refresh window
     const { hubUrl, cookie } = await approve();
     const callback = await fetch(

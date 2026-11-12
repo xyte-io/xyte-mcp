@@ -407,7 +407,9 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
 - **Organization authority.** Calls send `Authorization: Bearer xoat_…` and
   `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The token carries the
   organization's full authority, like an org API key; the user is attribution only.
-  Writes are off unless `XYTE_MCP_ALLOW_WRITES=1` — that is the control for what the agent
+  Who may sign in is the organization's choice when its administrator connects the app
+  at hub; because every signed-in user gets the same authority, "only organization
+  administrators" is the recommended sign-in policy. Writes are off unless `XYTE_MCP_ALLOW_WRITES=1` — that is the control for what the agent
   may do. A sign-in yields an organization token only, so partner endpoints are not
   available through it.
 - **Hub token lifecycle.** A hub access token lives an hour; within a minute of expiry, or
@@ -469,7 +471,7 @@ a public sign-in URL.
   shared `.mcp.json`.
 - `--http` is reachable from the network. Its static bearer is one shared identity — every
   holder acts as the process API key — so keep it to dev/CI, read-only, and rotate it by
-  redeploying with a new value. OAuth gives each user their own sign-in instead. See
+  setting a new value (changing the variable restarts the server). OAuth gives each user their own sign-in instead. See
   [Remote HTTP transport](#remote-http-transport) and [OAuth 2.1](#oauth-21).
 
 ## License

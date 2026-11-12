@@ -189,9 +189,14 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     })());
   listener.once('close', () => void stop());
 
-  // Heroku sends SIGTERM on every deploy and daily restart, and SIGKILL 30 s later.
-  process.once('SIGTERM', () => {
-    log('SIGTERM: finishing in-flight requests and hub refreshes');
+  // Heroku sends SIGTERM on every deploy and daily restart, and SIGKILL 30 s later;
+  // a local Ctrl+C (SIGINT) drains the same way. A second, different signal during
+  // the drain is ignored; repeating the same one falls back to the default exit.
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`${signal}: finishing in-flight requests and hub refreshes`);
     setTimeout(() => {
       logError('shutdown deadline reached; exiting with work unfinished');
       process.exit(1);
@@ -205,7 +210,9 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       await stop();
       process.exit(0);
     })();
-  });
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 
   const auth = oauth ? `oauth (${oauth.issuerUrl}, sign-in: hub oauth)` : 'static bearer';
   log(

@@ -112,6 +112,13 @@ class HttpHarness {
   stop(): void {
     this.child.kill('SIGKILL');
   }
+
+  /** Send a signal and resolve with the exit code. */
+  signal(name: NodeJS.Signals): Promise<number | null> {
+    const exited = new Promise<number | null>((resolve) => this.child.once('exit', resolve));
+    this.child.kill(name);
+    return exited;
+  }
 }
 
 let harness: HttpHarness | undefined;
@@ -449,6 +456,13 @@ describe('http transport: token store outage', () => {
       stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
+  });
+
+  // Windows has no SIGINT delivery via kill(): the child ends at once.
+  it.skipIf(process.platform === 'win32')('drains and exits cleanly on SIGINT (local Ctrl+C)', async () => {
+    const server = await start();
+    expect(await server.signal('SIGINT')).toBe(0);
+    expect(server.stderr.join('')).toContain('SIGINT: finishing in-flight requests');
   });
 });
 

@@ -434,10 +434,10 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
   pre-release database needs the one-time drop under [Deploy it](#deploy-it)).
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
-- **Shutdown.** On `SIGTERM` (every deploy and daily restart) the listener stops accepting,
-  in-flight requests get 10 s, then in-flight hub refreshes are awaited and any rotated hub
-  pair not yet saved is written before exit; a hard deadline of 28 s stays inside Heroku's
-  30 s before `SIGKILL`.
+- **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
+  listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
+  awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of
+  28 s stays inside Heroku's 30 s before `SIGKILL`.
 - **Rate limits.** Per IP (behind Heroku's router, `trust proxy` 1): `/register` 1000/hour,
   `/token` 2000 and `/revoke` 500 per 15 minutes, `/authorize` the SDK's 100 per 15 minutes.
   The first three are raised from the SDK defaults because claude.ai and ChatGPT call them

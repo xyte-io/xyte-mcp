@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { connect, createServer } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
@@ -61,7 +61,12 @@ class HttpHarness {
     return harness;
   }
 
-  /** Poll /healthz rather than sleeping: a fixed delay is either slow or flaky. */
+  /**
+   * Poll /healthz rather than sleeping: a fixed delay is either slow or flaky.
+   * Then wait for the ready line naming *our* port: stderr is a different pipe
+   * from the HTTP response, and freePort's port could in theory have been taken
+   * by another process whose /healthz answered instead.
+   */
   private async awaitReady(): Promise<void> {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
@@ -69,13 +74,23 @@ class HttpHarness {
         throw new Error(`server exited (${this.child.exitCode})\n${this.stderr.join('')}`);
       }
       try {
-        if ((await fetch(`${this.base}/healthz`)).ok) return;
+        if ((await fetch(`${this.base}/healthz`)).ok) break;
       } catch {
         // Not listening yet.
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    throw new Error(`server never became ready\n${this.stderr.join('')}`);
+    await this.waitForStderr(`ready over http on :${new URL(this.base).port}/mcp`);
+  }
+
+  async waitForStderr(text: string): Promise<void> {
+    const deadline = Date.now() + 10_000;
+    while (!this.stderr.join('').includes(text)) {
+      if (Date.now() > deadline) {
+        throw new Error(`stderr never contained "${text}"\n${this.stderr.join('')}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
   }
 
   post(body: unknown, init: { token?: string | null; path?: string } = {}): Promise<Response> {
@@ -99,6 +114,29 @@ class HttpHarness {
 }
 
 let harness: HttpHarness | undefined;
+let bareChild: ChildProcess | undefined;
+
+/** Run the binary to exit; killed in afterEach and bounded, so a regression fails fast instead of hanging. */
+async function runToExit(
+  args: string[],
+  env: Record<string, string>
+): Promise<{ code: number | null; stderr: string }> {
+  const child = spawn(process.execPath, [DIST_ENTRY, ...args], {
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  bareChild = child;
+  let stderr = '';
+  child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
+  const code = await new Promise<number | null>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`still running\n${stderr}`)), 5_000);
+    child.on('exit', (exitCode) => {
+      clearTimeout(timer);
+      resolve(exitCode);
+    });
+  });
+  return { code, stderr };
+}
 
 async function start(env: Record<string, string> = {}): Promise<HttpHarness> {
   harness = await HttpHarness.start(env);
@@ -114,6 +152,8 @@ beforeAll(() => {
 afterEach(() => {
   harness?.stop();
   harness = undefined;
+  bareChild?.kill('SIGKILL');
+  bareChild = undefined;
 });
 
 describe('http transport', () => {
@@ -131,7 +171,9 @@ describe('http transport', () => {
 
     expect(response.status).toBe(401);
     expect((await response.json()) as JsonRpcResponse).toMatchObject({
-      error: { message: 'unauthorized' }
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32001, message: 'unauthorized' }
     });
   });
 
@@ -156,12 +198,18 @@ describe('http transport', () => {
     expect(response.status).toBe(200);
   });
 
-  it('never echoes the bearer token or the API key back to the caller', async () => {
+  it('never echoes the bearer token or the API key, to the caller or the log', async () => {
     const server = await start();
-    const body = await (await server.post({}, { token: 'nope' })).text();
+    const wrong = 'xmcp_wrong_token_fedcba9876543210';
+    const body = await (await server.post({}, { token: wrong })).text();
 
     expect(body).not.toContain(TOKEN);
     expect(body).not.toContain(ORG_KEY);
+    // The denial log is the real leak surface: it names the request, never the bearer.
+    await server.waitForStderr('401 POST /mcp');
+    const stderr = server.stderr.join('');
+    expect(stderr).not.toContain(wrong);
+    expect(stderr).not.toContain(TOKEN);
   });
 
   // A challenge makes mcp-remote open a browser for an OAuth flow that does not
@@ -178,6 +226,7 @@ describe('http transport', () => {
     const response = await server.post({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, { path: '/' });
 
     expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ jsonrpc: '2.0', id: null, error: { code: -32601 } });
   });
 
   // Otherwise the SDK opens an SSE stream a stateless server can never write to,
@@ -193,6 +242,11 @@ describe('http transport', () => {
       expect(response.status, method).toBe(405);
       expect(response.headers.get('allow'), method).toBe('POST');
       expect(response.headers.get('content-type'), method).toContain('application/json');
+      expect(await response.json(), method).toMatchObject({
+        jsonrpc: '2.0',
+        id: null,
+        error: { code: -32000 }
+      });
     }
   });
 
@@ -201,6 +255,43 @@ describe('http transport', () => {
     const response = await fetch(`${server.base}/mcp`, { method: 'GET', headers: MCP_HEADERS });
 
     expect(response.status).toBe(401);
+    expect(await response.json()).toMatchObject({ jsonrpc: '2.0', id: null, error: { code: -32001 } });
+  });
+
+  // `new URL` throws on an absolute-form target with a bad port; unguarded, that
+  // rejection killed the process before the auth check.
+  it('answers a malformed request target with a 4xx and stays up', async () => {
+    const server = await start();
+    const { port } = new URL(server.base);
+    const raw = await new Promise<string>((resolve, reject) => {
+      const socket = connect(Number(port), '127.0.0.1', () => {
+        socket.end('GET http://x:99999/mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+      });
+      let data = '';
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk: string) => (data += chunk));
+      socket.on('end', () => resolve(data));
+      socket.on('error', reject);
+    });
+
+    expect(raw).toMatch(/^HTTP\/1\.1 4\d\d/);
+    expect((await fetch(`${server.base}/healthz`)).status).toBe(200);
+  });
+
+  // Stateless means a fresh server/transport pair per request: concurrent calls
+  // on one process must neither cross-talk nor break the teardown.
+  it('answers concurrent requests on one process, each with its own id', async () => {
+    const server = await start();
+    const ids = Array.from({ length: 20 }, (_, index) => index + 1);
+    const responses = await Promise.all(
+      ids.map(async (id) => {
+        const response = await server.post({ jsonrpc: '2.0', id, method: 'tools/list' });
+        return (await response.json()) as JsonRpcResponse & { id: number };
+      })
+    );
+
+    expect(responses.map((response) => response.id)).toEqual(ids);
+    for (const response of responses) expect(response.result?.tools).toHaveLength(3);
   });
 
   it('completes the initialize handshake', async () => {
@@ -262,14 +353,17 @@ describe('http transport', () => {
     expect(server.stderr.join('')).toContain('WARNING: writes are enabled');
   });
 
+  it('does not warn when started read-only', async () => {
+    const server = await start({ XYTE_MCP_READ_ONLY: '1' });
+    expect(server.stderr.join('')).not.toContain('WARNING');
+  });
+
   it('refuses to start without a bearer token, naming the variable', async () => {
-    const child = spawn(process.execPath, [DIST_ENTRY, '--http'], {
-      env: { ...process.env, PORT: '0', XYTE_ORG_API_KEY: ORG_KEY, XYTE_MCP_HTTP_TOKEN: '' },
-      stdio: ['ignore', 'pipe', 'pipe']
+    const { code, stderr } = await runToExit(['--http'], {
+      PORT: String(await freePort()),
+      XYTE_ORG_API_KEY: ORG_KEY,
+      XYTE_MCP_HTTP_TOKEN: ''
     });
-    let stderr = '';
-    child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
-    const code = await new Promise<number | null>((resolve) => child.on('exit', resolve));
 
     expect(code).toBe(1);
     expect(stderr).toContain('XYTE_MCP_HTTP_TOKEN');
@@ -303,5 +397,21 @@ describe('http transport: token store outage', () => {
       getToken.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
+  });
+});
+
+describe('cli', () => {
+  it('rejects an unknown argument with exit code 2', async () => {
+    const { code, stderr } = await runToExit(['--bogus'], {});
+
+    expect(code).toBe(2);
+    expect(stderr).toContain('unknown argument');
+  });
+
+  it('prints the version and exits for --http --version, without listening', async () => {
+    const { code, stderr } = await runToExit(['--http', '--version'], {});
+
+    expect(code).toBe(0);
+    expect(stderr).toMatch(/^\d+\.\d+\.\d+/);
   });
 });

@@ -1,6 +1,6 @@
 # `--http` selects the Streamable HTTP transport; without it the binary serves
-# stdio and Heroku's health check would never get an answer. $PORT is assigned by
-# the platform and read via resolveHttpConfig.
+# stdio and Heroku's boot check (bind $PORT within 60s, else R10) would fail.
+# $PORT is assigned by the platform and read via resolveHttpConfig.
 #
 # Exactly one web dyno. The MCP transport itself is stateless, but in OAuth mode
 # the pending consent/sign-in state and the per-grant hub-token refresh

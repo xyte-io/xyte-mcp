@@ -208,4 +208,27 @@ describe('resolveHttpConfig', () => {
       /must not have a path/
     );
   });
+
+  // An org key alongside the token keeps these valid once OAuth lands.
+  const withKey = { [ENV.orgKey]: 'org-key' };
+
+  it('puts the length floor at 24 characters, after trimming', () => {
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(23) })).toThrow(
+      /too short/
+    );
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: ` ${'a'.repeat(23)} ` })).toThrow(
+      /too short/
+    );
+    // Field-name agnostic, so it survives the token field's rename for OAuth.
+    expect(Object.values(resolveHttpConfig({ ...withKey, [ENV.httpToken]: ` ${token} ` }))).toContain(
+      token
+    );
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(24) })).not.toThrow();
+  });
+
+  it.each(['abc', '0', '-1', '3000.5', '70000'])('refuses PORT=%s', (port) => {
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: token, [ENV.httpPort]: port })
+    ).toThrow(/PORT must be an integer/);
+  });
 });

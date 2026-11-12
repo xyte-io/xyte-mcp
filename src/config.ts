@@ -113,7 +113,8 @@ export function resolveConfig(
  *
  * Separate from `resolveConfig` because a bearer token and a port are properties
  * of the listener, not of a tool call — and keeping every environment read in
- * this module is what lets `src/transports/` stay free of `process.env`.
+ * this module means transports only pass `env` through; they never read
+ * individual variables.
  *
  * No auth at all is fatal rather than "auth off". This transport is reachable
  * from the internet, so defaulting open would publish whatever credentials the
@@ -178,7 +179,7 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
   return {
     ...(staticToken ? { staticToken } : {}),
     ...(oauth ? { oauth } : {}),
-    port: parsePositiveInt(env[ENV.httpPort]) ?? DEFAULT_HTTP_PORT
+    port: parsePort(env[ENV.httpPort])
   };
 }
 
@@ -208,6 +209,16 @@ function validateIssuerUrl(value: string): void {
   if (url.pathname !== '/') {
     throw new XyteError('config', `${ENV.issuerUrl} must not have a path (got ${url.pathname}).`);
   }
+}
+
+/** An unset PORT defaults; a set-but-invalid one is a misconfiguration, not a default. */
+function parsePort(value: string | undefined): number {
+  if (!value?.trim()) return DEFAULT_HTTP_PORT;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new XyteError('config', `${ENV.httpPort} must be an integer in 1..65535 (got "${value}").`);
+  }
+  return port;
 }
 
 function trimmed(value: string | undefined): string | undefined {

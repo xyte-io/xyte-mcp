@@ -2,7 +2,9 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:net';
 import path from 'node:path';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { MemoryOAuthStore } from '../src/oauth/store.js';
+import { startHttpServer } from '../src/transports/http.js';
 
 /**
  * Drives a real `--http` server process over the network, so this covers the
@@ -143,6 +145,17 @@ describe('http transport', () => {
     expect((await server.post({}, { token: `${TOKEN}x` })).status).toBe(401);
   });
 
+  it('accepts the Bearer scheme in any case (RFC 7235)', async () => {
+    const server = await start();
+    const response = await fetch(`${server.base}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, Authorization: `bearer  ${TOKEN}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+    });
+
+    expect(response.status).toBe(200);
+  });
+
   it('never echoes the bearer token or the API key back to the caller', async () => {
     const server = await start();
     const body = await (await server.post({}, { token: 'nope' })).text();
@@ -260,5 +273,35 @@ describe('http transport', () => {
 
     expect(code).toBe(1);
     expect(stderr).toContain('XYTE_MCP_HTTP_TOKEN');
+  });
+});
+
+// In-process, so the token store can be made to fail.
+describe('http transport: token store outage', () => {
+  it('answers 503 without a challenge, not a 401, when the token check cannot run', async () => {
+    const port = await freePort();
+    const getToken = vi
+      .spyOn(MemoryOAuthStore.prototype, 'getToken')
+      .mockRejectedValue(new Error('db down'));
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    try {
+      for (const method of ['POST', 'GET']) {
+        const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+          method,
+          headers: { ...MCP_HEADERS, Authorization: 'Bearer xmcp_at_whatever' },
+          ...(method === 'POST' ? { body: '{}' } : {})
+        });
+        expect(response.status, method).toBe(503);
+        expect(response.headers.get('www-authenticate'), method).toBeNull();
+      }
+    } finally {
+      getToken.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
   });
 });

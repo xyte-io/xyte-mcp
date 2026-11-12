@@ -123,8 +123,9 @@ export function createHubOAuth(options: {
 
     /**
      * `invalid_grant` is the one answer that means the chain is dead (or was
-     * already rotated by someone else); everything else throws, and must not be
-     * read as a revocation — a hub outage is not a reason to log anyone out.
+     * already rotated by someone else); everything else throws. A 4xx throws as
+     * 'auth' (nothing rotated); a timeout, network error or 5xx leaves it
+     * unknown whether hub rotated — the caller must not send the token again.
      */
     async refresh(refreshToken: string): Promise<HubTokens | 'invalid_grant'> {
       const response = await post('/oauth/token', {

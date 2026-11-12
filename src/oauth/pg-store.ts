@@ -1,5 +1,6 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { logError } from '../log.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -92,6 +93,9 @@ export class PgOAuthStore implements OAuthStore {
         : { ssl: { rejectUnauthorized: false } }),
       max: 5
     });
+    // An idle client dropped server-side (maintenance, failover) is emitted here;
+    // unhandled, it exits the process. The pool replaces the client on its own.
+    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
     await pool.query(SCHEMA);
     return new PgOAuthStore(pool);
   }

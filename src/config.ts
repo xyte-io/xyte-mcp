@@ -204,6 +204,10 @@ function validateIssuerUrl(value: string): void {
   if (url.search || url.hash) {
     throw new XyteError('config', `${ENV.issuerUrl} must not have a query string or fragment.`);
   }
+  // Routes are mounted at the root, so a path would send every sign-in to a 404.
+  if (url.pathname !== '/') {
+    throw new XyteError('config', `${ENV.issuerUrl} must not have a path (got ${url.pathname}).`);
+  }
 }
 
 function trimmed(value: string | undefined): string | undefined {

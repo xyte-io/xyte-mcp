@@ -201,4 +201,11 @@ describe('resolveHttpConfig', () => {
       XyteError
     );
   });
+
+  // Routes are mounted at the root: a path would send every sign-in to a 404.
+  it('refuses an issuer with a path', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'https://a.example/xyte' })).toThrow(
+      /must not have a path/
+    );
+  });
 });

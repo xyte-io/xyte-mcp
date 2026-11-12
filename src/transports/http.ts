@@ -2,6 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { Server } from 'node:http';
 import express, { type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { endpointCount } from '../catalog/catalog.js';
 import {
@@ -138,10 +139,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       // Auth first, as on POST: an unauthenticated caller learns nothing about
       // the endpoint, not even which methods it supports.
       const auth = { staticToken, staticContext, provider, config, upstream, oauth };
-      if (!(await resolveIdentity(req, auth))) {
-        respondUnauthorized(req, res, auth);
-        return;
-      }
+      if (!(await authenticate(req, res, auth))) return;
       res.setHeader('Allow', 'POST');
       respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
     })();
@@ -192,11 +190,8 @@ interface McpAuth {
 }
 
 async function handleMcp(req: Request, res: Response, auth: McpAuth): Promise<void> {
-  const context = await resolveIdentity(req, auth);
-  if (!context) {
-    respondUnauthorized(req, res, auth);
-    return;
-  }
+  const context = await authenticate(req, res, auth);
+  if (!context) return;
 
   const server = createServer(context);
   const transport = new StreamableHTTPServerTransport({
@@ -242,6 +237,28 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
 }
 
 /**
+ * The caller's identity, or undefined once a rejection is sent. Only a bad
+ * token is a 401: a store outage is a retryable 503, or every connected client
+ * would drop its tokens and restart the OAuth flow.
+ */
+async function authenticate(
+  req: Request,
+  res: Response,
+  auth: McpAuth
+): Promise<ToolContext | undefined> {
+  let context: ToolContext | undefined;
+  try {
+    context = await resolveIdentity(req, auth);
+  } catch (error) {
+    logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
+    respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
+    return undefined;
+  }
+  if (!context) respondUnauthorized(req, res, auth);
+  return context;
+}
+
+/**
  * Map the presented bearer to an identity: the static token to the shared
  * process context, an OAuth token to a per-request context carrying its
  * grant's hub token (refreshed on demand by the provider's hub client). Order
@@ -249,9 +266,10 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
  * are random lookups by hash.
  */
 async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext | undefined> {
-  const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) return undefined;
-  const presented = header.slice('Bearer '.length).trim();
+  // The auth scheme is case-insensitive (RFC 7235 2.1).
+  const header = req.headers.authorization ?? '';
+  if (!/^bearer\s+/i.test(header)) return undefined;
+  const presented = header.replace(/^bearer\s+/i, '').trim();
 
   if (auth.staticToken && auth.staticContext && matches(presented, auth.staticToken)) {
     return auth.staticContext;
@@ -264,8 +282,9 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
       { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
       auth.provider.hubHttp(hub.grantId, auth.upstream)
     );
-  } catch {
-    return undefined;
+  } catch (error) {
+    if (error instanceof InvalidTokenError) return undefined;
+    throw error;
   }
 }
 

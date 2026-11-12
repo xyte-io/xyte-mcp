@@ -577,12 +577,36 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
   });
 
-  it('a hub 5xx on refresh fails the call without revoking, and is not retried', async () => {
+  // Hub may have rotated (and burned xort_1) before the answer was lost; a
+  // later replay would end the user's sign-in at hub, so the grant ends here.
+  it.each([
+    ['a timeout', () => Promise.reject(new DOMException('slow', 'TimeoutError'))],
+    ['a network error', () => Promise.reject(new TypeError('fetch failed'))],
+    ['a 5xx', () => json(503, { error: 'temporarily_unavailable' })],
+    ['an unreadable 200', () => new Response('<html>', { status: 200 })]
+  ])('%s on refresh ends the grant and never re-sends the refresh token', async (_name, answer) => {
     const { provider, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId, tokens } = await connected(provider, client);
-    hub.onRefresh = () => json(503, { error: 'temporarily_unavailable' });
+    hub.onRefresh = answer as () => Promise<Response>;
+    const get = () =>
+      provider
+        .hubHttp(grantId, upstreamOk())
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+
+    await expect(get()).rejects.toMatchObject({ kind: 'auth' });
+    await expect(get()).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes()).toHaveLength(1);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('a plain 4xx on refresh (nothing rotated) fails the call and keeps the grant', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.onRefresh = () => json(401, { error: 'invalid_client' });
 
     const call = provider
       .hubHttp(grantId, upstreamOk())
@@ -633,6 +657,33 @@ describe('XyteOAuthProvider: revocation', () => {
 
     expect(hub.revokes()).toHaveLength(1);
     expect((await store.getGrant(first.grantId))?.hub).toBeUndefined(); // hub tokens dropped
+  });
+
+  it('a revoke during an in-flight hub refresh revokes the rotated token at hub', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    let answer!: () => void;
+    hub.onRefresh = () =>
+      new Promise<Response>((resolve) => {
+        answer = () =>
+          resolve(
+            json(200, { access_token: 'xoat_2', refresh_token: 'xort_2', expires_in: 3600 })
+          );
+      });
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    await vi.waitFor(() => expect(hub.refreshes()).toHaveLength(1));
+
+    const revoke = provider.revokeToken(client, { token: tokens.access_token });
+    answer();
+    await Promise.allSettled([call, revoke]);
+
+    expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
   });
 
   it("revoking another client's token is a silent no-op", async () => {

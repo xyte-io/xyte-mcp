@@ -294,6 +294,8 @@ npm run lint
 npm run inspect   # build and open the MCP Inspector
 ```
 
+The OAuth store contract (`tests/oauth-store.test.ts`) always runs against the in-memory store, and against Postgres too when `TEST_DATABASE_URL` names a throwaway database (its tables are truncated); otherwise the Postgres run is skipped.
+
 Two invariants are enforced by lint rather than convention, because both erode silently:
 
 - **Nothing but JSON-RPC may reach stdout.** On stdio, stdout *is* the protocol channel; one

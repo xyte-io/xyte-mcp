@@ -318,9 +318,26 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     }
 
     const sent = hub.refreshToken;
-    // Sent once, never retried: once hub answers, `sent` is burned. A 5xx or
-    // timeout throws straight to the tool call and the grant is kept.
-    const next = await this.hub.refresh(sent);
+    // Sent once, never retried: once hub answers, `sent` is burned.
+    let next: HubTokens | 'invalid_grant';
+    try {
+      next = await this.hub.refresh(sent);
+    } catch (error) {
+      // A plain 4xx rejection ('auth') never rotated anything: keep the grant.
+      if (error instanceof XyteError && error.kind === 'auth') throw error;
+      // Timeout, network, 5xx or an unreadable 200: hub may have rotated and
+      // burned `sent`. A replay inside hub's 60 s window only gets invalid_grant
+      // (no pair), and one after it ends the user's sign-in — so `sent` is never
+      // sent again: the grant ends here and the client reconnects.
+      // Only our own messages: a JSON parse error would quote the response body.
+      logError(
+        `grant ${grantId}: hub refresh outcome unknown ` +
+          `(${error instanceof XyteError ? error.message : 'unreadable hub response'}); ending the grant`
+      );
+      await this.store.revokeGrant(grantId);
+      this.unsaved.delete(grantId);
+      throw signInGone();
+    }
     if (next === 'invalid_grant') {
       const current = await this.liveHub(grantId);
       if (current && current.hub.refreshToken !== sent) {
@@ -457,8 +474,11 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       const grant = await this.store.getGrant(record.grantId);
       // Spec: revoking someone else's token is a silent no-op, not an oracle.
       if (grant && grant.clientId === client.client_id && !grant.revoked) {
+        // Let an in-flight hub refresh land first: otherwise it rotates the pair
+        // just after we read it, and hub is sent the already-burned token.
+        await this.refreshing.get(grant.id)?.catch(() => undefined);
+        const hub = (await this.liveHub(grant.id))?.hub;
         await this.store.revokeGrant(grant.id);
-        const hub = grant.hub && { ...grant.hub, ...this.unsaved.get(grant.id) };
         this.unsaved.delete(grant.id);
         if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
           await this.hub.revoke(hub.refreshToken);

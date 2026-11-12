@@ -377,11 +377,14 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
   organization's full authority, like an org API key; the user is attribution only.
   `XYTE_MCP_READ_ONLY=1` is the control for what the agent may do.
 - **Hub token lifecycle.** A hub access token lives an hour; within a minute of expiry, or
-  after a hub `401`, it is refreshed once (one refresh per grant at a time — hub refresh
+  after hub rejects it (`401` with `WWW-Authenticate: Bearer error="invalid_token"`; a plain
+  `401` such as a device outside the organization is returned as is), it is refreshed once (one refresh per grant at a time — hub refresh
   tokens are single-use, and a late replay revokes the user's sign-in) and the call retried
   once. A refresh is never retried. Hub `invalid_grant` with the current refresh token
   revokes the grant: that tool call errors and the next request gets a `401`, so the client
-  re-authorizes. A hub outage during refresh only fails the call. The chain ends 90 days
+  re-authorizes. A refresh with an unclear outcome (timeout, network error, hub 5xx) also
+  revokes the grant, because the refresh token may already be used and replaying it later
+  would end the user's sign-in at hub. The chain ends 90 days
   after the first sign-in.
 - **Disconnect.** Revoking any of our tokens revokes its grant, and calls hub's revoke —
   which ends that user's sign-in on that organization for every client — only when no
@@ -394,6 +397,14 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
   `401` and re-authorize.
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
+- **Shutdown.** On `SIGTERM` (every deploy and daily restart) the listener stops accepting,
+  in-flight requests get 10 s, then in-flight hub refreshes are awaited and any rotated hub
+  pair not yet saved is written before exit; a hard deadline of 28 s stays inside Heroku's
+  30 s before `SIGKILL`.
+- **Rate limits.** Per IP (behind Heroku's router, `trust proxy` 1): `/register` 1000/hour,
+  `/token` 2000 and `/revoke` 500 per 15 minutes, `/authorize` the SDK's 100 per 15 minutes.
+  The first three are raised from the SDK defaults because claude.ai and ChatGPT call them
+  from shared backend IPs.
 
 **Registering at hub.** Once per hub environment, from a hub console:
 

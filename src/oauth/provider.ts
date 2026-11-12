@@ -250,8 +250,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 
   /**
    * The hub client for one grant's tool calls: swaps in a fresh hub token
-   * before each call, and on a hub 401 (expired and revoked look the same)
-   * refreshes once and retries once.
+   * before each call, and when hub rejects the token itself (expired and
+   * revoked look the same) refreshes once and retries once.
    */
   hubHttp(grantId: string, upstream: HttpClient): HttpClient {
     return {
@@ -265,7 +265,19 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         try {
           return await send(token);
         } catch (error) {
-          if (!(error instanceof XyteHttpError && error.status === 401)) throw error;
+          // Hub also answers 401 for a record outside the organization (a wrong
+          // device id); only a rejected token carries `error="invalid_token"`
+          // (hub's OauthBearerAuthentication). Refreshing on the other kind would
+          // burn a single-use refresh token per typo.
+          if (
+            !(
+              error instanceof XyteHttpError &&
+              error.status === 401 &&
+              /error="invalid_token"/.test(error.wwwAuthenticate ?? '')
+            )
+          ) {
+            throw error;
+          }
           return send(await this.refreshHub(grantId, token));
         }
       }
@@ -378,6 +390,28 @@ export class XyteOAuthProvider implements OAuthServerProvider {
             'holding them in memory until a later refresh saves'
         );
         return;
+      }
+    }
+  }
+
+  /**
+   * For shutdown: lets in-flight hub refreshes land, then makes a last attempt
+   * at saving every rotated pair held only in memory. Losing either leaves the
+   * store with a refresh token hub has burned; the next refresh replays it, and
+   * hub ends the user's sign-in on that organization.
+   */
+  async drain(): Promise<void> {
+    // A request still running can start another refresh while we wait.
+    while (this.refreshing.size > 0) {
+      await Promise.allSettled(this.refreshing.values());
+    }
+    for (const grantId of [...this.unsaved.keys()]) {
+      try {
+        const live = await this.liveHub(grantId);
+        const next = this.unsaved.get(grantId);
+        if (live && next) await this.saveHubTokens(grantId, live.stored, next);
+      } catch {
+        logError(`ERROR grant ${grantId}: rotated hub tokens lost at shutdown`);
       }
     }
   }

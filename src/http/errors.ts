@@ -32,7 +32,9 @@ export class XyteHttpError extends XyteError {
     readonly status: number,
     readonly statusText: string,
     readonly body: unknown,
-    readonly endpointKey: string
+    readonly endpointKey: string,
+    /** RFC 6750 3: hub sets it only when it rejects the bearer token itself. */
+    readonly wwwAuthenticate?: string
   ) {
     super('http', `${status} ${statusText} from ${endpointKey}`);
     this.name = 'XyteHttpError';

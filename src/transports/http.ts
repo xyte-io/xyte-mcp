@@ -59,6 +59,11 @@ const CALLBACK_PATH = '/oauth/callback';
 /** Caller-controlled strings are capped before they reach the log stream. */
 const MAX_LOGGED_PATH = 64;
 
+/** Under Heroku's 30 s SIGTERM-to-SIGKILL window. */
+const SHUTDOWN_DEADLINE_MS = 28_000;
+/** In-flight requests get this long before the provider drain starts regardless. */
+const REQUEST_GRACE_MS = 10_000;
+
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const { staticToken, oauth, port } = resolveHttpConfig(env);
   // OAuth requests carry their own hub token, so only the static-bearer
@@ -110,7 +115,16 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         provider,
         issuerUrl: new URL(oauth.issuerUrl),
         resourceServerUrl: new URL(`${oauth.issuerUrl}${MCP_PATH}`),
-        resourceName: 'Xyte MCP'
+        resourceName: 'Xyte MCP',
+        // The SDK limits per IP (register 20/h, token and revoke 50/15 min), but
+        // claude.ai and ChatGPT register, exchange and refresh from their own
+        // backend egress IPs, so one IP is all their users. Sized for a few
+        // thousand users behind one IP (a refresh per user per hour, the access
+        // TTL); tokens are 256-bit random, so the limit is load control, not
+        // brute-force defence. `/authorize` is a browser, so it keeps the default.
+        clientRegistrationOptions: { rateLimit: { windowMs: 60 * 60 * 1000, max: 1000 } },
+        tokenOptions: { rateLimit: { windowMs: 15 * 60 * 1000, max: 2000 } },
+        revocationOptions: { rateLimit: { windowMs: 15 * 60 * 1000, max: 500 } }
       })
     );
 
@@ -156,7 +170,33 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     });
     server.once('error', reject);
   });
-  listener.once('close', () => void store?.close());
+  // Drain before the pool goes: a rotated hub pair that never reaches the store
+  // is replayed on the next refresh, and hub then ends the user's sign-in.
+  let stopping: Promise<void> | undefined;
+  const stop = () =>
+    (stopping ??= (async () => {
+      await provider?.drain();
+      await store?.close().catch(() => undefined);
+    })());
+  listener.once('close', () => void stop());
+
+  // Heroku sends SIGTERM on every deploy and daily restart, and SIGKILL 30 s later.
+  process.once('SIGTERM', () => {
+    log('SIGTERM: finishing in-flight requests and hub refreshes');
+    setTimeout(() => {
+      logError('shutdown deadline reached; exiting with work unfinished');
+      process.exit(1);
+    }, SHUTDOWN_DEADLINE_MS).unref();
+    void (async () => {
+      await new Promise<void>((resolve) => {
+        listener.close(() => resolve());
+        // A kept-alive connection would hold close() open past the deadline.
+        setTimeout(resolve, REQUEST_GRACE_MS).unref();
+      });
+      await stop();
+      process.exit(0);
+    })();
+  });
 
   const auth = [
     staticToken ? 'static bearer' : '',

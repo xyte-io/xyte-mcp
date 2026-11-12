@@ -388,4 +388,23 @@ describe('oauth over http, in order', () => {
   it('warned at boot that the token store is in-memory', () => {
     expect(stderr.join('')).toContain('no DATABASE_URL');
   });
+
+  // claude.ai and ChatGPT register from shared egress IPs; the SDK default is 20/h per IP.
+  it('lets one IP register more clients than the SDK default allows', async () => {
+    for (let i = 0; i < 25; i += 1) {
+      const response = await fetch(`${base}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none' })
+      });
+      expect(response.status).toBe(201);
+    }
+  });
+
+  it('exits cleanly on SIGTERM', async () => {
+    const exited = new Promise<number | null>((resolve) => child!.once('exit', resolve));
+    child!.kill('SIGTERM');
+    expect(await exited).toBe(0);
+    expect(stderr.join('')).toContain('SIGTERM');
+  });
 });

@@ -58,6 +58,9 @@ const SCHEMA = `
     ADD COLUMN IF NOT EXISTS hub_expires_at    timestamptz,
     ADD COLUMN IF NOT EXISTS hub_sub           text,
     ADD COLUMN IF NOT EXISTS hub_email         text;
+  -- The sibling check on revoke (hasLiveHubSibling) joins on both.
+  CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
+  CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
 `;
 
 interface TokenRow {

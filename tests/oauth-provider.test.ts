@@ -65,6 +65,11 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+/** Hub's answer to an expired or revoked bearer token (OauthBearerAuthentication). */
+function tokenRejected(): XyteHttpError {
+  return new XyteHttpError(401, 'Unauthorized', {}, 'k', 'Bearer error="invalid_token"');
+}
+
 let currentHub: ReturnType<typeof fakeHub> | undefined;
 
 function makeProvider() {
@@ -485,13 +490,29 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     );
   });
 
-  it('on a hub 401, refreshes once and retries once', async () => {
+  it('a hub 401 without invalid_token (record not in the org) is returned unchanged, no refresh', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const notAuthorized = new XyteHttpError(401, 'Unauthorized', { error: 'Not authorized' }, 'k');
+    const upstream = stubHttp(() => notAuthorized);
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstream)
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toBe(notAuthorized);
+    expect(hub.refreshes()).toHaveLength(0);
+    expect(upstream.calls).toHaveLength(1);
+  });
+
+  it('on a hub 401 with invalid_token, refreshes once and retries once', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     const upstream = stubHttp((request) =>
       request.headers.Authorization === 'Bearer xoat_1'
-        ? new XyteHttpError(401, 'Unauthorized', {}, 'k')
+        ? tokenRejected()
         : { data: {} }
     );
 
@@ -528,7 +549,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     save.mockRestore();
     const upstream = stubHttp((request) =>
       request.headers.Authorization === 'Bearer xoat_2'
-        ? new XyteHttpError(401, 'Unauthorized', {}, 'k')
+        ? tokenRejected()
         : { data: {} }
     );
     await provider
@@ -614,6 +635,52 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     await expect(call).rejects.toBeInstanceOf(XyteError);
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+});
+
+describe('XyteOAuthProvider: drain on shutdown', () => {
+  it('waits for an in-flight hub refresh and saves its pair', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    let answer!: () => void;
+    hub.onRefresh = () =>
+      new Promise<Response>((resolve) => {
+        answer = () =>
+          resolve(json(200, { access_token: 'xoat_2', refresh_token: 'xort_2', expires_in: 3600 }));
+      });
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    await vi.waitFor(() => expect(hub.refreshes()).toHaveLength(1));
+
+    let drained = false;
+    const drain = provider.drain().then(() => (drained = true));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(drained).toBe(false); // still waiting on hub
+
+    answer();
+    await Promise.all([call, drain]);
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_2');
+  });
+
+  it('saves a rotated pair that was only held in memory', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    await provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
+
+    save.mockRestore();
+    await provider.drain();
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_2');
+    expect(hub.refreshes()).toHaveLength(1); // saved, not refreshed again
   });
 });
 

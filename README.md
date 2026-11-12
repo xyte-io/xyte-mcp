@@ -230,7 +230,7 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run bu
 `engines.node` pins the runtime.
 
 ```bash
-heroku create <app> --region eu --team xyte
+heroku create <app> --region eu --team <team>
 heroku addons:create heroku-postgresql:essential-0 -a <app>   # OAuth token store (sets DATABASE_URL)
 heroku config:edit -a <app>    # XYTE_MCP_ISSUER_URL, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1,
                                 # XYTE_MCP_HUB_OAUTH_CLIENT_ID / _SECRET
@@ -247,11 +247,6 @@ build starts; it recreates them at boot.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
-
-The DEV-6742 POC runs at **`xyte-mcp-aran`** (Heroku team `xyte`, EU), pointed at
-`hub-aran.xyte.io` and read-only:
-`https://xyte-mcp-aran-6f8c801d1b74.herokuapp.com`. It holds one org API key and one bearer
-token, so treat the URL as a shared dev credential, not a service.
 
 ### Connect a client
 

@@ -1,5 +1,5 @@
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { resolveConfig } from '../config.js';
+import { DEFAULT_HUB_URL, resolveConfig } from '../config.js';
 import { createToolContext } from '../context.js';
 import { createServer } from '../server.js';
 import { endpointCount } from '../catalog/catalog.js';
@@ -24,7 +24,7 @@ export async function startStdioServer(env: NodeJS.ProcessEnv = process.env): Pr
     `xyte-mcp ready over stdio — ${endpointCount()} endpoints, ` +
       `credentials: ${scopes}, writes: ${config.allowWrites ? 'ENABLED' : 'disabled'}`
   );
-  if (config.baseUrls.hub !== 'https://hub.xyte.io') {
+  if (config.baseUrls.hub !== DEFAULT_HUB_URL) {
     log(`hub base URL overridden: ${config.baseUrls.hub}`);
   }
 

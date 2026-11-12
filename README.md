@@ -186,7 +186,7 @@ and a restart costs a client nothing.
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
-| `GET /healthz` | none | Platform health probe. Reveals nothing a port scan would not. |
+| `GET /healthz` | none | Liveness probe for uptime monitors and the smoke script. Reveals nothing a port scan would not. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
 server that offers no SSE stream. Do not "fix" this by letting the SDK handle them: a
@@ -235,7 +235,8 @@ claude mcp add --transport http --scope user xyte-dev \
   --header "Authorization: Bearer <token>"
 ```
 
-Then restart the client and check `/mcp` reports Connected. By hand — note that the MCP
+Then restart the client, run the client's `/mcp` command and check `xyte-dev` reports
+Connected. By hand — note that the MCP
 spec requires the client to accept both content types, whichever one comes back:
 
 ```bash
@@ -278,7 +279,8 @@ Two invariants are enforced by lint rather than convention, because both erode s
 - **Tools take `(args, ctx)` and nothing else.** No environment reads, no transport imports.
   Credential resolution and transport wiring live in `src/transports/`.
 
-That second rule is what keeps the door open for a remote transport (see below).
+That second rule is what let `--http` reuse the tools unchanged — see
+[Remote HTTP transport](#remote-http-transport).
 
 ## Releasing
 

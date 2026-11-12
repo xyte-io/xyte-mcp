@@ -59,7 +59,14 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   const context = createToolContext(config);
 
   const listener = createHttpListener((req, res) => {
-    void handle(req, res, token, context);
+    // Anything `handle` throws outside its own try — e.g. `new URL` on a
+    // malformed request target — would otherwise be an unhandled rejection and
+    // take the process down, before auth.
+    handle(req, res, token, context).catch(() => {
+      logError(`400 ${req.method ?? '-'} — unparseable request`);
+      if (!res.headersSent) respondJsonRpcError(res, 400, -32600, 'bad request');
+      else res.destroy();
+    });
   });
   await new Promise<void>((resolve, reject) => {
     listener.once('error', reject);

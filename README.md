@@ -216,7 +216,7 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run bu
 `engines.node` pins the runtime.
 
 ```bash
-heroku create <app> --region eu --team xyte
+heroku create <app> --region eu --team <team>
 heroku config:edit -a <app>    # XYTE_MCP_HTTP_TOKEN, XYTE_ORG_API_KEY, XYTE_HUB_URL, XYTE_MCP_READ_ONLY=1
 git push heroku HEAD:main       # HEAD, so a branch can be deployed without merging it
 ```
@@ -226,11 +226,6 @@ and in `ps` while it runs.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
-
-The DEV-6742 POC runs at **`xyte-mcp-aran`** (Heroku team `xyte`, EU), pointed at
-`hub-aran.xyte.io` and read-only:
-`https://xyte-mcp-aran-6f8c801d1b74.herokuapp.com`. It holds one org API key and one bearer
-token, so treat the URL as a shared dev credential, not a service.
 
 ### Connect a client
 

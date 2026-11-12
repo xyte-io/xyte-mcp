@@ -265,6 +265,22 @@ describe('oauth over http, in order', () => {
     expect(html).toContain('127.0.0.1:9');
   });
 
+  // Errors here must be direct answers: redirecting would hand the outcome to an unvetted URI.
+  it('refuses /authorize for an unknown client or an unregistered redirect_uri, never redirecting', async () => {
+    for (const [field, value, error] of [
+      ['client_id', 'no-such-client', 'invalid_client'],
+      ['redirect_uri', 'https://attacker.example.test/callback', 'invalid_request']
+    ] as const) {
+      const url = authorizeUrl();
+      url.searchParams.set(field, value);
+      const response = await fetch(url, { redirect: 'manual' });
+      expect(response.status).toBe(400);
+      expect(response.headers.get('location')).toBeNull();
+      expect(response.headers.getSetCookie()).toEqual([]);
+      expect(((await response.json()) as { error: string }).error).toBe(error);
+    }
+  });
+
   it('refuses a callback without the browser cookie, issuing nothing', async () => {
     const { hubUrl } = await approve();
     const before = hub.requests.length;
@@ -316,6 +332,23 @@ describe('oauth over http, in order', () => {
       })
     });
     expect(response.status).toBe(400);
+  });
+
+  it('refuses the token exchange for an unknown client, leaving the code usable', async () => {
+    const response = await fetch(`${base}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: verifier,
+        client_id: 'no-such-client',
+        redirect_uri: REDIRECT
+      })
+    });
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(response.status).toBeLessThan(500);
+    expect(((await response.json()) as { error: string }).error).toBe('invalid_client');
   });
 
   it('exchanges the code with the right verifier', async () => {

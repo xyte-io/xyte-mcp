@@ -12,12 +12,14 @@ import { hubAcceptsPkce } from './support/pkce.js';
 const ISSUER = 'https://mcp.test';
 const HUB = 'https://hub.test';
 const REDIRECT = 'https://client.test/callback';
-const ID_CLAIMS = { sub: 'user-1', xyte_tenant_id: 'org-1', email: 'user@example.com' };
-const ID_TOKEN = `h.${Buffer.from(JSON.stringify(ID_CLAIMS)).toString('base64url')}.s`;
+const idTokenFor = (claims: Record<string, string>) =>
+  `h.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.s`;
+const ID_TOKEN = idTokenFor({ sub: 'user-1', xyte_tenant_id: 'org-1', email: 'user@example.com' });
 
 /**
  * Hub's token and revoke endpoints behind a fetch mock. Every token response
- * mints a fresh pair; `onRefresh` overrides the refresh answer per test. A code
+ * mints a fresh pair; `onRefresh` / `onCode` override the refresh / code-exchange
+ * answer per test. A code
  * exchange is refused unless its verifier fits `challenge`, the one sent on the
  * last authorize redirect.
  */
@@ -40,6 +42,7 @@ function fakeHub() {
     idToken: ID_TOKEN,
     challenge: undefined as string | undefined,
     onRefresh: undefined as undefined | ((form: URLSearchParams) => Promise<Response> | Response),
+    onCode: undefined as undefined | (() => Promise<Response> | Response),
     refreshes: () => calls.filter((call) => call.form.get('grant_type') === 'refresh_token'),
     revokes: () => calls.filter((call) => call.path === '/oauth/revoke'),
     fetchImpl: (async (url: string, init: RequestInit) => {
@@ -48,6 +51,7 @@ function fakeHub() {
       calls.push({ path, form, auth: String((init.headers as Record<string, string>).Authorization) });
       if (path === '/oauth/revoke') return new Response(null, { status: 200 });
       if (form.get('grant_type') === 'refresh_token' && hub.onRefresh) return hub.onRefresh(form);
+      if (form.get('grant_type') === 'authorization_code' && hub.onCode) return hub.onCode();
       if (
         form.get('grant_type') === 'authorization_code' &&
         !hubAcceptsPkce(form.get('code_verifier'), hub.challenge)
@@ -410,6 +414,26 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       'an id_token that is not JSON',
       (hub: ReturnType<typeof fakeHub>) =>
         (hub.idToken = `h.${Buffer.from('not-json-user@example.com').toString('base64url')}.s`)
+    ],
+    [
+      'a 5xx from the code exchange',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.onCode = () => json(502, { error: 'server_error', detail: 'user@example.com' }))
+    ],
+    [
+      'an unreadable 200 from the code exchange',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.onCode = () => new Response('<html>user@example.com</html>', { status: 200 }))
+    ],
+    [
+      'a code exchange timeout',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.onCode = () => Promise.reject(new DOMException('slow', 'TimeoutError')))
+    ],
+    [
+      'a code exchange network error',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.onCode = () => Promise.reject(new TypeError('fetch failed')))
     ]
   ])('%s sends server_error with the state back to the client, no code', async (_name, breakHub) => {
     const { provider, hub } = makeProvider();
@@ -453,6 +477,43 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('error_description')).toBe('org_not_approved: Ask your administrator');
     expect(url.searchParams.get('state')).toBe('st4te');
     expect(url.searchParams.get('code')).toBeNull();
+    // The error ended the login: a later code on the same state mints nothing.
+    expect((await callback(provider, { state: pending, code: 'hub-code' }, cookie)).status).toBe(400);
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a callback with neither code nor error sends server_error, asking hub nothing', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await approve(provider, client);
+
+    let out!: Awaited<ReturnType<typeof callback>>;
+    await captureStderr(async () => {
+      out = await callback(provider, { state: pending }, cookie);
+    });
+    const url = new URL(out.location);
+    expect(url.searchParams.get('error')).toBe('server_error');
+    expect(url.searchParams.get('state')).toBe('st4te');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('refuses an unknown or an expired state, asking hub nothing', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+
+    const unknown = await callback(provider, { state: 'no-such-state', code: 'c' }, '__Host-xmcp_no-such-state=v');
+    expect(unknown.status).toBe(400);
+    expect(unknown.cookies['__Host-xmcp_no-such-state']?.options.maxAge).toBe(0);
+
+    const { pending, cookie } = await approve(provider, client);
+    vi.useFakeTimers({ now: Date.now() + 11 * 60 * 1000 });
+    try {
+      const expired = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
+      expect(expired.status).toBe(400);
+      expect(expired.location).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
     expect(hub.calls).toHaveLength(0);
   });
 
@@ -581,6 +642,25 @@ describe('XyteOAuthProvider: our tokens', () => {
       vi.useRealTimers();
     }
   });
+
+  it('expires codes after 10 minutes and refresh tokens after 30 days', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { code } = await signIn(provider, client);
+    const { tokens } = await connected(provider, client);
+    const start = Date.now();
+    try {
+      vi.useFakeTimers({ now: start + 11 * 60 * 1000 });
+      await expect(provider.challengeForAuthorizationCode(client, code)).rejects.toThrow(/expired/);
+      await expect(provider.exchangeAuthorizationCode(client, code)).rejects.toThrow(/expired/);
+      vi.setSystemTime(start + 31 * 24 * 60 * 60 * 1000);
+      await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+        /expired/
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('XyteOAuthProvider: hub token lifecycle', () => {
@@ -671,6 +751,52 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       'Bearer xoat_1',
       'Bearer xoat_2'
     ]);
+  });
+
+  it('a retry rejected again with invalid_token fails the call: no second refresh, no loop', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const rejected = tokenRejected();
+    const upstream = stubHttp(() => rejected);
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstream)
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toBe(rejected);
+    expect(hub.refreshes()).toHaveLength(1);
+    expect(upstream.calls.map((call) => call.headers.Authorization)).toEqual([
+      'Bearer xoat_1',
+      'Bearer xoat_2'
+    ]);
+  });
+
+  it.each([
+    ['invalid_grant', () => json(400, { error: 'invalid_grant' })],
+    ['a 5xx', () => json(503, { error: 'temporarily_unavailable' })]
+  ])('N parallel calls during a refresh that ends in %s all fail on its one refresh', async (_name, answer) => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = answer;
+    const upstream = upstreamOk();
+    const http = provider.hubHttp(grantId, upstream);
+
+    let runs!: PromiseSettledResult<unknown>[];
+    await captureStderr(async () => {
+      runs = await Promise.allSettled(
+        Array.from({ length: 8 }, () =>
+          http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+        )
+      );
+    });
+    expect(runs.map((run) => run.status === 'rejected' && (run.reason as XyteError).kind)).toEqual(
+      Array(8).fill('auth')
+    );
+    expect(hub.refreshes()).toHaveLength(1);
+    expect(upstream.calls).toHaveLength(0);
   });
 
   // A call that read xoat_1 before another call's refresh landed must not burn
@@ -1037,5 +1163,104 @@ describe('XyteOAuthProvider: revocation', () => {
 
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
     expect(hub.revokes()).toHaveLength(0);
+  });
+});
+
+describe('XyteOAuthProvider: several organizations on one server', () => {
+  const get = { method: 'GET' as const, url: `${HUB}/x`, headers: {}, endpointKey: 'k' };
+
+  /** A whole sign-in whose hub id_token names `sub` in organization `org`. */
+  async function connectedAs(
+    provider: XyteOAuthProvider,
+    client: OAuthClientInformationFull,
+    sub: string,
+    org: string
+  ) {
+    currentHub!.idToken = idTokenFor({ sub, xyte_tenant_id: org });
+    return connected(provider, client);
+  }
+
+  /** What one of our access tokens makes hub see, from verify to the hub call. */
+  async function hubBearerFor(
+    provider: XyteOAuthProvider,
+    accessToken: string,
+    upstream = stubHttp(() => ({ data: {} }))
+  ) {
+    const { grantId } = hubIdentityOf(await provider.verifyAccessToken(accessToken));
+    await provider.hubHttp(grantId, upstream).request(get);
+    return upstream.calls.at(-1)!.headers.Authorization;
+  }
+
+  it("each token reaches hub only with its own organization's hub token, across refreshes", async () => {
+    const { provider, store, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const a = await connectedAs(provider, client, 'user-a', 'org-a');
+    const b = await connectedAs(provider, client, 'user-b', 'org-b');
+    expect((await store.getGrant(a.grantId))?.hub).toMatchObject({ tenantId: 'org-a', accessToken: 'xoat_1' });
+    expect((await store.getGrant(b.grantId))?.hub).toMatchObject({ tenantId: 'org-b', accessToken: 'xoat_2' });
+
+    expect(await hubBearerFor(provider, a.tokens.access_token)).toBe('Bearer xoat_1');
+    expect(await hubBearerFor(provider, b.tokens.access_token)).toBe('Bearer xoat_2');
+
+    // Hub rejects A's token: A refreshes with A's refresh token; B is untouched.
+    const rejectsA = stubHttp((request) =>
+      request.headers.Authorization === 'Bearer xoat_1' ? tokenRejected() : { data: {} }
+    );
+    expect(await hubBearerFor(provider, a.tokens.access_token, rejectsA)).toBe('Bearer xoat_3');
+    expect(hub.refreshes().map((call) => call.form.get('refresh_token'))).toEqual(['xort_1']);
+    expect(await hubBearerFor(provider, b.tokens.access_token)).toBe('Bearer xoat_2');
+    expect((await store.getGrant(b.grantId))?.hub?.refreshToken).toBe('xort_2');
+
+    // Our own token refresh keeps each connection on its own grant.
+    const a2 = await provider.exchangeRefreshToken(client, a.tokens.refresh_token!);
+    const b2 = await provider.exchangeRefreshToken(client, b.tokens.refresh_token!);
+    expect(await hubBearerFor(provider, a2.access_token)).toBe('Bearer xoat_3');
+    expect(await hubBearerFor(provider, b2.access_token)).toBe('Bearer xoat_2');
+  });
+
+  it('a dead hub refresh chain on one organization leaves the same user on another working', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30; // both start inside the refresh window
+    const client = await registeredClient(provider);
+    const a = await connectedAs(provider, client, 'user-a', 'org-a');
+    const b = await connectedAs(provider, client, 'user-a', 'org-b');
+    hub.onRefresh = (form) =>
+      form.get('refresh_token') === 'xort_1'
+        ? json(400, { error: 'invalid_grant' })
+        : json(200, { access_token: 'xoat_b', refresh_token: 'xort_b', expires_in: 3600 });
+    const upstreamB = stubHttp(() => ({ data: {} }));
+
+    // In parallel: the per-grant single-flight must not hand one grant's outcome to the other.
+    const [runA, runB] = await Promise.allSettled([
+      provider.hubHttp(a.grantId, stubHttp(() => ({ data: {} }))).request(get),
+      provider.hubHttp(b.grantId, upstreamB).request(get)
+    ]);
+    expect(runA).toMatchObject({ status: 'rejected', reason: { kind: 'auth' } });
+    expect(runB.status).toBe('fulfilled');
+    expect(upstreamB.calls[0]!.headers.Authorization).toBe('Bearer xoat_b');
+    expect(hub.refreshes().map((call) => call.form.get('refresh_token')).sort()).toEqual([
+      'xort_1',
+      'xort_2'
+    ]);
+    await expect(provider.verifyAccessToken(a.tokens.access_token)).rejects.toThrow(/invalid/);
+    await expect(provider.verifyAccessToken(b.tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  it('revoking one connection revokes it at hub: another org or another user is no sibling', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const a = await connectedAs(provider, client, 'user-a', 'org-a');
+    const sameUserOtherOrg = await connectedAs(provider, client, 'user-a', 'org-b');
+    const otherUserSameOrg = await connectedAs(provider, client, 'user-b', 'org-a');
+
+    await provider.revokeToken(client, { token: a.tokens.access_token });
+
+    expect(hub.revokes().map((call) => call.form.get('token'))).toEqual(['xort_1']);
+    await expect(provider.verifyAccessToken(a.tokens.access_token)).rejects.toThrow(/invalid/);
+    expect(await hubBearerFor(provider, sameUserOtherOrg.tokens.access_token)).toBe('Bearer xoat_2');
+    expect(await hubBearerFor(provider, otherUserSameOrg.tokens.access_token)).toBe('Bearer xoat_3');
+    await expect(
+      provider.exchangeRefreshToken(client, otherUserSameOrg.tokens.refresh_token!)
+    ).resolves.toBeTruthy();
   });
 });

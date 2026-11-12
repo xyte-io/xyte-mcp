@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { XyteOAuthProvider } from '../src/oauth/provider.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
 import { startHttpServer } from '../src/transports/http.js';
 
@@ -332,8 +333,9 @@ describe('http transport', () => {
     expect(result.structuredContent?.count).toBeGreaterThan(0);
   });
 
-  it('refuses a mutating endpoint when started read-only', async () => {
-    const server = await start({ XYTE_MCP_READ_ONLY: '1' });
+  // Hosted is read-only unless writes are asked for; stdio keeps writes on.
+  it('refuses a mutating endpoint by default', async () => {
+    const server = await start();
     const response = await server.call(3, 'tools/call', {
       name: 'xyte_api_call',
       arguments: {
@@ -348,14 +350,35 @@ describe('http transport', () => {
     expect(result.content[0]?.text).toContain('read-only');
   });
 
-  it('warns on stderr when writes are enabled on a network transport', async () => {
-    const server = await start();
+  it('enables writes only on an explicit XYTE_MCP_ALLOW_WRITES=1, and warns', async () => {
+    const server = await start({ XYTE_MCP_ALLOW_WRITES: '1' });
+    expect(server.stderr.join('')).toContain('writes: ENABLED');
     expect(server.stderr.join('')).toContain('WARNING: writes are enabled');
   });
 
-  it('does not warn when started read-only', async () => {
-    const server = await start({ XYTE_MCP_READ_ONLY: '1' });
+  it('lets an explicit read-only win over XYTE_MCP_ALLOW_WRITES=1', async () => {
+    const server = await start({ XYTE_MCP_ALLOW_WRITES: '1', XYTE_MCP_READ_ONLY: '1' });
+    expect(server.stderr.join('')).toContain('writes: disabled');
+  });
+
+  it('does not warn when read-only, the default', async () => {
+    const server = await start();
+    expect(server.stderr.join('')).toContain('writes: disabled');
     expect(server.stderr.join('')).not.toContain('WARNING');
+  });
+
+  it('refuses to start with both the static token and OAuth configured', async () => {
+    const { code, stderr } = await runToExit(['--http'], {
+      PORT: String(await freePort()),
+      XYTE_ORG_API_KEY: ORG_KEY,
+      XYTE_MCP_HTTP_TOKEN: TOKEN,
+      XYTE_MCP_ISSUER_URL: 'https://mcp.example.com',
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+
+    expect(code).toBe(1);
+    expect(stderr).toContain('are both set');
   });
 
   it('refuses to start without a bearer token, naming the variable', async () => {
@@ -395,6 +418,35 @@ describe('http transport: token store outage', () => {
       }
     } finally {
       getToken.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  it('answers an unexpected throw in the consent flow with a generic 500 page', async () => {
+    const port = await freePort();
+    const consent = vi
+      .spyOn(XyteOAuthProvider.prototype, 'consent')
+      .mockRejectedValue(new Error('secret-ish internal detail'));
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/oauth/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'pending=x'
+      });
+      expect(response.status).toBe(500);
+      const html = await response.text();
+      expect(html).toContain('Sign-in failed');
+      expect(html).not.toContain('secret-ish');
+    } finally {
+      consent.mockRestore();
+      stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
   });

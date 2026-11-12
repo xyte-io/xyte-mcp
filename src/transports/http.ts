@@ -33,13 +33,12 @@ import { log, logError } from '../log.js';
  * request/response, so `/mcp` answers only POST (see the 405 below for what
  * goes wrong otherwise) and `enableJsonResponse` returns plain JSON.
  *
- * **Two credentials can open the door, each mapping to its own upstream
- * identity:**
+ * **One of two authentication modes per deployment** (config refuses both):
  *
  * - A static bearer (`XYTE_MCP_HTTP_TOKEN`) fronting the process-level API
  *   key — the phase-1 mode, kept for dev/CI. Every caller shares one identity,
- *   so it belongs behind a dev hub with `XYTE_MCP_READ_ONLY=1`.
- * - An OAuth 2.1 access token (enabled by `XYTE_MCP_ISSUER_URL`). The SDK's
+ *   so it belongs behind a dev hub, read-only.
+ * - OAuth 2.1 (enabled by `XYTE_MCP_ISSUER_URL`). The SDK's
  *   `mcpAuthRouter` serves discovery metadata, dynamic client registration and
  *   the authorize/token/revoke endpoints; `XyteOAuthProvider` renders a
  *   consent page, delegates sign-in to hub's OAuth server, and every verified
@@ -48,9 +47,11 @@ import { log, logError } from '../log.js';
  *   never forwarded to the hub (confused-deputy). Tokens live in Postgres
  *   (`DATABASE_URL`) so they survive a dyno restart; without it, an in-memory
  *   store that loudly warns.
+ *
+ * Read-only unless `XYTE_MCP_ALLOW_WRITES=1`: unlike stdio, writes are opt-in.
  */
 
-export const MCP_PATH = '/mcp';
+const MCP_PATH = '/mcp';
 const HEALTH_PATH = '/healthz';
 const CONSENT_PATH = '/oauth/consent';
 /** Registered at hub as `<issuer>/oauth/callback`. */
@@ -68,12 +69,14 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   const { staticToken, oauth, port } = resolveHttpConfig(env);
   // OAuth requests carry their own hub token, so only the static-bearer
   // mode needs a process-level API key (resolveHttpConfig enforces that pair).
-  const config = resolveConfig(env, { requireCredentials: !oauth });
+  const config = resolveConfig(env, { requireCredentials: !oauth, writesByDefault: false });
 
   // One HTTP client for every context: it holds the keep-alive pool and no
   // credentials, so sharing it across identities is safe and cheap.
   const upstream = createHttpClient({ timeoutMs: config.timeoutMs });
-  const staticContext = staticToken ? createToolContext(config, upstream) : undefined;
+  const staticContext = staticToken
+    ? withSecret(createToolContext(config, upstream), staticToken)
+    : undefined;
 
   const app = express();
   app.disable('x-powered-by');
@@ -170,6 +173,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     });
     server.once('error', reject);
   });
+  // Once listening, a server error (EMFILE on accept, …) is fatal; say so
+  // rather than crash on an unhandled 'error' event, and let the platform restart us.
+  listener.on('error', (error) => {
+    logError(`http listener failed: ${error.message}`);
+    process.exit(1);
+  });
   // Drain before the pool goes: a rotated hub pair that never reaches the store
   // is replayed on the next refresh, and hub then ends the user's sign-in.
   let stopping: Promise<void> | undefined;
@@ -198,12 +207,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     })();
   });
 
-  const auth = [
-    staticToken ? 'static bearer' : '',
-    oauth ? `oauth (${oauth.issuerUrl}, sign-in: hub oauth)` : ''
-  ]
-    .filter(Boolean)
-    .join(' + ');
+  const auth = oauth ? `oauth (${oauth.issuerUrl}, sign-in: hub oauth)` : 'static bearer';
   log(
     `xyte-mcp ready over http on :${port}${MCP_PATH} — ${endpointCount()} endpoints, ` +
       `auth: ${auth}, writes: ${config.allowWrites ? 'ENABLED' : 'disabled'}`
@@ -212,9 +216,9 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     log(`hub base URL overridden: ${config.baseUrls.hub}`);
   }
   if (config.allowWrites) {
-    // Worth shouting about: on stdio the blast radius is one laptop, here it is
-    // whoever holds a token.
-    log('WARNING: writes are enabled on a network-reachable server. Set XYTE_MCP_READ_ONLY=1.');
+    // Worth shouting about even when asked for: on stdio the blast radius is
+    // one laptop, here it is whoever holds a token.
+    log('WARNING: writes are enabled on a network-reachable server (XYTE_MCP_ALLOW_WRITES).');
   }
 
   return listener;
@@ -299,11 +303,10 @@ async function authenticate(
 }
 
 /**
- * Map the presented bearer to an identity: the static token to the shared
- * process context, an OAuth token to a per-request context carrying its
- * grant's hub token (refreshed on demand by the provider's hub client). Order
- * matters only for the static token's constant-time comparison; OAuth tokens
- * are random lookups by hash.
+ * Map the presented bearer to an identity: in static mode the token to the
+ * shared process context (constant-time compare), in OAuth mode a token to a
+ * per-request context carrying its grant's hub token (refreshed on demand by
+ * the provider's hub client).
  */
 async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext | undefined> {
   // The auth scheme is case-insensitive (RFC 7235 2.1).
@@ -311,8 +314,8 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
   if (!/^bearer\s+/i.test(header)) return undefined;
   const presented = header.replace(/^bearer\s+/i, '').trim();
 
-  if (auth.staticToken && auth.staticContext && matches(presented, auth.staticToken)) {
-    return auth.staticContext;
+  if (auth.staticToken && auth.staticContext) {
+    return matches(presented, auth.staticToken) ? auth.staticContext : undefined;
   }
 
   if (!auth.provider) return undefined;
@@ -330,6 +333,11 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
     if (error instanceof InvalidTokenError) return undefined;
     throw error;
   }
+}
+
+/** The bearer joins the redaction set, so no logged error can carry it either. */
+function withSecret(context: ToolContext, secret: string): ToolContext {
+  return { ...context, secrets: [...context.secrets, secret] };
 }
 
 /** An unexpected throw in the consent/callback flow; the message never reaches the browser. */

@@ -4,12 +4,13 @@ import { hubAcceptsPkce } from './support/pkce.js';
 import { existsSync, readFileSync } from 'node:fs';
 import {
   createServer,
+  request as httpRequest,
   type IncomingMessage,
   type Server,
   type ServerResponse
 } from 'node:http';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 /**
  * The whole OAuth dance against a real `--http` child process, with a fake hub
@@ -22,7 +23,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
-const STATIC_TOKEN = 'xmcp_static_token_0123456789abcdef';
+/** Well-formed, long enough, and no token of ours. */
+const JUNK_TOKEN = 'xmcp_junk_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
 const VERSION = (
   JSON.parse(readFileSync(path.resolve(import.meta.dirname, '..', 'package.json'), 'utf8')) as {
@@ -45,6 +47,11 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+/** Hub token lifetime the fake hub hands out; a test sets it inside the refresh window. */
+let hubExpiresIn = 3600;
+/** While set, the fake hub parks refresh requests here instead of answering. */
+let heldRefreshes: Array<() => void> | undefined;
+
 /** Just enough hub: OAuth token + revoke, plus one org API read that echoes headers. */
 function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> } {
   const requests: Array<Record<string, unknown>> = [];
@@ -63,16 +70,23 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
           res.end(JSON.stringify({ error: 'invalid_grant' }));
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({
-            access_token: 'xoat_1',
-            refresh_token: 'xort_1',
-            expires_in: 3600,
-            token_type: 'Bearer',
-            id_token: ID_TOKEN
-          })
-        );
+        const answer = () => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              access_token: 'xoat_1',
+              refresh_token: 'xort_1',
+              expires_in: hubExpiresIn,
+              token_type: 'Bearer',
+              id_token: ID_TOKEN
+            })
+          );
+        };
+        if (tokenForm.get('grant_type') === 'refresh_token' && heldRefreshes) {
+          heldRefreshes.push(answer);
+        } else {
+          answer();
+        }
         return;
       }
       if (req.method === 'POST' && req.url === '/oauth/revoke') {
@@ -111,7 +125,6 @@ beforeAll(async () => {
       XYTE_MCP_ISSUER_URL: base,
       XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
       XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
-      XYTE_MCP_HTTP_TOKEN: STATIC_TOKEN,
       XYTE_ORG_API_KEY: ORG_KEY,
       XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
       XYTE_MCP_READ_ONLY: '1',
@@ -216,8 +229,8 @@ describe('oauth over http, in order', () => {
   it('401s an unauthenticated /mcp call WITH a WWW-Authenticate challenge', async () => {
     const response = await mcp(null, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
     expect(response.status).toBe(401);
-    expect(response.headers.get('www-authenticate')).toContain(
-      '/.well-known/oauth-protected-resource/mcp'
+    expect(response.headers.get('www-authenticate')).toBe(
+      `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`
     );
   });
 
@@ -252,7 +265,7 @@ describe('oauth over http, in order', () => {
     expect(html).toContain('127.0.0.1:9');
   });
 
-  it('refuses a callback from a browser that did not approve, issuing nothing', async () => {
+  it('refuses a callback without the browser cookie, issuing nothing', async () => {
     const { hubUrl } = await approve();
     const before = hub.requests.length;
     const response = await fetch(
@@ -346,9 +359,10 @@ describe('oauth over http, in order', () => {
     expect(headers.tenant).toBeUndefined();
   });
 
-  it('still accepts the phase-1 static bearer alongside OAuth', async () => {
-    const response = await mcp(STATIC_TOKEN, { jsonrpc: '2.0', id: 3, method: 'tools/list' });
-    expect(response.status).toBe(200);
+  it('401s a bearer that is no token of ours, with the challenge', async () => {
+    const response = await mcp(JUNK_TOKEN, { jsonrpc: '2.0', id: 3, method: 'tools/list' });
+    expect(response.status).toBe(401);
+    expect(response.headers.get('www-authenticate')).toContain('resource_metadata=');
   });
 
   it('refreshes, rotating the refresh token', async () => {
@@ -401,10 +415,57 @@ describe('oauth over http, in order', () => {
     }
   });
 
-  it('exits cleanly on SIGTERM', async () => {
+  // The request that started the refresh is gone (client hung up), so only
+  // drain() stands between SIGTERM and an exit that loses the rotated pair.
+  it('on SIGTERM, waits for an in-flight hub refresh, then exits cleanly', async () => {
+    hubExpiresIn = 30; // this sign-in's hub token starts inside the refresh window
+    const { hubUrl, cookie } = await approve();
+    const callback = await fetch(
+      `${base}/oauth/callback?state=${hubUrl.searchParams.get('state')}&code=hub-code`,
+      { redirect: 'manual', headers: { Cookie: cookie } }
+    );
+    const freshCode = new URL(callback.headers.get('location')!).searchParams.get('code')!;
+    const exchange = await fetch(`${base}/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form({
+        grant_type: 'authorization_code',
+        code: freshCode,
+        code_verifier: verifier,
+        client_id: clientId,
+        redirect_uri: REDIRECT
+      })
+    });
+    const { access_token: token } = (await exchange.json()) as { access_token: string };
+    hubExpiresIn = 3600;
+
+    heldRefreshes = [];
+    // A raw request, so hanging up really closes the socket under it.
+    const call = httpRequest(`${base}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${token}` }
+    });
+    call.on('error', () => undefined);
+    call.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+      })
+    );
+    await vi.waitFor(() => expect(heldRefreshes).toHaveLength(1));
+    call.destroy();
+
     const exited = new Promise<number | null>((resolve) => child!.once('exit', resolve));
     child!.kill('SIGTERM');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(child!.exitCode).toBeNull(); // still waiting on hub
+
+    for (const answer of heldRefreshes!) answer();
+    heldRefreshes = undefined;
     expect(await exited).toBe(0);
     expect(stderr.join('')).toContain('SIGTERM');
+    expect(stderr.join('')).not.toContain('lost at shutdown');
   });
 });

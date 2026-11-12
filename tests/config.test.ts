@@ -93,6 +93,26 @@ describe('resolveConfig', () => {
     });
   });
 
+  // The HTTP transport: read-only unless writes are asked for explicitly.
+  describe('with writesByDefault: false', () => {
+    const http = (env: Record<string, string>) =>
+      resolveConfig({ ...withOrgKey, ...env }, { writesByDefault: false }).allowWrites;
+
+    it('defaults writes to off, and read-only=0 alone does not turn them on', () => {
+      expect(http({})).toBe(false);
+      expect(http({ [ENV.readOnly]: '0' })).toBe(false);
+    });
+
+    it('turns writes on only for an explicit allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1' })).toBe(true);
+      expect(http({ [ENV.allowWrites]: '0' })).toBe(false);
+    });
+
+    it('still lets an explicit read-only win over allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1', [ENV.readOnly]: '1' })).toBe(false);
+    });
+  });
+
   it('defaults and validates the timeout', () => {
     expect(resolveConfig(withOrgKey).timeoutMs).toBe(15_000);
     expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '5000' }).timeoutMs).toBe(5000);
@@ -155,6 +175,11 @@ describe('resolveHttpConfig', () => {
 
   it('enables OAuth from the issuer URL, with and without a database', () => {
     const issuer = 'https://mcp.example.com';
+    // Normalized as the SDK normalizes the resource clients send back.
+    expect(
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'https://MCP.example.com:443' }).oauth
+        ?.issuerUrl
+    ).toBe(issuer);
     expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: `${issuer}/` }).oauth).toEqual({
       issuerUrl: issuer,
       hubClient
@@ -174,14 +199,11 @@ describe('resolveHttpConfig', () => {
     ).toThrow(new RegExp(ENV.hubOAuthClientSecret));
   });
 
-  it('accepts static + OAuth together', () => {
-    const config = resolveHttpConfig({
-      ...staticEnv,
-      ...hubClientEnv,
-      [ENV.issuerUrl]: 'https://mcp.example.com'
-    });
-    expect(config.staticToken).toBe(token);
-    expect(config.oauth?.issuerUrl).toBe('https://mcp.example.com');
+  // A shared static bearer next to the per-user sign-in on one public URL.
+  it('refuses static + OAuth together, naming both variables', () => {
+    expect(() =>
+      resolveHttpConfig({ ...staticEnv, ...hubClientEnv, [ENV.issuerUrl]: 'https://mcp.example.com' })
+    ).toThrow(new RegExp(`${ENV.httpToken} and ${ENV.issuerUrl} are both set`));
   });
 
   // Tokens minted under a plain-http issuer are readable by every hop; only
@@ -224,6 +246,16 @@ describe('resolveHttpConfig', () => {
       token
     );
     expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(24) })).not.toThrow();
+  });
+
+  // The xmcp_ prefix is a scanner marker; it adds nothing to guess.
+  it('does not count the xmcp_ prefix toward the floor', () => {
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(23)}` })
+    ).toThrow(/too short/);
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(24)}` })
+    ).not.toThrow();
   });
 
   it.each(['abc', '0', '-1', '3000.5', '70000'])('refuses PORT=%s', (port) => {

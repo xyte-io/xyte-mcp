@@ -29,8 +29,6 @@ function signIn(overrides: Partial<HubSignIn> = {}): HubSignIn {
 interface Harness {
   store: OAuthStore;
   reset(): Promise<void>;
-  /** A grant from the retired devise-triplet login: no hub refresh token. */
-  deadGrant(clientId: string): Promise<string>;
   close(): Promise<void>;
 }
 
@@ -43,7 +41,6 @@ const harnesses: Array<[string, () => Promise<Harness>]> = [
         reset: async () => {
           harness.store = new MemoryOAuthStore();
         },
-        deadGrant: (clientId) => harness.store.createGrant(clientId, undefined as never),
         close: async () => {}
       };
       return harness;
@@ -60,14 +57,6 @@ if (PG_URL) {
         store,
         reset: async () => {
           await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
-        },
-        deadGrant: async (clientId) => {
-          const result = await admin.query<{ id: string }>(
-            `INSERT INTO oauth_grants (client_id, hub_access_token, hub_client, hub_uid, hub_tenant)
-             VALUES ($1, 'old', 'c', 'u', 'org-1') RETURNING id`,
-            [clientId]
-          );
-          return result.rows[0]!.id;
         },
         close: async () => {
           await store.close();
@@ -106,13 +95,6 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     expect(typeof id).toBe('string');
     expect(await store().getGrant(id)).toEqual({ id, clientId: 'c1', hub, revoked: false });
     expect(await store().getGrant('999999')).toBeUndefined();
-  });
-
-  it('treats a grant without hub refresh token as having no hub sign-in', async () => {
-    const id = await harness.deadGrant('c1');
-    const grant = await store().getGrant(id);
-    expect(grant).toMatchObject({ id, clientId: 'c1', revoked: false });
-    expect(grant?.hub).toBeUndefined();
   });
 
   it('revokeGrant marks the grant revoked and drops its hub tokens', async () => {
@@ -159,14 +141,12 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       codeChallenge: 'ch',
       redirectUri: 'https://a/cb',
       resource: 'https://mcp/mcp',
-      expiresAt,
-      revoked: false
+      expiresAt
     });
     expect(await store().getToken('t1', 'access')).toEqual({
       kind: 'access',
       grantId: id,
-      expiresAt,
-      revoked: false
+      expiresAt
     });
     expect(await store().getToken('t1', 'refresh')).toBeUndefined();
   });

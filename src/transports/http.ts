@@ -318,10 +318,14 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
   if (!auth.provider) return undefined;
   try {
     const hub = hubIdentityOf(await auth.provider.verifyAccessToken(presented));
-    return createToolContext(
+    // hubHttp replaces this token with the grant's current one, and adds every
+    // token it sends here, so a refreshed one is redacted like the original.
+    const secrets = [hub.accessToken];
+    const context = createToolContext(
       { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
-      auth.provider.hubHttp(hub.grantId, auth.upstream)
+      auth.provider.hubHttp(hub.grantId, auth.upstream, secrets)
     );
+    return { ...context, secrets };
   } catch (error) {
     if (error instanceof InvalidTokenError) return undefined;
     throw error;

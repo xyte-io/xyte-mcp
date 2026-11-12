@@ -76,11 +76,13 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   private readonly refreshing = new Map<string, Promise<string>>();
   /** Rotated hub pairs the store failed to save, used in place of the stored ones. */
   private readonly unsaved = new Map<string, HubTokens>();
+  /** Set by drain(): no new hub refresh may start, so its snapshot is final. */
+  private draining = false;
 
   constructor(
     private readonly store: OAuthStore,
     private readonly hub: HubOAuth,
-    /** e.g. https://xyte-mcp-aran.herokuapp.com — no trailing slash. */
+    /** e.g. https://<app>.herokuapp.com — no trailing slash. */
     private readonly issuerUrl: string
   ) {
     this.clientsStore = {
@@ -251,16 +253,19 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   /**
    * The hub client for one grant's tool calls: swaps in a fresh hub token
    * before each call, and when hub rejects the token itself (expired and
-   * revoked look the same) refreshes once and retries once.
+   * revoked look the same) refreshes once and retries once. Every hub token
+   * it sends is added to `secrets`, so a refreshed one is redacted too.
    */
-  hubHttp(grantId: string, upstream: HttpClient): HttpClient {
+  hubHttp(grantId: string, upstream: HttpClient, secrets?: string[]): HttpClient {
     return {
       request: async (request) => {
-        const send = (token: string) =>
-          upstream.request({
+        const send = (token: string) => {
+          if (secrets && !secrets.includes(token)) secrets.push(token);
+          return upstream.request({
             ...request,
             headers: { ...request.headers, Authorization: `Bearer ${token}` }
           });
+        };
         const token = await this.hubAccessToken(grantId);
         try {
           return await send(token);
@@ -309,6 +314,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   private refreshHub(grantId: string, staleAccessToken: string): Promise<string> {
     let flight = this.refreshing.get(grantId);
     if (!flight) {
+      // A rotation started now could land after the store closes and be lost.
+      if (this.draining) {
+        return Promise.reject(
+          new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
+        );
+      }
       flight = this.doRefresh(grantId, staleAccessToken).finally(() => {
         this.refreshing.delete(grantId);
       });
@@ -401,16 +412,17 @@ export class XyteOAuthProvider implements OAuthServerProvider {
    * hub ends the user's sign-in on that organization.
    */
   async drain(): Promise<void> {
-    // A request still running can start another refresh while we wait.
-    while (this.refreshing.size > 0) {
-      await Promise.allSettled(this.refreshing.values());
-    }
+    this.draining = true;
+    await Promise.allSettled(this.refreshing.values());
     for (const grantId of [...this.unsaved.keys()]) {
       try {
         const live = await this.liveHub(grantId);
         const next = this.unsaved.get(grantId);
         if (live && next) await this.saveHubTokens(grantId, live.stored, next);
       } catch {
+        // The grant read failed; the pair is still unsaved.
+      }
+      if (this.unsaved.has(grantId)) {
         logError(`ERROR grant ${grantId}: rotated hub tokens lost at shutdown`);
       }
     }
@@ -454,7 +466,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     resource?: URL
   ): Promise<OAuthTokens> {
     const record = await this.store.getToken(refreshToken, 'refresh');
-    if (!record || record.revoked || record.expiresAt <= nowSeconds()) {
+    if (!record || record.expiresAt <= nowSeconds()) {
       throw new InvalidGrantError('refresh token is invalid or expired');
     }
     const grant = await this.store.getGrant(record.grantId);
@@ -473,11 +485,10 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const record = await this.store.getToken(token, 'access');
-    if (!record || record.revoked || record.expiresAt <= nowSeconds()) {
+    if (!record || record.expiresAt <= nowSeconds()) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
     const grant = await this.store.getGrant(record.grantId);
-    // No hub tokens = a grant from the retired devise-triplet login: re-auth.
     if (!grant?.hub || grant.revoked) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
@@ -527,7 +538,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     authorizationCode: string
   ): Promise<TokenRecord> {
     const record = await this.store.getToken(authorizationCode, 'code');
-    if (!record || record.revoked || record.expiresAt <= nowSeconds()) {
+    if (!record || record.expiresAt <= nowSeconds()) {
       throw new InvalidGrantError('authorization code is invalid or expired');
     }
     const grant = await this.store.getGrant(record.grantId);
@@ -568,6 +579,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 /** What a verified token resolves to: its grant and that grant's hub token. */
 export interface HubIdentity {
   grantId: string;
+  /** As stored at verify time; hubHttp sends the current one, possibly refreshed. */
   accessToken: string;
 }
 

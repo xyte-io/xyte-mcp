@@ -442,13 +442,6 @@ describe('XyteOAuthProvider: our tokens', () => {
       vi.useRealTimers();
     }
   });
-
-  it('treats a grant without hub tokens (the old devise login) as invalid', async () => {
-    const { provider, store } = makeProvider();
-    const grantId = await store.createGrant('client-1', undefined as never);
-    await store.saveToken({ token: 'old-at', kind: 'access', grantId, expiresAt: 2 ** 31 });
-    await expect(provider.verifyAccessToken('old-at')).rejects.toThrow(/invalid/);
-  });
 });
 
 describe('XyteOAuthProvider: hub token lifecycle', () => {
@@ -467,6 +460,21 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       endpointKey: 'k'
     });
     expect(upstream.calls[0]!.headers.Authorization).toBe('Bearer xoat_1');
+  });
+
+  it('adds every hub token it sends, a refreshed one too, to the secrets to redact', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const upstream = stubHttp((request) =>
+      request.headers.Authorization === 'Bearer xoat_1' ? tokenRejected() : { data: {} }
+    );
+    const secrets = ['xoat_1'];
+
+    await provider
+      .hubHttp(grantId, upstream, secrets)
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    expect(secrets).toEqual(['xoat_1', 'xoat_2']);
   });
 
   it('N parallel calls across hub-token expiry share exactly one refresh', async () => {
@@ -681,6 +689,43 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     await provider.drain();
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_2');
     expect(hub.refreshes()).toHaveLength(1); // saved, not refreshed again
+  });
+
+  it('says the pair is lost when the store is still down at shutdown', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    await provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      await provider.drain();
+      expect(stderr.mock.calls.map(([line]) => String(line)).join('')).toContain(
+        `grant ${grantId}: rotated hub tokens lost at shutdown`
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it('starts no hub refresh once draining: the call fails retryably, hub is never asked', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+
+    await provider.drain();
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    await expect(call).rejects.toMatchObject({ kind: 'network' });
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
 });
 

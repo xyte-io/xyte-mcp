@@ -241,6 +241,10 @@ git push heroku HEAD:main       # HEAD, so a branch can be deployed without merg
 `config:edit` rather than `config:set`: the latter puts the API key in your shell history
 and in `ps` while it runs.
 
+A database created by a pre-release build of the OAuth branch has an incompatible schema:
+drop its three tables (`oauth_tokens`, `oauth_grants`, `oauth_clients`) once before this
+build starts; it recreates them at boot.
+
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
 
@@ -358,9 +362,11 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
 - **Consent first.** `/authorize` never redirects straight away: it shows our own consent
   page naming the registering client (its `client_name` is self-declared, and labelled so)
   and the host the code will be sent to, with Approve / Deny. The page cannot be framed.
-  Approve binds the flow to that browser with a `__Host-` cookie and sends it on to hub;
-  the callback refuses any browser without the cookie, so an attacker cannot approve their
-  own consent and hand the hub URL to a victim.
+  It binds the flow to that browser with a `__Host-` cookie, set with the page itself so a
+  cross-site auto-submitted Approve (no `SameSite=Lax` cookie) fails. Approve sends the
+  browser on to hub; the callback refuses any browser without the cookie, so an attacker
+  cannot approve their own consent and hand the hub URL to a victim. The pending consent
+  expires after 10 minutes.
 - **Sign-in at hub.** xyte-mcp is a confidential OAuth client of hub (`/oauth/authorize`,
   `/oauth/token`, `/oauth/revoke`): authorization code with its own S256 PKCE,
   `client_secret_basic`, `scope=openid email profile`. The user signs in and picks one
@@ -371,7 +377,8 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
 - **Audience-bound tokens.** The access/refresh tokens we mint are our own, hashed at rest,
   and bound to this server as the RFC 8707 resource. A client's token is **never forwarded
   to the hub** — each request resolves its grant and calls the hub with the stored hub
-  token (the classic confused-deputy guard).
+  token (the classic confused-deputy guard). Lifetimes: authorization code 10 minutes,
+  access token 1 hour, refresh token 30 days (single-use, rotated on every exchange).
 - **Organization authority.** Calls send `Authorization: Bearer xoat_…` and
   `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The token carries the
   organization's full authority, like an org API key; the user is attribution only.
@@ -392,9 +399,7 @@ revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
   logs users out. The schema is created at boot and only ever extended (nullable columns,
-  nothing dropped), so rolling back to an older build still boots. Grants from the earlier
-  password/Descope login hold no hub tokens and are treated as invalid: their clients get a
-  `401` and re-authorize.
+  nothing dropped), so rolling back to an older build still boots.
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) the listener stops accepting,

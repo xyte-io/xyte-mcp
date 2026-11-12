@@ -19,7 +19,7 @@ export type TokenKind = 'code' | 'access' | 'refresh';
 export interface GrantRecord {
   id: string;
   clientId: string;
-  /** Absent on grants from the old devise-triplet login: those are dead. */
+  /** Absent once revoked: revocation drops the hub tokens. */
   hub?: HubSignIn;
   revoked: boolean;
 }
@@ -35,10 +35,9 @@ export interface TokenRecord {
   redirectUri?: string;
   /** RFC 8707 audience the token was requested for, if any. */
   resource?: string;
-  revoked: boolean;
 }
 
-export interface NewToken extends Omit<TokenRecord, 'revoked'> {
+export interface NewToken extends TokenRecord {
   token: string;
 }
 
@@ -61,7 +60,7 @@ export interface OAuthStore {
   ): Promise<boolean>;
   /**
    * Whether another grant on the same hub sign-in is still in use: not
-   * revoked, and holding an unexpired, unrevoked access or refresh token.
+   * revoked, and holding an unexpired access or refresh token.
    */
   hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean>;
 
@@ -133,7 +132,7 @@ export class MemoryOAuthStore implements OAuthStore {
     const now = Math.floor(Date.now() / 1000);
     const used = new Set(
       [...this.tokens.values()]
-        .filter((token) => token.kind !== 'code' && !token.revoked && token.expiresAt > now)
+        .filter((token) => token.kind !== 'code' && token.expiresAt > now)
         .map((token) => token.grantId)
     );
     return [...this.grants.values()].some(
@@ -147,7 +146,7 @@ export class MemoryOAuthStore implements OAuthStore {
   }
 
   async saveToken({ token, ...record }: NewToken): Promise<void> {
-    this.tokens.set(`${record.kind}:${hashToken(token)}`, { ...record, revoked: false });
+    this.tokens.set(`${record.kind}:${hashToken(token)}`, record);
   }
 
   async getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined> {

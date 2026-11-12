@@ -29,14 +29,18 @@ const SCHEMA = `
     created_at timestamptz NOT NULL DEFAULT now()
   );
   CREATE TABLE IF NOT EXISTS oauth_grants (
-    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    client_id        text NOT NULL,
-    hub_access_token text NOT NULL,
-    hub_client       text NOT NULL,
-    hub_uid          text NOT NULL,
-    hub_tenant       text,
-    revoked_at       timestamptz,
-    created_at       timestamptz NOT NULL DEFAULT now()
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    client_id         text NOT NULL,
+    hub_sub           text NOT NULL,
+    hub_tenant        text NOT NULL,
+    hub_email         text,
+    -- NULL only once revoked: revocation drops the hub tokens.
+    hub_access_token  text,
+    hub_refresh_token text,
+    hub_expires_at    timestamptz NOT NULL,
+    revoked_at        timestamptz,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    CHECK (revoked_at IS NOT NULL OR (hub_access_token IS NOT NULL AND hub_refresh_token IS NOT NULL))
   );
   CREATE TABLE IF NOT EXISTS oauth_tokens (
     token_hash     text NOT NULL,
@@ -46,18 +50,9 @@ const SCHEMA = `
     redirect_uri   text,
     resource       text,
     expires_at     timestamptz NOT NULL,
-    revoked_at     timestamptz,
     created_at     timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (kind, token_hash)
   );
-  -- Hub OAuth sign-in (DEV-6746). hub_access_token and hub_tenant are reused;
-  -- hub_client / hub_uid belong to the retired devise triplet. A row without
-  -- hub_refresh_token is a triplet-era grant and is treated as dead.
-  ALTER TABLE oauth_grants
-    ADD COLUMN IF NOT EXISTS hub_refresh_token text,
-    ADD COLUMN IF NOT EXISTS hub_expires_at    timestamptz,
-    ADD COLUMN IF NOT EXISTS hub_sub           text,
-    ADD COLUMN IF NOT EXISTS hub_email         text;
   -- The sibling check on revoke (hasLiveHubSibling) joins on both.
   CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
   CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
@@ -69,17 +64,16 @@ interface TokenRow {
   redirect_uri: string | null;
   resource: string | null;
   expires_at: Date;
-  revoked_at: Date | null;
 }
 
 interface GrantRow {
   id: string;
   client_id: string;
-  hub_access_token: string;
+  hub_access_token: string | null;
   hub_refresh_token: string | null;
-  hub_expires_at: Date | null;
-  hub_sub: string | null;
-  hub_tenant: string | null;
+  hub_expires_at: Date;
+  hub_sub: string;
+  hub_tenant: string;
   hub_email: string | null;
   revoked_at: Date | null;
 }
@@ -120,12 +114,10 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
-    // ponytail: hub_client / hub_uid stay NOT NULL from the triplet schema, so
-    // they get '' rather than a constraint change an older build might trip on.
     const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_client, hub_uid, hub_tenant,
+      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_tenant,
                                  hub_refresh_token, hub_expires_at, hub_sub, hub_email)
-       VALUES ($1, $2, '', '', $3, $4, to_timestamp($5), $6, $7) RETURNING id`,
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6, $7) RETURNING id`,
       [
         clientId,
         hub.accessToken,
@@ -150,7 +142,7 @@ export class PgOAuthStore implements OAuthStore {
     return {
       id: row.id,
       clientId: row.client_id,
-      ...(row.hub_refresh_token && row.hub_expires_at && row.hub_sub && row.hub_tenant
+      ...(row.hub_access_token !== null && row.hub_refresh_token !== null
         ? {
             hub: {
               accessToken: row.hub_access_token,
@@ -169,7 +161,7 @@ export class PgOAuthStore implements OAuthStore {
   async revokeGrant(grantId: string): Promise<void> {
     await this.pool.query(
       `UPDATE oauth_grants
-          SET revoked_at = now(), hub_access_token = '', hub_refresh_token = NULL
+          SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
         WHERE id = $1 AND revoked_at IS NULL`,
       [grantId]
     );
@@ -193,7 +185,7 @@ export class PgOAuthStore implements OAuthStore {
     const result = await this.pool.query(
       `SELECT 1 FROM oauth_grants g JOIN oauth_tokens t ON t.grant_id = g.id
         WHERE g.hub_sub = $1 AND g.hub_tenant = $2 AND g.id <> $3 AND g.revoked_at IS NULL
-          AND t.kind IN ('access', 'refresh') AND t.revoked_at IS NULL AND t.expires_at > now()
+          AND t.kind IN ('access', 'refresh') AND t.expires_at > now()
         LIMIT 1`,
       [sub, tenantId, exceptGrantId]
     );
@@ -229,8 +221,7 @@ export class PgOAuthStore implements OAuthStore {
       expiresAt: Math.floor(row.expires_at.getTime() / 1000),
       ...(row.code_challenge ? { codeChallenge: row.code_challenge } : {}),
       ...(row.redirect_uri ? { redirectUri: row.redirect_uri } : {}),
-      ...(row.resource ? { resource: row.resource } : {}),
-      revoked: row.revoked_at !== null
+      ...(row.resource ? { resource: row.resource } : {})
     };
   }
 

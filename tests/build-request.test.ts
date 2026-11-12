@@ -149,6 +149,46 @@ describe('buildRequest', () => {
     expect((caught as XyteError).hints.join(' ')).toContain('XYTE_PARTNER_API_KEY');
   });
 
+  it('says partner endpoints are unavailable over a Xyte sign-in, not to set a key', () => {
+    const context = testContext({ credentials: { organization: { accessToken: 'xoat_abc' } } });
+    const partnerEndpoint = spec({
+      key: 'partner.devices.getDevices',
+      namespace: 'partner',
+      authScope: 'partner',
+      pathParams: [],
+      pathTemplate: '/core/v1/partner/devices',
+      queryParams: []
+    });
+
+    let caught: unknown;
+    try {
+      buildRequest(partnerEndpoint, {}, context);
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as XyteError).message).toMatch(/not available through a Xyte sign-in/);
+    expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_PARTNER_API_KEY');
+  });
+
+  it('sends a hub OAuth token as a Bearer with X-Xyte-Client, never as a bare key', () => {
+    const context = testContext({ credentials: { organization: { accessToken: 'xoat_abc' } } });
+    const request = buildRequest(spec(), { path: { device_id: 'abc' } }, context);
+
+    expect(request.headers.Authorization).toBe('Bearer xoat_abc');
+    expect(request.headers['X-Xyte-Client']).toMatch(/^xyte-mcp\/\d+\.\d+\.\d+/);
+  });
+
+  it('rejects ".." in any path parameter, not only the first', () => {
+    const twoParams = spec({
+      pathTemplate: '/core/v1/organization/devices/:device_id/files/:file_id',
+      pathParams: ['device_id', 'file_id']
+    });
+
+    expect(() =>
+      buildRequest(twoParams, { path: { device_id: 'abc', file_id: '..' } }, testContext())
+    ).toThrow(/"file_id" cannot be/);
+  });
+
   it('builds a request for every catalog endpoint without throwing', () => {
     // Catches any generated spec whose template and pathParams disagree.
     const context = testContext({

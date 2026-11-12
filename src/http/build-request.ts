@@ -31,6 +31,14 @@ export function buildRequest(
   context: ToolContext
 ): HttpRequest {
   const credential = context.credentials[endpoint.authScope];
+  if (!credential && typeof context.credentials.organization === 'object') {
+    // A Xyte sign-in yields an organization token only; no key to set fixes that.
+    throw new XyteError(
+      'config',
+      `${endpoint.key} needs a ${endpoint.authScope} API key; ${endpoint.authScope} endpoints are not available through a Xyte sign-in.`,
+      ['Use an organization endpoint, or a local server configured with a partner API key.']
+    );
+  }
   if (!credential) {
     throw new XyteError(
       'config',

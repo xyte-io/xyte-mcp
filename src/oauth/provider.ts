@@ -65,6 +65,9 @@ interface PendingAuthorization {
 }
 
 const PENDING_TTL_SECONDS = 10 * 60;
+// ponytail: a fixed ceiling on parked logins (DCR is open, so /authorize is
+// reachable from any number of IPs); per-client caps if this is ever hit.
+const MAX_PENDING = 10_000;
 const COOKIE_PREFIX = '__Host-xmcp_';
 const EXPIRED = 'Authorization expired or invalid. Restart the connection.';
 
@@ -78,6 +81,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   private readonly unsaved = new Map<string, HubTokens>();
   /** Set by drain(): no new hub refresh may start, so its snapshot is final. */
   private draining = false;
+  /** Grants being revoked: no new hub refresh may start on them (it would burn the token revoke sends). */
+  private readonly ending = new Set<string>();
 
   constructor(
     private readonly store: OAuthStore,
@@ -129,7 +134,16 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       expiresAt: nowSeconds() + PENDING_TTL_SECONDS
     };
     this.prunePending();
+    if (this.pending.size >= MAX_PENDING) {
+      res.status(503).type('html').send(errorPage('Too many sign-ins in progress. Try again shortly.'));
+      return;
+    }
     this.pending.set(pendingId, entry);
+    // One cookie per started flow: expire the ones whose flow is gone, or
+    // enough abandoned flows grow the Cookie header past the server's limit.
+    for (const name of cookieNames(res.req)) {
+      if (!this.pending.has(name.slice(COOKIE_PREFIX.length))) clearBrowserCookie(res, name);
+    }
 
     // Set with the page, not only on Approve: a cross-site auto-submitted
     // Approve carries no SameSite=Lax cookie, so it cannot skip this page.
@@ -152,18 +166,18 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     const form = (req.body ?? {}) as Record<string, unknown>;
     const pendingId = typeof form.pending === 'string' ? form.pending : '';
     const entry = this.livePending(pendingId);
-    if (
-      !entry ||
-      !same(form.csrf, entry.csrf) ||
-      !same(readCookie(req, COOKIE_PREFIX + pendingId), entry.browserKey)
-    ) {
-      if (entry) this.pending.delete(pendingId);
+    const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
+    // A mismatch leaves the entry alone: the pending id travels in URLs, so
+    // dropping it here would let anyone who saw one cancel that login.
+    if (!entry || !same(form.csrf, entry.csrf) || !same(cookie, entry.browserKey)) {
+      if (!entry && cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
       res.status(400).type('html').send(errorPage(EXPIRED));
       return;
     }
 
     if (form.decision !== 'approve') {
       this.pending.delete(pendingId);
+      clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
       res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
       return;
     }
@@ -190,12 +204,18 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     const query = req.query as Record<string, unknown>;
     const pendingId = typeof query.state === 'string' ? query.state : '';
     const entry = this.livePending(pendingId);
-    // Single-use either way: a replayed callback must not mint twice.
-    if (entry) {
-      this.pending.delete(pendingId);
-      res.cookie(COOKIE_PREFIX + pendingId, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+    const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
+    // Without the cookie the entry is left alone, as in consent(): the state is
+    // in hub's URL, and knowing it must not be enough to cancel the login.
+    if (!entry || !same(cookie, entry.browserKey)) {
+      if (!entry && cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+      res.status(400).type('html').send(errorPage(EXPIRED));
+      return;
     }
-    if (!entry?.approved || !same(readCookie(req, COOKIE_PREFIX + pendingId), entry.browserKey)) {
+    // Single-use from here: a replayed callback must not mint twice.
+    this.pending.delete(pendingId);
+    clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+    if (!entry.approved) {
       res.status(400).type('html').send(errorPage(EXPIRED));
       return;
     }
@@ -230,7 +250,14 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       });
       res.redirect(302, clientRedirect(entry, { code }));
     } catch (error) {
-      logError(`hub sign-in failed: ${error instanceof Error ? error.message : String(error)}`);
+      // A JSON parse error quotes its input — the id_token or the response body.
+      const detail =
+        error instanceof SyntaxError
+          ? 'unreadable hub response'
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      logError(`hub sign-in failed: ${detail}`);
       res.redirect(
         302,
         clientRedirect(entry, { error: 'server_error', error_description: 'Xyte sign-in failed' })
@@ -320,6 +347,9 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
         );
       }
+      // Revoke read the refresh token it is about to send hub; rotating it now
+      // would make that send a replay of a burned token.
+      if (this.ending.has(grantId)) return Promise.reject(signInGone());
       flight = this.doRefresh(grantId, staleAccessToken).finally(() => {
         this.refreshing.delete(grantId);
       });
@@ -519,14 +549,20 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       const grant = await this.store.getGrant(record.grantId);
       // Spec: revoking someone else's token is a silent no-op, not an oracle.
       if (grant && grant.clientId === client.client_id && !grant.revoked) {
-        // Let an in-flight hub refresh land first: otherwise it rotates the pair
-        // just after we read it, and hub is sent the already-burned token.
-        await this.refreshing.get(grant.id)?.catch(() => undefined);
-        const hub = (await this.liveHub(grant.id))?.hub;
-        await this.store.revokeGrant(grant.id);
-        this.unsaved.delete(grant.id);
-        if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
-          await this.hub.revoke(hub.refreshToken);
+        // Let an in-flight hub refresh land first, and start no new one until
+        // the grant is revoked: either would rotate the pair just after we read
+        // it, and hub would be sent the already-burned token.
+        this.ending.add(grant.id);
+        try {
+          await this.refreshing.get(grant.id)?.catch(() => undefined);
+          const hub = (await this.liveHub(grant.id))?.hub;
+          await this.store.revokeGrant(grant.id);
+          this.unsaved.delete(grant.id);
+          if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
+            await this.hub.revoke(hub.refreshToken);
+          }
+        } finally {
+          this.ending.delete(grant.id);
         }
       }
       return;
@@ -624,6 +660,18 @@ function setBrowserCookie(res: Response, pendingId: string, value: string): void
     ...COOKIE_OPTIONS,
     maxAge: PENDING_TTL_SECONDS * 1000
   });
+}
+
+function clearBrowserCookie(res: Response, name: string): void {
+  res.cookie(name, '', { ...COOKIE_OPTIONS, maxAge: 0 });
+}
+
+/** Our flow cookies the browser sent; their names came from us, so they are safe to set back. */
+function cookieNames(req: Request | undefined): string[] {
+  return (req?.headers.cookie ?? '')
+    .split(';')
+    .map((part) => part.trim().split('=')[0] ?? '')
+    .filter((name) => name.startsWith(COOKIE_PREFIX));
 }
 
 function readCookie(req: Request, name: string): string | undefined {

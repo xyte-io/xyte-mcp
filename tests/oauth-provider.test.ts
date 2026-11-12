@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { HttpClient, HttpRequest, HttpResponse } from '../src/http/client.js';
 import { XyteError, XyteHttpError } from '../src/http/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
@@ -30,12 +31,13 @@ function fakeHub() {
       refresh_token: `xort_${minted}`,
       expires_in: expiresIn,
       token_type: 'Bearer',
-      id_token: ID_TOKEN
+      id_token: hub.idToken
     });
   };
   const hub = {
     calls,
     expiresIn: 3600,
+    idToken: ID_TOKEN,
     challenge: undefined as string | undefined,
     onRefresh: undefined as undefined | ((form: URLSearchParams) => Promise<Response> | Response),
     refreshes: () => calls.filter((call) => call.form.get('grant_type') === 'refresh_token'),
@@ -56,6 +58,27 @@ function fakeHub() {
     }) as unknown as typeof fetch
   };
   return hub;
+}
+
+const okResponse = (): HttpResponse => ({
+  status: 200,
+  statusText: 'OK',
+  durationMs: 1,
+  attempts: 1,
+  data: {}
+});
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Runs `fn` with stderr captured; returns what was written. */
+async function captureStderr(fn: () => Promise<unknown>): Promise<string> {
+  const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+  try {
+    await fn();
+    return stderr.mock.calls.map(([line]) => String(line)).join('');
+  } finally {
+    stderr.mockRestore();
+  }
 }
 
 function json(status: number, body: unknown): Response {
@@ -280,6 +303,37 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('error')).toBe('access_denied');
     expect(url.searchParams.get('state')).toBe('st4te');
     expect(hub.calls).toHaveLength(0);
+    // The flow is over, so its cookie goes too.
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+  });
+
+  it('expires flow cookies whose flow is gone when a new /authorize starts', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const live = await openConsent(provider, client);
+    const { out, res } = fakeRes();
+    (res as unknown as { req: Request }).req = fakeReq({
+      cookie: `${live.cookie}; __Host-xmcp_gone=v; other=1`
+    });
+
+    await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+    expect(out.cookies['__Host-xmcp_gone']?.options.maxAge).toBe(0);
+    expect(out.cookies[live.cookie.split('=')[0]!]).toBeUndefined();
+    expect(out.cookies.other).toBeUndefined();
+  });
+
+  it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const start = () => {
+      const { out, res } = fakeRes();
+      return provider
+        .authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+        .then(() => out.status);
+    };
+    for (let i = 0; i < 10_000; i += 1) await start();
+
+    expect(await start()).toBe(503);
   });
 
   it('callback mints a code bound to the client challenge and stores the hub sign-in', async () => {
@@ -306,16 +360,12 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     });
   });
 
-  it('callback without, or with the wrong, browser cookie issues nothing and drops the entry', async () => {
+  it('callback without, or with the wrong, browser cookie issues nothing', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
 
     const missing = await approve(provider, client);
     expect((await callback(provider, { state: missing.pending, code: 'c' })).status).toBe(400);
-    // Dropped: even the right cookie cannot complete it now.
-    expect(
-      (await callback(provider, { state: missing.pending, code: 'c' }, missing.cookie)).status
-    ).toBe(400);
 
     const wrong = await approve(provider, client);
     const forged = `${wrong.cookie.split('=')[0]}=attacker-value`;
@@ -323,6 +373,63 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.status).toBe(400);
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+  });
+
+  // The state is in hub's URL (history, logs): knowing it must not cancel a login.
+  it('a cookieless callback leaves the login for its own browser to finish', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await approve(provider, client);
+
+    expect((await callback(provider, { state: pending, code: 'c' })).status).toBe(400);
+    const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+    // ...once: the replay is refused.
+    expect((await callback(provider, { state: pending, code: 'hub-code' }, cookie)).status).toBe(400);
+  });
+
+  it('refuses a callback for a consent that was never approved, even with its cookie', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await openConsent(provider, client);
+
+    const out = await callback(provider, { state: pending, code: 'c' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it.each([
+    ['a refused code exchange', (hub: ReturnType<typeof fakeHub>) => (hub.challenge = 'other')],
+    [
+      'an id_token without xyte_tenant_id',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.idToken = `h.${Buffer.from(JSON.stringify({ sub: 'user-1' })).toString('base64url')}.s`)
+    ],
+    [
+      'an id_token that is not JSON',
+      (hub: ReturnType<typeof fakeHub>) =>
+        (hub.idToken = `h.${Buffer.from('not-json-user@example.com').toString('base64url')}.s`)
+    ]
+  ])('%s sends server_error with the state back to the client, no code', async (_name, breakHub) => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await approve(provider, client);
+    breakHub(hub);
+
+    let out!: Awaited<ReturnType<typeof callback>>;
+    const stderr = await captureStderr(async () => {
+      out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
+    });
+    expect(out.status).toBe(302);
+    const url = new URL(out.location);
+    expect(url.origin + url.pathname).toBe(REDIRECT);
+    expect(url.searchParams.get('error')).toBe('server_error');
+    expect(url.searchParams.get('state')).toBe('st4te');
+    expect(url.searchParams.get('code')).toBeNull();
+    // The log names the failure without quoting what hub sent.
+    expect(stderr).toContain('hub sign-in failed');
+    expect(stderr).not.toContain('user@example.com');
   });
 
   it('passes a hub error and error_reason through to the client redirect', async () => {
@@ -417,6 +524,38 @@ describe('XyteOAuthProvider: our tokens', () => {
       provider.exchangeRefreshToken(client, tokens.refresh_token!)
     ]);
     expect(refreshRuns.map((run) => run.status).sort()).toEqual(['fulfilled', 'rejected']);
+  });
+
+  it('refuses a refresh token presented by another client, which leaves it usable', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const other = await registeredClient(provider, 'client-2');
+    const { tokens } = await connected(provider, client);
+
+    await expect(provider.exchangeRefreshToken(other, tokens.refresh_token!)).rejects.toThrow(
+      /invalid or expired/
+    );
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).resolves.toBeTruthy();
+  });
+
+  it('checks the RFC 8707 resource on both exchanges', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const ours = new URL(`${ISSUER}/mcp`);
+    const theirs = new URL('https://other.test/mcp');
+
+    const { code } = await signIn(provider, client);
+    await expect(
+      provider.exchangeAuthorizationCode(client, code, undefined, undefined, theirs)
+    ).rejects.toThrow(/resource/);
+    const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, undefined, ours);
+
+    await expect(
+      provider.exchangeRefreshToken(client, tokens.refresh_token!, undefined, theirs)
+    ).rejects.toThrow(/resource/);
+    await expect(
+      provider.exchangeRefreshToken(client, tokens.refresh_token!, undefined, ours)
+    ).resolves.toBeTruthy();
   });
 
   it('rotates refresh tokens and kills the old one', async () => {
@@ -534,6 +673,61 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     ]);
   });
 
+  // A call that read xoat_1 before another call's refresh landed must not burn
+  // xort_2 with a second refresh: the stored token is already fresh.
+  it('a stale token rejected after a finished refresh reuses its result, no second refresh', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const slow: HttpRequest[] = [];
+    const slowUpstream: HttpClient = {
+      request: async (request) => {
+        slow.push(request);
+        if (request.headers.Authorization !== 'Bearer xoat_1') return okResponse();
+        await gate;
+        throw tokenRejected();
+      }
+    };
+    const request = { method: 'GET' as const, url: `${HUB}/x`, headers: {}, endpointKey: 'k' };
+
+    const stale = provider.hubHttp(grantId, slowUpstream).request(request);
+    await vi.waitFor(() => expect(slow).toHaveLength(1));
+    const rejectsXoat1 = stubHttp((sent) =>
+      sent.headers.Authorization === 'Bearer xoat_1' ? tokenRejected() : { data: {} }
+    );
+    await provider.hubHttp(grantId, rejectsXoat1).request(request);
+    expect(hub.refreshes()).toHaveLength(1);
+
+    release();
+    await stale;
+    expect(hub.refreshes()).toHaveLength(1);
+    expect(slow.map((call) => call.headers.Authorization)).toEqual([
+      'Bearer xoat_1',
+      'Bearer xoat_2'
+    ]);
+  });
+
+  it('a lost compare-and-set on save logs, keeps the stored pair and still serves the call', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockResolvedValueOnce(false);
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      provider
+        .hubHttp(grantId, upstream)
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
+    expect(stderr).toContain(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
+    expect(upstream.calls[0]!.headers.Authorization).toBe('Bearer xoat_2');
+  });
+
   it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
@@ -641,6 +835,10 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       .hubHttp(grantId, upstreamOk())
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
     await expect(call).rejects.toBeInstanceOf(XyteError);
+    await expect(call).rejects.toMatchObject({
+      kind: 'auth',
+      message: expect.stringMatching(/refresh failed: 401/)
+    });
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
@@ -791,11 +989,42 @@ describe('XyteOAuthProvider: revocation', () => {
     await vi.waitFor(() => expect(hub.refreshes()).toHaveLength(1));
 
     const revoke = provider.revokeToken(client, { token: tokens.access_token });
+    await tick();
+    expect(hub.revokes()).toEqual([]); // waiting on the refresh, not racing it
     answer();
     await Promise.allSettled([call, revoke]);
 
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
     await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('starts no hub refresh on a grant while it is being revoked', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30; // every call wants a refresh
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    // Hold revoke inside its window: after it marks the grant, before it is revoked.
+    const getGrant = store.getGrant.bind(store);
+    let reads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    vi.spyOn(store, 'getGrant').mockImplementation(async (id) => {
+      reads += 1;
+      if (reads === 2) await gate;
+      return getGrant(id);
+    });
+
+    const revoke = provider.revokeToken(client, { token: tokens.access_token });
+    await vi.waitFor(() => expect(reads).toBe(2));
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    await expect(call).rejects.toMatchObject({ kind: 'auth' });
+
+    release();
+    await revoke;
+    expect(hub.refreshes()).toHaveLength(0);
+    expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_1']);
   });
 
   it("revoking another client's token is a silent no-op", async () => {

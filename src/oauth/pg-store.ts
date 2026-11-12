@@ -16,8 +16,9 @@ import {
  *
  * Three tables, created at boot with IF NOT EXISTS instead of a migration
  * framework: this service owns its whole schema and the schema is additive —
- * columns are only ever added (nullable), never dropped, so rolling back to an
- * older build still boots against a newer database.
+ * columns are only ever added (nullable), never dropped, so from this release
+ * on, rolling back to an older build still boots against a newer database
+ * (a pre-release database needs its tables dropped once — see the README).
  * Client metadata is one jsonb blob because the server never queries inside
  * it — it goes back to the SDK exactly as registered.
  */
@@ -58,6 +59,22 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
 `;
 
+/** Arbitrary, constant: the advisory lock serializing schema creation. */
+const SCHEMA_LOCK_ID = 674_601;
+
+/**
+ * An `sslmode` in the DSN decides on its own (pg lets it override this option
+ * anyway), so a compose or CI host can opt out with `sslmode=disable`. Without
+ * one: none for a local database, and Heroku's TLS otherwise — it requires TLS
+ * but presents a chain the dyno can't verify.
+ */
+function sslOption(databaseUrl: string): { ssl?: { rejectUnauthorized: false } } {
+  const url = new URL(databaseUrl);
+  if (url.searchParams.has('sslmode')) return {};
+  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
+  return { ssl: { rejectUnauthorized: false } };
+}
+
 interface TokenRow {
   grant_id: string;
   code_challenge: string | null;
@@ -84,16 +101,20 @@ export class PgOAuthStore implements OAuthStore {
   static async connect(databaseUrl: string): Promise<PgOAuthStore> {
     const pool = new pg.Pool({
       connectionString: databaseUrl,
-      // Heroku Postgres requires TLS but presents a chain the dyno can't verify.
-      ...(databaseUrl.includes('localhost') || databaseUrl.includes('127.0.0.1')
-        ? {}
-        : { ssl: { rejectUnauthorized: false } }),
-      max: 5
+      ...sslOption(databaseUrl),
+      max: 5,
+      // Unbounded by default: an unreachable or hung database would hang boot
+      // past Heroku's R10 and every token check instead of failing with a 503.
+      connectionTimeoutMillis: 10_000,
+      query_timeout: 10_000
     });
     // An idle client dropped server-side (maintenance, failover) is emitted here;
     // unhandled, it exits the process. The pool replaces the client on its own.
     pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
-    await pool.query(SCHEMA);
+    // One multi-statement query runs as one transaction, so the xact lock holds
+    // for all of it: two boots on an empty database (preboot, a one-off dyno)
+    // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
+    await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
     return new PgOAuthStore(pool);
   }
 

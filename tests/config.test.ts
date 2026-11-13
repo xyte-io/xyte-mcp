@@ -93,6 +93,26 @@ describe('resolveConfig', () => {
     });
   });
 
+  // The HTTP transport: read-only unless writes are asked for explicitly.
+  describe('with writesByDefault: false', () => {
+    const http = (env: Record<string, string>) =>
+      resolveConfig({ ...withOrgKey, ...env }, { writesByDefault: false }).allowWrites;
+
+    it('defaults writes to off, and read-only=0 alone does not turn them on', () => {
+      expect(http({})).toBe(false);
+      expect(http({ [ENV.readOnly]: '0' })).toBe(false);
+    });
+
+    it('turns writes on only for an explicit allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1' })).toBe(true);
+      expect(http({ [ENV.allowWrites]: '0' })).toBe(false);
+    });
+
+    it('still lets an explicit read-only win over allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1', [ENV.readOnly]: '1' })).toBe(false);
+    });
+  });
+
   it('defaults and validates the timeout', () => {
     expect(resolveConfig(withOrgKey).timeoutMs).toBe(15_000);
     expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '5000' }).timeoutMs).toBe(5000);
@@ -103,21 +123,22 @@ describe('resolveConfig', () => {
 
 describe('resolveHttpConfig', () => {
   const token = 'xmcp_test_token_0123456789abcdef';
+  const staticEnv = { [ENV.httpToken]: token, [ENV.orgKey]: 'org-key' };
 
-  it('reads the token and the platform port', () => {
-    expect(resolveHttpConfig({ [ENV.httpToken]: token, [ENV.httpPort]: '5001' })).toEqual({
-      token,
+  it('reads the static token and the platform port', () => {
+    expect(resolveHttpConfig({ ...staticEnv, [ENV.httpPort]: '5001' })).toEqual({
+      staticToken: token,
       port: 5001
     });
   });
 
   it('defaults the port', () => {
-    expect(resolveHttpConfig({ [ENV.httpToken]: token }).port).toBe(DEFAULT_HTTP_PORT);
+    expect(resolveHttpConfig(staticEnv).port).toBe(DEFAULT_HTTP_PORT);
   });
 
   // Serving with auth disabled would publish a live API key to anyone with the
-  // URL, so a missing token must stop the boot rather than widen the server.
-  it('refuses a missing token and names the variable', () => {
+  // URL, so missing auth must stop the boot rather than widen the server.
+  it('refuses a config with no auth at all, naming both options', () => {
     const error = (() => {
       try {
         resolveHttpConfig({});
@@ -129,6 +150,7 @@ describe('resolveHttpConfig', () => {
     expect(error).toBeInstanceOf(XyteError);
     expect((error as XyteError).kind).toBe('config');
     expect((error as XyteError).message).toContain(ENV.httpToken);
+    expect((error as XyteError).message).toContain(ENV.issuerUrl);
   });
 
   it('refuses a whitespace-only token', () => {
@@ -136,7 +158,77 @@ describe('resolveHttpConfig', () => {
   });
 
   it('refuses a guessably short token', () => {
-    expect(() => resolveHttpConfig({ [ENV.httpToken]: 'short' })).toThrow(/too short/);
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: 'short', [ENV.orgKey]: 'k' })).toThrow(
+      /too short/
+    );
+  });
+
+  it('refuses a static token with no API key behind it', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: token })).toThrow(/no API key/);
+  });
+
+  const hubClientEnv = {
+    [ENV.hubOAuthClientId]: 'hub-id',
+    [ENV.hubOAuthClientSecret]: 'hub-secret'
+  };
+  const hubClient = { id: 'hub-id', secret: 'hub-secret' };
+
+  it('enables OAuth from the issuer URL, with and without a database', () => {
+    const issuer = 'https://mcp.example.com';
+    // Normalized as the SDK normalizes the resource clients send back.
+    expect(
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'https://MCP.example.com:443' }).oauth
+        ?.issuerUrl
+    ).toBe(issuer);
+    expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: `${issuer}/` }).oauth).toEqual({
+      issuerUrl: issuer,
+      hubClient
+    });
+    expect(
+      resolveHttpConfig({
+        ...hubClientEnv,
+        [ENV.issuerUrl]: issuer,
+        [ENV.databaseUrl]: 'postgres://x'
+      }).oauth
+    ).toEqual({ issuerUrl: issuer, databaseUrl: 'postgres://x', hubClient });
+  });
+
+  it('refuses OAuth without the hub client credentials', () => {
+    expect(() =>
+      resolveHttpConfig({ [ENV.issuerUrl]: 'https://mcp.example.com', [ENV.hubOAuthClientId]: 'x' })
+    ).toThrow(new RegExp(ENV.hubOAuthClientSecret));
+  });
+
+  // A shared static bearer next to the per-user sign-in on one public URL.
+  it('refuses static + OAuth together, naming both variables', () => {
+    expect(() =>
+      resolveHttpConfig({ ...staticEnv, ...hubClientEnv, [ENV.issuerUrl]: 'https://mcp.example.com' })
+    ).toThrow(new RegExp(`${ENV.httpToken} and ${ENV.issuerUrl} are both set`));
+  });
+
+  // Tokens minted under a plain-http issuer are readable by every hop; only
+  // localhost (tests, local runs) is exempt, mirroring the SDK's rule.
+  it('refuses a non-https issuer except localhost', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'http://mcp.example.com' })).toThrow(
+      /https/
+    );
+    expect(
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'http://127.0.0.1:8080' }).oauth
+        ?.issuerUrl
+    ).toBe('http://127.0.0.1:8080');
+  });
+
+  it('refuses an issuer with a query or fragment', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'https://a.example?x=1' })).toThrow(
+      XyteError
+    );
+  });
+
+  // Routes are mounted at the root: a path would send every sign-in to a 404.
+  it('refuses an issuer with a path', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'https://a.example/xyte' })).toThrow(
+      /must not have a path/
+    );
   });
 
   // An org key alongside the token keeps these valid once OAuth lands.
@@ -154,6 +246,16 @@ describe('resolveHttpConfig', () => {
       token
     );
     expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(24) })).not.toThrow();
+  });
+
+  // The xmcp_ prefix is a scanner marker; it adds nothing to guess.
+  it('does not count the xmcp_ prefix toward the floor', () => {
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(23)}` })
+    ).toThrow(/too short/);
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(24)}` })
+    ).not.toThrow();
   });
 
   it.each(['abc', '0', '-1', '3000.5', '70000'])('refuses PORT=%s', (port) => {

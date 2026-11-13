@@ -1,4 +1,5 @@
-import { ENV } from '../config.js';
+import { ENV, type HubOAuthCredential } from '../config.js';
+import { VERSION } from '../version.js';
 import { XyteError } from './errors.js';
 import type { EndpointSpec } from '../catalog/types.js';
 import type { ToolContext } from '../context.js';
@@ -30,6 +31,14 @@ export function buildRequest(
   context: ToolContext
 ): HttpRequest {
   const credential = context.credentials[endpoint.authScope];
+  if (!credential && typeof context.credentials.organization === 'object') {
+    // A Xyte sign-in yields an organization token only; no key to set fixes that.
+    throw new XyteError(
+      'config',
+      `${endpoint.key} needs a ${endpoint.authScope} API key; ${endpoint.authScope} endpoints are not available through a Xyte sign-in.`,
+      ['Use an organization endpoint, or a local server configured with a partner API key.']
+    );
+  }
   if (!credential) {
     throw new XyteError(
       'config',
@@ -94,12 +103,24 @@ export function buildRequest(
     url: url.toString(),
     headers: {
       Accept: 'application/json',
-      // The hub expects the bare key — no "Bearer" scheme.
-      Authorization: credential,
+      ...authHeaders(credential),
       ...(hasBody ? { 'Content-Type': 'application/json' } : {})
     },
     ...(hasBody ? { body: JSON.stringify(args.body) } : {}),
     endpointKey: endpoint.key
+  };
+}
+
+/**
+ * An API key goes in `Authorization` bare (the hub expects no "Bearer" scheme).
+ * A hub OAuth token goes as a Bearer — it already names its organization, so
+ * no `tenant` header — plus `X-Xyte-Client`, which hub's call log shows.
+ */
+function authHeaders(credential: string | HubOAuthCredential): Record<string, string> {
+  if (typeof credential === 'string') return { Authorization: credential };
+  return {
+    Authorization: `Bearer ${credential.accessToken}`,
+    'X-Xyte-Client': `xyte-mcp/${VERSION}`
   };
 }
 
@@ -111,6 +132,14 @@ function substitutePath(endpoint: EndpointSpec, pathArgs: PathArgs): string {
       throw new XyteError(
         'validation',
         `${endpoint.key}: path parameter "${name}" is empty.`
+      );
+    }
+    // encodeURIComponent leaves dots alone, and URL normalisation then turns
+    // "/devices/.." into a different endpoint than the one the catalog names.
+    if (text === '.' || text === '..') {
+      throw new XyteError(
+        'validation',
+        `${endpoint.key}: path parameter "${name}" cannot be "${text}".`
       );
     }
     return encodeURIComponent(text);

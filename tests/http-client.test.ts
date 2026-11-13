@@ -52,6 +52,18 @@ describe('createHttpClient', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps a 401's WWW-Authenticate challenge on the error", async () => {
+    const rejected = jsonResponse(401, { error: 'Not authorized' });
+    rejected.headers.set('WWW-Authenticate', 'Bearer error="invalid_token"');
+    const fetchImpl = vi.fn().mockResolvedValue(rejected);
+    const client = createHttpClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(client.request(request())).rejects.toMatchObject({
+      status: 401,
+      wwwAuthenticate: 'Bearer error="invalid_token"'
+    });
+  });
+
   it('retries a GET on 5xx and succeeds', async () => {
     const fetchImpl = vi
       .fn()

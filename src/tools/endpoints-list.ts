@@ -18,7 +18,7 @@ const inputSchema = {
   search: z
     .string()
     .optional()
-    .describe('Case-insensitive substring match over key, title and path.'),
+    .describe('Case-insensitive substring match over key, title, path and description.'),
   readOnly: z
     .boolean()
     .optional()

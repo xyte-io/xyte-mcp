@@ -42,6 +42,7 @@
     "catalog:generate": "node scripts/generate-catalog.mjs",
     "smoke:live": "npm run build && node scripts/live-smoke.mjs",
     "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
+    "loop:partner-coupons": "npm run build && node scripts/partner-coupon-loop.mjs",
     "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
     "prepare": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run smoke:pack-install"

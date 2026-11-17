@@ -177,6 +177,33 @@ exercised, and the key is never printed — this runs against production, so it 
 anything. A pass means the whole path works; if this passes but your host still shows
 nothing, the problem is the host registration, not the server.
 
+### Partner coupon loop
+
+`npm run loop:partner-coupons` runs every partner coupon and organization tag flow through the
+built server and checks each result: percent, fixed-amount and code coupons, tagging customers,
+changing, deactivating and deleting coupons, removing a tag, and the lists. It also checks that
+another partner sees and changes nothing, that coupon calls return 403 without store coupons,
+that read-only mode refuses every write, and that the write log holds no key or body.
+
+It **writes** (every name it creates carries a run id), so it refuses to start without an
+explicit `XYTE_HUB_URL` and never runs against production. Use a local or staging hub.
+
+| Variable | Needed | What it is |
+| --- | --- | --- |
+| `XYTE_HUB_URL` | yes | The hub to test, e.g. `http://localhost:3000`. |
+| `XYTE_PARTNER_API_KEY` | yes | Key of a partner with the Store plan and store coupons on. |
+| `XYTE_LOOP_CUSTOMERS` | yes | Five of that partner's customers, comma separated, visible in its store. |
+| `XYTE_LOOP_HIDDEN_CUSTOMER` | no | A customer that cannot see the store; checks `store_visible: false`. |
+| `XYTE_LOOP_LISTING` | no | Store listing name for the fixed-amount coupon (default: the first). |
+| `XYTE_LOOP_USED_COUPON_ID` | no | A coupon used in an order; checks that deleting it is refused. |
+| `XYTE_LOOP_OTHER_PARTNER_KEY` | no | Another partner's key, for the isolation checks. |
+| `XYTE_LOOP_NO_COUPONS_PARTNER_KEY` | no | Key of a partner with store coupons off, for the 403 checks. |
+| `XYTE_LOOP_RUN_ID` | no | Suffix for created names (default: a timestamp). |
+| `XYTE_LOOP_FLOWS` | no | Run only some flows, e.g. `1,2,3,4`, to check the portals between steps. |
+
+A check whose optional variable is unset is skipped, not failed. The script exits 1 when any
+check fails.
+
 ## Development
 
 ```bash

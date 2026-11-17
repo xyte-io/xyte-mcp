@@ -53,6 +53,9 @@ export function createServer(context: ToolContext): McpServer {
             "loses, then stop and wait for the user's explicit yes in the conversation. Make no " +
             'such write before that yes. A yes covers only the items you listed; ask again for ' +
             'anything else. With several items, list them all and ask once.\n' +
+            '- Before you propose any DELETE or removal, call xyte_endpoint_describe on that ' +
+            'endpoint. Your plan must then say, per item, what the API will refuse and what you ' +
+            'will do instead (for example, switch it off when it cannot be deleted).\n' +
             '- When a create request matches something that already exists, tell the user what ' +
             'exists and how it differs, and do not change it unless the user asks.\n' +
             "- DELETE also requires confirm set to the endpoint key; set it only after that yes. " +

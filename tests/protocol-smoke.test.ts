@@ -132,6 +132,7 @@ describe('stdio protocol', () => {
     // D4: no destructive change or removal before the user's own yes in the conversation.
     expect(response.result?.instructions).toContain("explicit yes");
     expect(response.result?.instructions).toContain('already exists');
+    expect(response.result?.instructions).toContain('read back the customers');
     expect(response.result?.instructions).toContain('no ids');
   });
 

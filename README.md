@@ -8,7 +8,8 @@ Reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it 
 read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
-their telemetry and incidents, service tickets, commands, models and warranties. This server
+their telemetry and incidents, service tickets, commands, models, warranties and maintenance
+schedules, and for partners the store coupons they give their customers. This server
 puts that API in front of an agent as three tools instead of 97 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
@@ -85,7 +86,7 @@ the upgrade. Where the two disagree, the restrictive one wins. New configuration
 
 | Tool | What it does |
 | --- | --- |
-| `xyte_endpoints_list` | Discover endpoints. Filter by `namespace`, `group`, `method`, `search`, `readOnly`. Returns compact rows. |
+| `xyte_endpoints_list` | Discover endpoints. Filter by `namespace`, `group`, `method`, `search` (matches key, title, path and description), `readOnly`. Returns compact rows. |
 | `xyte_endpoint_describe` | Full contract for one endpoint: path params, query params, body shape, required credential. |
 | `xyte_api_call` | Invoke an endpoint by key with `path`, `query` and `body`. |
 
@@ -103,12 +104,21 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
   even with writes enabled — an irreversible call is the one that cannot be walked back.
 - **Ask before destroying:** the server instructions tell the model to explain in plain words
   what a delete, a removal (such as a tag off an organization) or a change to something live
-  or scheduled will cost the customer, and to wait for your explicit yes before it acts. A
-  create request that matches something existing is reported, not applied.
+  or scheduled will cost the customer, and to wait for your explicit yes before it acts.
+  Before it proposes a delete or removal it reads that endpoint's contract, so its plan says
+  what the API will refuse and what it will do instead. A create request that matches
+  something existing is reported, not applied.
+- **Other writes go ahead:** creates and updates you asked for are made without a second
+  question, and the model makes every write the request needs — a change "for" a named
+  customer is done only when that customer has it. It then reads those customers back and
+  tells you what each one now gets. Your host's write-approval prompt still applies.
+- **Answers:** the model answers in plain words — names and dates, no ids, endpoint keys,
+  field names or setting names unless you ask. API times are UTC, so it shows dates in your
+  time zone, asks for it, or names the zone next to the date.
 - **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
   before a request is built, and the model tells the user the connection is set up to look
   only.
-- **Write log:** every mutating call that reaches the API writes one line to stderr —
+- **Write log:** every mutating call the server sends writes one line to stderr —
   `[xyte-mcp] write <key> <METHOD> status=<code> duration_ms=<n>` — so you can tell later
   what an agent changed. It never holds the API key or a request or response body.
   `status=error` means no HTTP status came back (timeout, network), so the write may still
@@ -150,8 +160,13 @@ Partner endpoints cover devices, tickets and organizations, plus the store coupo
 partner gives its customers: `partner.organizations.getOrganizations`,
 `partner.organizationTags.*` (add, remove, list organization tags), `partner.coupons.*`
 (create, list, update, delete coupons) and `partner.storeListings.getStoreListings`. A
-coupon reaches a customer by code or by an organization tag. Coupons and store listings
-need the Store plan feature and store coupons enabled for the partner.
+coupon reaches a customer by code or by an organization tag. Coupons need the Store plan
+feature and store coupons enabled for the partner; store listings need only the Store plan
+feature.
+
+Organization endpoints also gained `organization.edges.devices.changeModel`, maintenance schedules
+(`organization.maintenanceSchedules.*`) and incident notes (`organization.notes.*IncidentNote*`), picked up from hub with this
+catalog refresh.
 
 Device API endpoints are deliberately excluded: they authenticate as a device with a device
 access token, not as an operator.
@@ -196,7 +211,7 @@ another partner sees and changes nothing, that coupon calls return 403 without s
 that read-only mode refuses every write, and that the write log holds no key or body.
 
 It **writes** (every name it creates carries a run id), so it refuses to start without an
-explicit `XYTE_HUB_URL` and never runs against production. Use a local or staging hub.
+explicit `XYTE_HUB_URL` and refuses `hub.xyte.io`. Use a local or staging hub.
 
 | Variable | Needed | What it is |
 | --- | --- | --- |
@@ -204,12 +219,16 @@ explicit `XYTE_HUB_URL` and never runs against production. Use a local or stagin
 | `XYTE_PARTNER_API_KEY` | yes | Key of a partner with the Store plan and store coupons on. |
 | `XYTE_LOOP_CUSTOMERS` | yes | Five of that partner's customers, comma separated, visible in its store. |
 | `XYTE_LOOP_HIDDEN_CUSTOMER` | no | A customer that cannot see the store; checks `store_visible: false`. |
-| `XYTE_LOOP_LISTING` | no | Store listing name for the fixed-amount coupon (default: the first). |
+| `XYTE_LOOP_LISTING` | no | Store listing name for the fixed-amount coupon (default: the first). A name that matches no listing stops the run. |
 | `XYTE_LOOP_USED_COUPON_ID` | no | A coupon used in an order; checks that deleting it is refused. |
 | `XYTE_LOOP_OTHER_PARTNER_KEY` | no | Another partner's key, for the isolation checks. |
 | `XYTE_LOOP_NO_COUPONS_PARTNER_KEY` | no | Key of a partner with store coupons off, for the 403 checks. |
 | `XYTE_LOOP_RUN_ID` | no | Suffix for created names (default: a timestamp). |
-| `XYTE_LOOP_FLOWS` | no | Run only some flows, e.g. `1,2,3,4`, to check the portals between steps. |
+| `XYTE_LOOP_FLOWS` | no | Run only some flows, e.g. `1,2,3,4`, to check the portals between steps. Valid: `1,2,3,4,5,6,10,7,8,11,isolation,gates,readonly`. |
+
+To run the flows in steps, set the same `XYTE_LOOP_RUN_ID` on every step (the first run prints
+it) and keep the order above: later flows find the coupons and tags by run-id names, and flow
+11 expects flows 10 and 7 to have run.
 
 A check whose optional variable is unset is skipped, not failed. The script exits 1 when any
 check fails.

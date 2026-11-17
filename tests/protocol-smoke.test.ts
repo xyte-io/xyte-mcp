@@ -133,6 +133,7 @@ describe('stdio protocol', () => {
     expect(response.result?.instructions).toContain("explicit yes");
     expect(response.result?.instructions).toContain('already exists');
     expect(response.result?.instructions).toContain('read back the customers');
+    expect(response.result?.instructions).toContain('API times are UTC');
     expect(response.result?.instructions).toContain('no ids');
   });
 

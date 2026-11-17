@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { getEndpoint } from '../src/catalog/catalog.js';
 import { evaluateWritePolicy } from '../src/write-policy.js';
 import type { EndpointSpec } from '../src/catalog/types.js';
 
@@ -96,5 +97,41 @@ describe('evaluateWritePolicy', () => {
     expect(decision.allowed).toBe(false);
     if (decision.allowed) return;
     expect(decision.reason).toContain('read-only');
+  });
+});
+
+describe('evaluateWritePolicy on the Partner coupon and tag endpoints', () => {
+  const real = (key: string): EndpointSpec => {
+    const spec = getEndpoint(key);
+    if (!spec) throw new Error(`missing from the catalog: ${key}`);
+    return spec;
+  };
+
+  const reads = [
+    'partner.organizations.getOrganizations',
+    'partner.organizationTags.getOrganizationTags',
+    'partner.coupons.getCoupons',
+    'partner.storeListings.getStoreListings'
+  ];
+  const writes = [
+    'partner.organizationTags.addOrganizationTag',
+    'partner.organizationTags.removeOrganizationTag',
+    'partner.coupons.createCoupon',
+    'partner.coupons.updateCoupon',
+    'partner.coupons.deleteCoupon'
+  ];
+  const deletes = ['partner.coupons.deleteCoupon', 'partner.organizationTags.removeOrganizationTag'];
+
+  it.each(reads)('allows the read %s when read-only', (key) => {
+    expect(evaluateWritePolicy(real(key), undefined, false)).toEqual({ allowed: true });
+  });
+
+  it.each(writes)('refuses the write %s when read-only', (key) => {
+    expect(evaluateWritePolicy(real(key), key, false).allowed).toBe(false);
+  });
+
+  it.each(deletes)('requires confirm for %s', (key) => {
+    expect(evaluateWritePolicy(real(key), undefined, true).allowed).toBe(false);
+    expect(evaluateWritePolicy(real(key), key, true)).toEqual({ allowed: true });
   });
 });

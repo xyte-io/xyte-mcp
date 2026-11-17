@@ -9,7 +9,7 @@ read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
-puts that API in front of an agent as three tools instead of 78 hand-written ones — it can
+puts that API in front of an agent as three tools instead of 97 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
 
@@ -103,6 +103,11 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
   even with writes enabled — an irreversible call is the one that cannot be walked back.
 - **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
   before a request is built, and the model is told an operator alone can lift it.
+- **Write log:** every mutating call that reaches the API writes one line to stderr —
+  `[xyte-mcp] write <key> <METHOD> status=<code> duration_ms=<n>` — so you can tell later
+  what an agent changed. It never holds the API key or a request or response body.
+  `status=error` means no HTTP status came back (timeout, network), so the write may still
+  have landed.
 
 `xyte_api_call`'s MCP annotations (`readOnlyHint`, `destructiveHint`) follow the live
 configuration, so a host prompts according to what the server can actually do.
@@ -126,10 +131,17 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
+`src/catalog/endpoints.generated.json` holds 97 endpoints (74 organization, 23 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.
+
+Partner endpoints cover devices, tickets and organizations, plus the store coupons a
+partner gives its customers: `partner.organizations.getOrganizations`,
+`partner.organizationTags.*` (add, remove, list organization tags), `partner.coupons.*`
+(create, list, update, delete coupons) and `partner.storeListings.getStoreListings`. A
+coupon reaches a customer by code or by an organization tag. Coupons and store listings
+need the Store plan feature and store coupons enabled for the partner.
 
 Device API endpoints are deliberately excluded: they authenticate as a device with a device
 access token, not as an operator.

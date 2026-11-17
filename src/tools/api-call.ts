@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { getEndpoint, suggestKeys } from '../catalog/catalog.js';
+import type { EndpointSpec } from '../catalog/types.js';
+import type { ToolContext } from '../context.js';
 import { buildRequest } from '../http/build-request.js';
+import type { HttpRequest, HttpResponse } from '../http/client.js';
 import { XyteHttpError, isXyteError } from '../http/errors.js';
+import { log } from '../log.js';
 import { redactValue } from '../redact.js';
 import { evaluateWritePolicy } from '../write-policy.js';
 import { defineTool, errorResult, textResult } from './types.js';
@@ -79,8 +83,9 @@ export const apiCallTool = defineTool({
         },
         context
       );
-      const response = await context.http.request(request);
-      const data = redactValue(response.data, context.secrets);
+      const response = await sendRequest(endpoint, request, context);
+      // A 204 has no body; null keeps `data` in the structured result, which the output schema requires.
+      const data = redactValue(response.data ?? null, context.secrets);
 
       const structured = {
         key: endpoint.key,
@@ -100,6 +105,34 @@ export const apiCallTool = defineTool({
     }
   }
 });
+
+/**
+ * Sends the request; a mutating call also writes one line to stderr, so an operator can tell
+ * later what the agent changed. The line holds the key, method, status and duration only —
+ * never the API key, the request body or the response body. `status=error` means no HTTP
+ * status came back (timeout, network), so the write may still have landed.
+ */
+async function sendRequest(
+  endpoint: EndpointSpec,
+  request: HttpRequest,
+  context: ToolContext
+): Promise<HttpResponse> {
+  if (!endpoint.mutating) return context.http.request(request);
+
+  const startedAt = performance.now();
+  let status: number | 'error' = 'error';
+  try {
+    const response = await context.http.request(request);
+    status = response.status;
+    return response;
+  } catch (error) {
+    if (error instanceof XyteHttpError) status = error.status;
+    throw error;
+  } finally {
+    const durationMs = Math.round(performance.now() - startedAt);
+    log(`write ${endpoint.key} ${endpoint.method} status=${status} duration_ms=${durationMs}`);
+  }
+}
 
 function toErrorResult(
   error: unknown,

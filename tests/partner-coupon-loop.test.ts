@@ -34,6 +34,26 @@ describe('partner coupon loop guard', () => {
     expect(result.stderr).toContain('production');
   });
 
+  it('refuses production written with a trailing dot or in capitals', () => {
+    for (const url of ['https://hub.xyte.io./', 'https://HUB.XYTE.IO']) {
+      const result = run({ XYTE_HUB_URL: url, XYTE_PARTNER_API_KEY: 'k' });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('production');
+    }
+  });
+
+  it('fails cleanly on a hub URL that is not a URL', () => {
+    const result = run({ XYTE_HUB_URL: 'not a url', XYTE_PARTNER_API_KEY: 'k' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('XYTE_HUB_URL is not a valid URL');
+  });
+
+  it('refuses an unknown flow name in XYTE_LOOP_FLOWS', () => {
+    const result = run({ XYTE_HUB_URL: 'http://localhost:3000', XYTE_PARTNER_API_KEY: 'k', XYTE_LOOP_FLOWS: '1, 2,9' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('unknown flow 9');
+  });
+
   it('refuses to run without the partner key', () => {
     const result = run({ XYTE_HUB_URL: 'http://localhost:3000' });
     expect(result.status).toBe(1);

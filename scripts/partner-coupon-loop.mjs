@@ -6,7 +6,7 @@
  *   XYTE_LOOP_CUSTOMERS='Org A,Org B,Org C,Org D,Org E' npm run loop:partner-coupons
  *
  * WRITES: it creates, changes and deletes coupons and tags, so it refuses to start
- * without an explicit XYTE_HUB_URL and never runs against production. Every name it
+ * without an explicit XYTE_HUB_URL and refuses hub.xyte.io. Every name it
  * creates carries a run id, so runs do not collide. See README "Partner coupon loop".
  */
 
@@ -30,15 +30,24 @@ function fail(message) {
 const env = process.env;
 const hubUrl = env.XYTE_HUB_URL?.trim();
 if (!hubUrl) fail('set XYTE_HUB_URL to the hub to test; this loop writes, so it never uses the default.');
-if (new URL(hubUrl).hostname === PRODUCTION_HOST) fail('refusing to run against production.');
+let hubHost;
+try {
+  hubHost = new URL(hubUrl).hostname.replace(/\.$/, '');
+} catch {
+  fail(`XYTE_HUB_URL is not a valid URL: ${hubUrl}`);
+}
+// ponytail: exact production host only; add other prod hostnames here if any appear.
+if (hubHost === PRODUCTION_HOST) fail('refusing to run against production.');
 const key = env.XYTE_PARTNER_API_KEY?.trim();
 if (!key) fail('set XYTE_PARTNER_API_KEY to the partner key under test.');
+const flows = env.XYTE_LOOP_FLOWS ? env.XYTE_LOOP_FLOWS.split(',').map((flow) => flow.trim()).filter(Boolean) : ALL_FLOWS;
+const unknownFlow = flows.find((flow) => !ALL_FLOWS.includes(flow));
+if (unknownFlow) fail(`unknown flow ${unknownFlow} in XYTE_LOOP_FLOWS; valid: ${ALL_FLOWS.join(',')}`);
 if (!existsSync(ENTRY)) fail(`not built; run npm run build (missing ${ENTRY}).`);
 const customers = (env.XYTE_LOOP_CUSTOMERS ?? '').split(',').map((name) => name.trim()).filter(Boolean);
 if (customers.length !== 5) fail('set XYTE_LOOP_CUSTOMERS to five customer names, comma separated.');
 
 const runId = env.XYTE_LOOP_RUN_ID ?? Date.now().toString(36);
-const flows = env.XYTE_LOOP_FLOWS ? env.XYTE_LOOP_FLOWS.split(',') : ALL_FLOWS;
 const NAME = {
   wholeStore: `Loop ${runId} whole store 10%`,
   listing: `Loop ${runId} listing 25 off`,
@@ -50,6 +59,7 @@ const NAME = {
 };
 
 const results = [];
+const servers = [];
 
 function check(name, pass, detail = '') {
   results.push({ name, pass });
@@ -73,12 +83,14 @@ async function startMcpServerClient(partnerApiKey, extraEnv = {}) {
   const client = new Client({ name: 'xyte-mcp-partner-coupon-loop', version: '0' });
   await client.connect(transport);
   const server = { client, stderr, call, writes: 0 };
+  servers.push(server);
 
   async function call(endpointKey, args = {}) {
     const isWrite = !endpointKey.split('.').pop().startsWith('get');
     const result = await client.callTool({ name: 'xyte_api_call', arguments: { key: endpointKey, ...args } });
     const text = result.content?.[0]?.text ?? '';
     const status = result.isError ? Number(/failed: (\d{3})/.exec(text)?.[1] ?? 0) : result.structuredContent?.status;
+    // Status 0 = no HTTP status: refused, invalid or a network failure (logged as status=error, not counted).
     if (isWrite && status) server.writes += 1;
     return { ok: !result.isError, status, data: result.structuredContent?.data, text };
   }
@@ -112,6 +124,7 @@ async function main() {
   const targets = customers.map((name) => organizations.get(name));
   if (targets.some((organization) => !organization)) fail(`not every customer was found: ${customers.join(', ')}`);
   const hidden = env.XYTE_LOOP_HIDDEN_CUSTOMER ? organizations.get(env.XYTE_LOOP_HIDDEN_CUSTOMER) : undefined;
+  if (env.XYTE_LOOP_HIDDEN_CUSTOMER && !hidden) fail(`XYTE_LOOP_HIDDEN_CUSTOMER not found: ${env.XYTE_LOOP_HIDDEN_CUSTOMER}`);
   const run = (flow) => flows.includes(flow);
 
   try {
@@ -133,13 +146,17 @@ async function main() {
 
     if (run('2')) {
       const listings = rows(await call('partner.storeListings.getStoreListings'));
-      const listing = listings.find((row) => row.name === env.XYTE_LOOP_LISTING) ?? listings[0];
-      const silverId = await tagId(call, NAME.silverTag);
-      const created = await call('partner.coupons.createCoupon', {
-        body: { name: NAME.listing, discount_type: 'fixed_amount', amount_off: 25, currency: 'USD', store_listing_id: listing?.id, organization_tag_id: silverId }
-      });
-      check('flow 2: fixed amount coupon for one store listing', created.ok && created.data.amount_off === 25 && created.data.store_listing?.id === listing?.id,
-        created.ok ? `${listings.length} listings, used "${listing?.name}"` : created.text);
+      const listing = env.XYTE_LOOP_LISTING ? listings.find((row) => row.name === env.XYTE_LOOP_LISTING) : listings[0];
+      if (env.XYTE_LOOP_LISTING && !listing) fail(`XYTE_LOOP_LISTING not found: ${env.XYTE_LOOP_LISTING}`);
+      if (listing) {
+        const silverId = await tagId(call, NAME.silverTag);
+        const created = await call('partner.coupons.createCoupon', {
+          body: { name: NAME.listing, discount_type: 'fixed_amount', amount_off: 25, currency: 'USD', store_listing_id: listing.id, organization_tag_id: silverId }
+        });
+        check('flow 2: fixed amount coupon for one store listing',
+          created.ok && created.data.amount_off === 25 && created.data.store_listing != null && created.data.store_listing.id === listing.id,
+          created.ok ? `${listings.length} listings, used "${listing.name}"` : created.text);
+      } else check('flow 2: fixed amount coupon for one store listing', false, 'the partner has no store listing');
     }
 
     if (run('3')) {
@@ -252,10 +269,14 @@ async function main() {
     await partnerServer.client.close();
   }
 
-  const stderr = partnerServer.stderr.join('');
-  const writeLines = stderr.split('\n').filter((line) => line.includes('] write '));
-  check('write log: one line per write that reached the API', writeLines.length === partnerServer.writes, `${writeLines.length} lines, ${partnerServer.writes} writes`);
-  check('write log: no key and no body', !stderr.includes(key) && !stderr.includes(NAME.goldTag) && !stderr.includes(NAME.codeValue));
+  // Every server the loop started: main, other partner, gated and read-only.
+  const stderr = servers.map((server) => server.stderr.join('')).join('');
+  const writeLines = stderr.split('\n').filter((line) => /\] write .* status=\d/.test(line));
+  const writes = servers.reduce((sum, server) => sum + server.writes, 0);
+  check('write log: one line per write that got an HTTP status', writeLines.length === writes, `${writeLines.length} lines, ${writes} writes`);
+  const secrets = [key, env.XYTE_LOOP_OTHER_PARTNER_KEY, env.XYTE_LOOP_NO_COUPONS_PARTNER_KEY, NAME.goldTag, NAME.codeValue, 'hijack', `GATED-${runId}`, `RO-${runId}`]
+    .filter(Boolean);
+  check('write log: no key and no body', !secrets.some((secret) => stderr.includes(secret)));
 
   const failed = results.filter((result) => !result.pass);
   console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
@@ -291,7 +312,7 @@ async function isolation(call, customer) {
         body: { name: 'hijack', discount_type: 'percent', percent_off: 50, organization_tag_id: goldId }
       })).status
     ];
-    check('isolation: another partner changes none of them', statuses.slice(0, 4).every((status) => status === 404) && [404, 422].includes(statuses[4]),
+    check('isolation: another partner changes none of them', statuses.every((status) => status === 404),
       `update/delete/add tag/remove tag/create on foreign tag: ${statuses.join('/')}`);
   } finally {
     await other.client.close();
@@ -303,10 +324,10 @@ async function gates() {
   if (!gatedKey) return skip('gates', 'set XYTE_LOOP_NO_COUPONS_PARTNER_KEY (store coupons off)');
   const gated = await startMcpServerClient(gatedKey);
   try {
-    const couponStatuses = [
-      (await gated.call('partner.coupons.getCoupons')).status,
-      (await gated.call('partner.coupons.createCoupon', { body: { name: 'gated', discount_type: 'percent', percent_off: 5, code: `GATED-${runId}` } })).status
-    ];
+    const probe = await gated.call('partner.coupons.createCoupon', { body: { name: 'gated', discount_type: 'percent', percent_off: 5, code: `GATED-${runId}` } });
+    // The key turned out to have store coupons on: remove the probe so it does not stay on the hub.
+    if (probe.ok) await gated.call('partner.coupons.deleteCoupon', { path: { id: probe.data.id }, confirm: 'partner.coupons.deleteCoupon' });
+    const couponStatuses = [(await gated.call('partner.coupons.getCoupons')).status, probe.status];
     check('gates: coupon calls return 403 without store coupons', couponStatuses.every((status) => status === 403), couponStatuses.join('/'));
     const organization = rows(await gated.call('partner.organizations.getOrganizations'))[0];
     const tag = organization && await gated.call('partner.organizationTags.addOrganizationTag', {

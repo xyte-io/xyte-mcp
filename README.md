@@ -101,8 +101,13 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
 - **Default:** `GET`/`HEAD`/`POST`/`PUT`/`PATCH` are all permitted.
 - **`DELETE`:** additionally requires `confirm` set to the endpoint key verbatim. This holds
   even with writes enabled — an irreversible call is the one that cannot be walked back.
+- **Ask before destroying:** the server instructions tell the model to explain in plain words
+  what a delete, a removal (such as a tag off an organization) or a change to something live
+  or scheduled will cost the customer, and to wait for your explicit yes before it acts. A
+  create request that matches something existing is reported, not applied.
 - **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
-  before a request is built, and the model is told an operator alone can lift it.
+  before a request is built, and the model tells the user the connection is set up to look
+  only.
 - **Write log:** every mutating call that reaches the API writes one line to stderr —
   `[xyte-mcp] write <key> <METHOD> status=<code> duration_ms=<n>` — so you can tell later
   what an agent changed. It never holds the API key or a request or response body.
@@ -111,6 +116,11 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
 
 `xyte_api_call`'s MCP annotations (`readOnlyHint`, `destructiveHint`) follow the live
 configuration, so a host prompts according to what the server can actually do.
+
+**This is guidance, not enforcement.** The ask-first rules and `confirm` are text the model
+reads; the model fills in `confirm` itself, so neither can stop a model that ignores them. The
+real stop is the write-approval prompt of your own agent host (Claude Code, Claude Desktop, …):
+keep approval on for `xyte_api_call`, and use `XYTE_MCP_READ_ONLY=1` when you only want to look.
 
 **Worth knowing before you point it at a live fleet.** The caller is a model, and read tools
 return content a third party can influence — device names, ticket bodies, notes. Nothing

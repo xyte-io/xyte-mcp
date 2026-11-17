@@ -42,7 +42,9 @@ describe('evaluateWritePolicy', () => {
       expect(decision.allowed).toBe(false);
       if (decision.allowed) return;
       expect(decision.reason).toContain('read-only');
-      expect(decision.hints.join(' ')).toContain('XYTE_MCP_READ_ONLY=1');
+      // The model repeats hints to the user, so no variable names (D4).
+      expect(decision.hints.join(' ')).not.toContain('XYTE_');
+      expect(decision.hints.join(' ')).toContain('set up to look only');
     }
   );
 
@@ -65,6 +67,7 @@ describe('evaluateWritePolicy', () => {
     if (decision.allowed) return;
     expect(decision.reason).toContain('explicit confirmation');
     expect(decision.hints[0]).toContain('confirm: "organization.devices.deleteDevice"');
+    expect(decision.hints.join(' ')).toContain('explicit yes');
   });
 
   it('blocks DELETE when confirm names a different endpoint', () => {

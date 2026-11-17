@@ -29,7 +29,11 @@ const inputSchema = {
   confirm: z
     .string()
     .optional()
-    .describe('Required for DELETE endpoints: pass the endpoint key verbatim to acknowledge.')
+    .describe(
+      'DELETE only: the endpoint key verbatim. Set it only after you told the user what will be ' +
+        "lost and the user gave an explicit yes in the conversation to this exact item — never " +
+        'on your own. A yes for one item does not cover others.'
+    )
 };
 
 const outputSchema = {
@@ -46,7 +50,9 @@ export const apiCallTool = defineTool({
   description:
     'Invoke a Xyte platform API endpoint by key. Use xyte_endpoint_describe first if ' +
     'you are unsure of the parameters. Mutating endpoints run unless the server was ' +
-    'started read-only; DELETE additionally requires confirm.',
+    'started read-only. Before a DELETE, a removal, or a change to something active or ' +
+    "scheduled, tell the user what changes and wait for the user's explicit yes; DELETE " +
+    'additionally requires confirm.',
   inputSchema,
   outputSchema,
   annotations: (context) => ({

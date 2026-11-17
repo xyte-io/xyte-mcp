@@ -98,6 +98,8 @@ describe('listEndpoints', () => {
 
   it('finds an endpoint by a word only its description uses', () => {
     // An agent asked to "give 20% off" searches "discount"; only the coupon descriptions say it.
+    const createCoupon = getEndpoint('partner.coupons.createCoupon');
+    expect(`${createCoupon?.key} ${createCoupon?.title} ${createCoupon?.pathTemplate}`.toLowerCase()).not.toContain('discount');
     const keys = listEndpoints({ search: 'discount' }).map((endpoint) => endpoint.key);
     expect(keys).toContain('partner.coupons.createCoupon');
   });

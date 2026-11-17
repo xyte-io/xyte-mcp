@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { apiCallTool } from '../src/tools/api-call.js';
 import { endpointDescribeTool } from '../src/tools/endpoint-describe.js';
 import { endpointsListTool } from '../src/tools/endpoints-list.js';
@@ -135,6 +136,21 @@ describe('xyte_api_call', () => {
     expect(result.isError).toBeUndefined();
     const structured = JSON.parse(JSON.stringify(result.structuredContent)) as Record<string, unknown>;
     expect(structured).toHaveProperty('data', null);
+    expect(z.object(apiCallTool.outputSchema ?? {}).safeParse(structured).success).toBe(true);
+  });
+
+  it('hints that the endpoint is missing on this hub when the hub does not know the path', async () => {
+    const http = stubHttp(
+      () => new XyteHttpError(404, 'Not Found', { error: 'Requested path /core/v1/partner/coupons does not exist' }, 'partner.coupons.getCoupons')
+    );
+    const result = await apiCallTool.handler(
+      { key: 'partner.coupons.getCoupons' },
+      testContext({ http, credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not available on this hub');
+    expect(result.content[0]?.text).not.toContain('the resource may not exist');
   });
 
   it('refuses an unknown endpoint with suggestions', async () => {
@@ -246,14 +262,36 @@ describe('xyte_api_call write log line', () => {
     expect(stderr[0]).toMatch(/ POST status=error duration_ms=\d+\n$/);
   });
 
-  it('writes nothing for a read, a refused write or a write that fails validation', async () => {
-    await apiCallTool.handler({ key: READ_KEY }, testContext());
+  it('logs a 204 DELETE with its status', async () => {
+    const http = stubHttp(() => ({ status: 204, statusText: 'No Content', data: undefined }));
     await apiCallTool.handler(
+      { key: 'partner.coupons.deleteCoupon', path: { id: 'c1' }, confirm: 'partner.coupons.deleteCoupon' },
+      testContext({ http, credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ write partner\.coupons\.deleteCoupon DELETE status=204 duration_ms=\d+\n$/);
+  });
+
+  it('writes nothing for a read, a refused write or a write that fails validation', async () => {
+    const read = await apiCallTool.handler({ key: READ_KEY }, testContext());
+    const readOnlyRefusal = await apiCallTool.handler(
       { key: WRITE_KEY, path: { device_id: 'd1' }, body: {} },
       testContext({ allowWrites: false })
     );
-    await apiCallTool.handler({ key: WRITE_KEY, body: {} }, testContext());
+    const deleteWithoutConfirm = await apiCallTool.handler(
+      { key: 'partner.coupons.deleteCoupon', path: { id: 'c1' } },
+      testContext({ credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+    const invalid = await apiCallTool.handler({ key: WRITE_KEY, body: {} }, testContext());
 
+    expect(read.isError).toBeUndefined();
+    expect(readOnlyRefusal.isError).toBe(true);
+    expect(readOnlyRefusal.content[0]?.text).toContain('read-only');
+    expect(deleteWithoutConfirm.isError).toBe(true);
+    expect(deleteWithoutConfirm.content[0]?.text).toContain('confirm');
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content[0]?.text).toContain('device_id');
     expect(stderr).toEqual([]);
   });
 });

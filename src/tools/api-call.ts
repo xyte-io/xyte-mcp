@@ -151,7 +151,10 @@ function toErrorResult(
     if (error.status === 401 || error.status === 403) {
       hints.push('The API key may be invalid, revoked, or lack the required scope.');
     }
-    if (error.status === 404) {
+    if (error.status === 404 && /Requested path .* does not exist/.test(JSON.stringify(error.body))) {
+      // Hub's catch-all route: the hub is older than this catalog, not a missing record.
+      hints.push('This endpoint is not available on this hub yet. Tell the user; do not retry with other ids.');
+    } else if (error.status === 404) {
       hints.push('Check the path parameter values — the resource may not exist.');
     }
     if (error.status === 422 || error.status === 400) {

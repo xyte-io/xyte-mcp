@@ -8,8 +8,9 @@ Reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it 
 read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
-their telemetry and incidents, service tickets, commands, models and warranties. This server
-puts that API in front of an agent as three tools instead of 78 hand-written ones — it can
+their telemetry and incidents, service tickets, commands, models, warranties and maintenance
+schedules, and for partners the store coupons they give their customers. This server
+puts that API in front of an agent as three tools instead of 97 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
 
@@ -85,7 +86,7 @@ the upgrade. Where the two disagree, the restrictive one wins. New configuration
 
 | Tool | What it does |
 | --- | --- |
-| `xyte_endpoints_list` | Discover endpoints. Filter by `namespace`, `group`, `method`, `search`, `readOnly`. Returns compact rows. |
+| `xyte_endpoints_list` | Discover endpoints. Filter by `namespace`, `group`, `method`, `search` (matches key, title, path and description), `readOnly`. Returns compact rows. |
 | `xyte_endpoint_describe` | Full contract for one endpoint: path params, query params, body shape, required credential. |
 | `xyte_api_call` | Invoke an endpoint by key with `path`, `query` and `body`. |
 
@@ -101,11 +102,35 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
 - **Default:** `GET`/`HEAD`/`POST`/`PUT`/`PATCH` are all permitted.
 - **`DELETE`:** additionally requires `confirm` set to the endpoint key verbatim. This holds
   even with writes enabled — an irreversible call is the one that cannot be walked back.
+- **Ask before destroying:** the server instructions tell the model to explain in plain words
+  what a delete, a removal (such as a tag off an organization) or a change to something live
+  or scheduled will cost the customer, and to wait for your explicit yes before it acts.
+  Before it proposes a delete or removal it reads that endpoint's contract, so its plan says
+  what the API will refuse and what it will do instead. A create request that matches
+  something existing is reported, not applied.
+- **Other writes go ahead:** creates and updates you asked for are made without a second
+  question, and the model makes every write the request needs — a change "for" a named
+  customer is done only when that customer has it. It then reads those customers back and
+  tells you what each one now gets. Your host's write-approval prompt still applies.
+- **Answers:** the model answers in plain words — names and dates, no ids, endpoint keys,
+  field names or setting names unless you ask. API times are UTC, so it shows dates in your
+  time zone, asks for it, or names the zone next to the date.
 - **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
-  before a request is built, and the model is told an operator alone can lift it.
+  before a request is built, and the model tells the user the connection is set up to look
+  only.
+- **Write log:** every mutating call the server sends writes one line to stderr —
+  `[xyte-mcp] write <key> <METHOD> status=<code> duration_ms=<n>` — so you can tell later
+  what an agent changed. It never holds the API key or a request or response body.
+  `status=error` means no HTTP status came back (timeout, network), so the write may still
+  have landed.
 
 `xyte_api_call`'s MCP annotations (`readOnlyHint`, `destructiveHint`) follow the live
 configuration, so a host prompts according to what the server can actually do.
+
+**This is guidance, not enforcement.** The ask-first rules and `confirm` are text the model
+reads; the model fills in `confirm` itself, so neither can stop a model that ignores them. The
+real stop is the write-approval prompt of your own agent host (Claude Code, Claude Desktop, …):
+keep approval on for `xyte_api_call`, and use `XYTE_MCP_READ_ONLY=1` when you only want to look.
 
 **Worth knowing before you point it at a live fleet.** The caller is a model, and read tools
 return content a third party can influence — device names, ticket bodies, notes. Nothing
@@ -126,10 +151,22 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
+`src/catalog/endpoints.generated.json` holds 97 endpoints (74 organization, 23 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.
+
+Partner endpoints cover devices, tickets and organizations, plus the store coupons a
+partner gives its customers: `partner.organizations.getOrganizations`,
+`partner.organizationTags.*` (add, remove, list organization tags), `partner.coupons.*`
+(create, list, update, delete coupons) and `partner.storeListings.getStoreListings`. A
+coupon reaches a customer by code or by an organization tag. Coupons need the Store plan
+feature and store coupons enabled for the partner; store listings need only the Store plan
+feature.
+
+Organization endpoints also gained `organization.edges.devices.changeModel`, maintenance schedules
+(`organization.maintenanceSchedules.*`) and incident notes (`organization.notes.*IncidentNote*`), picked up from hub with this
+catalog refresh.
 
 Device API endpoints are deliberately excluded: they authenticate as a device with a device
 access token, not as an operator.
@@ -164,6 +201,37 @@ started with `XYTE_MCP_READ_ONLY=1` regardless of your environment, only `GET` e
 exercised, and the key is never printed — this runs against production, so it cannot mutate
 anything. A pass means the whole path works; if this passes but your host still shows
 nothing, the problem is the host registration, not the server.
+
+### Partner coupon loop
+
+`npm run loop:partner-coupons` runs every partner coupon and organization tag flow through the
+built server and checks each result: percent, fixed-amount and code coupons, tagging customers,
+changing, deactivating and deleting coupons, removing a tag, and the lists. It also checks that
+another partner sees and changes nothing, that coupon calls return 403 without store coupons,
+that read-only mode refuses every write, and that the write log holds no key or body.
+
+It **writes** (every name it creates carries a run id), so it refuses to start without an
+explicit `XYTE_HUB_URL` and refuses `hub.xyte.io`. Use a local or staging hub.
+
+| Variable | Needed | What it is |
+| --- | --- | --- |
+| `XYTE_HUB_URL` | yes | The hub to test, e.g. `http://localhost:3000`. |
+| `XYTE_PARTNER_API_KEY` | yes | Key of a partner with the Store plan and store coupons on. |
+| `XYTE_LOOP_CUSTOMERS` | yes | Five of that partner's customers, comma separated, visible in its store. |
+| `XYTE_LOOP_HIDDEN_CUSTOMER` | no | A customer that cannot see the store; checks `store_visible: false`. |
+| `XYTE_LOOP_LISTING` | no | Store listing name for the fixed-amount coupon (default: the first). A name that matches no listing stops the run. |
+| `XYTE_LOOP_USED_COUPON_ID` | no | A coupon used in an order; checks that deleting it is refused. |
+| `XYTE_LOOP_OTHER_PARTNER_KEY` | no | Another partner's key, for the isolation checks. |
+| `XYTE_LOOP_NO_COUPONS_PARTNER_KEY` | no | Key of a partner with store coupons off, for the 403 checks. |
+| `XYTE_LOOP_RUN_ID` | no | Suffix for created names (default: a timestamp). |
+| `XYTE_LOOP_FLOWS` | no | Run only some flows, e.g. `1,2,3,4`, to check the portals between steps. Valid: `1,2,3,4,5,6,10,7,8,11,isolation,gates,readonly`. |
+
+To run the flows in steps, set the same `XYTE_LOOP_RUN_ID` on every step (the first run prints
+it) and keep the order above: later flows find the coupons and tags by run-id names, and flow
+11 expects flows 10 and 7 to have run.
+
+A check whose optional variable is unset is skipped, not failed. The script exits 1 when any
+check fails.
 
 ## Development
 

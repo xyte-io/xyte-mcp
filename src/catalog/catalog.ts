@@ -43,7 +43,8 @@ export function listEndpoints(filter: EndpointFilter = {}): EndpointSpec[] {
     if (filter.method && endpoint.method !== filter.method) return false;
     if (filter.includeMutating === false && endpoint.mutating) return false;
     if (search) {
-      const haystack = `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate}`.toLowerCase();
+      const haystack =
+        `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate} ${endpoint.description ?? ''}`.toLowerCase();
       if (!haystack.includes(search)) return false;
     }
     return true;

@@ -138,7 +138,9 @@ describe('buildRequest', () => {
     }
     expect(caught).toBeInstanceOf(XyteError);
     expect((caught as XyteError).kind).toBe('config');
-    expect((caught as XyteError).hints.join(' ')).toContain('XYTE_PARTNER_API_KEY');
+    // The hint reaches the model, so it names no setting (D4); the README names the variable.
+    expect((caught as XyteError).hints.join(' ')).toContain('no partner access');
+    expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_');
   });
 
   it('builds a request for every catalog endpoint without throwing', () => {

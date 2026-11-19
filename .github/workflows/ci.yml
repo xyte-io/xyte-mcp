@@ -22,9 +22,15 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
-      # Includes the protocol smoke test, which spawns a real stdio server.
-      - run: npx vitest run
-      - run: npm pack --dry-run
+      # Both packages. Includes the protocol smoke test, which spawns a real
+      # stdio server, and the transport tests, which spawn the hosted server.
+      - run: npm run test:unit --workspaces
+      - run: npm pack --dry-run -w @xyteai/mcp
+      # The published package must not carry the hosted server's code or its
+      # pg dependency. One OS is enough: the tarball is the same everywhere.
+      - name: Packed @xyteai/mcp has no pg and no hosted-server code
+        if: matrix.os == 'ubuntu-latest'
+        run: node packages/mcp/scripts/assert-pack-no-pg.mjs
 
   pg-store:
     # The OAuth store contract against a real Postgres. Service containers only
@@ -47,7 +53,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npx vitest run tests/oauth-store.test.ts
+      # The remote package imports the shared modules from @xyteai/mcp's dist.
+      - run: npm run build -w @xyteai/mcp
+      - run: npm run test:unit -w @xyteai/mcp-remote -- tests/oauth-store.test.ts
 
   catalog-shape:
     # The generator needs a hub checkout, which CI does not have, so validate the
@@ -65,7 +73,7 @@ jobs:
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             const { catalogVersion, endpoints } = JSON.parse(
-              readFileSync("src/catalog/endpoints.generated.json", "utf8")
+              readFileSync("packages/mcp/src/catalog/endpoints.generated.json", "utf8")
             );
             const fail = (m) => { console.error("FAIL " + m); process.exit(1); };
 
@@ -104,9 +112,10 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
 
-      # Gate on what actually ships. Only @modelcontextprotocol/sdk and zod are
-      # runtime dependencies, and `files` publishes just dist/ + README, so a
-      # devDependency advisory cannot reach a user of this package.
+      # Gate on what actually ships: the runtime dependencies of both packages
+      # (the published @xyteai/mcp: @modelcontextprotocol/sdk and zod; the
+      # hosted server adds express and pg). `files` publishes just dist/ +
+      # README, so a devDependency advisory cannot reach a user.
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 

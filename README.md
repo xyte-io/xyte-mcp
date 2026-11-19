@@ -6,7 +6,7 @@ discovery plus a generic call tool — over stdio locally, or over Streamable HT
 remote server.
 
 Locally, reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it a
-read-only server. The remote `--http` server is read-only unless `XYTE_MCP_ALLOW_WRITES=1`.
+read-only server. The hosted HTTP server is read-only unless `XYTE_MCP_ALLOW_WRITES=1`.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
@@ -19,8 +19,8 @@ went offline this week, and what do their open tickets say"), to script routine 
 or to work against the Xyte API without you writing the client.
 
 By default it runs locally as a subprocess of your MCP host and talks to `hub.xyte.io`
-directly — nothing to deploy and no third party in the path. `--http` serves the same tools
-over the network for clients that only support remote servers; see
+directly — nothing to deploy and no third party in the path. A hosted server (in this repo,
+not in the npm package) serves the same tools over the network for clients that only support remote servers; see
 [Remote HTTP transport](#remote-http-transport).
 
 ## Install
@@ -73,16 +73,16 @@ Everything below is about running the server itself.
 | `XYTE_ORG_API_KEY` | Organization-scoped API key. |
 | `XYTE_PARTNER_API_KEY` | Partner-scoped API key. Set either or both. |
 | `XYTE_MCP_READ_ONLY` | Set to `1` to refuse every mutating endpoint. Writes are permitted by default over stdio; this always wins. |
-| `XYTE_MCP_ALLOW_WRITES` | **`--http`:** set to `1` to permit writes; a hosted server is read-only otherwise. Over stdio, see below. |
+| `XYTE_MCP_ALLOW_WRITES` | **Hosted server:** set to `1` to permit writes; a hosted server is read-only otherwise. Over stdio, see below. |
 | `XYTE_HUB_URL` | Override the hub base URL. Defaults to `https://hub.xyte.io`. |
 | `XYTE_ENTRY_URL` | Override the entry base URL. |
 | `XYTE_MCP_TIMEOUT_MS` | Per-request timeout. Defaults to `15000`. |
-| `XYTE_MCP_HTTP_TOKEN` | **`--http` only.** Static bearer fronting the process API key (dev/CI). At least 24 characters, not counting an `xmcp_` prefix (a grep-able marker for secret scanners). Exactly one of this and `XYTE_MCP_ISSUER_URL`: setting both refuses to start. |
-| `XYTE_MCP_ISSUER_URL` | **`--http` only.** This deployment's public https URL; setting it enables OAuth 2.1. |
-| `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **`--http` + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
-| `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **`--http` + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
-| `DATABASE_URL` | **`--http` + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: an `sslmode` in the DSN decides; without one, none for `localhost`, otherwise TLS without chain verification (Heroku's). |
-| `PORT` | **`--http` only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
+| `XYTE_MCP_HTTP_TOKEN` | **Hosted server only.** Static bearer fronting the process API key (dev/CI). At least 24 characters, not counting an `xmcp_` prefix (a grep-able marker for secret scanners). Exactly one of this and `XYTE_MCP_ISSUER_URL`: setting both refuses to start. |
+| `XYTE_MCP_ISSUER_URL` | **Hosted server only.** This deployment's public https URL; setting it enables OAuth 2.1. |
+| `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
+| `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
+| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: an `sslmode` in the DSN decides; without one, none for `localhost`, otherwise TLS without chain verification (Heroku's). |
+| `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
 `XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for
 non-production hubs; the defaults are what you want.
@@ -90,7 +90,7 @@ non-production hubs; the defaults are what you want.
 `XYTE_MCP_ALLOW_WRITES` from 0.1.x is still honoured with its original meaning: if it is set
 at all, it decides, so a server pinned shut with `XYTE_MCP_ALLOW_WRITES=0` stays shut across
 the upgrade. Where the two disagree, the restrictive one wins. New stdio configuration should
-use `XYTE_MCP_READ_ONLY`; over `--http`, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
+use `XYTE_MCP_READ_ONLY`; on the hosted server, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
 writes on (`XYTE_MCP_READ_ONLY=0` alone does not).
 
 ## Tools
@@ -111,7 +111,7 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
 ## Write policy
 
 - **Default over stdio:** `GET`/`HEAD`/`POST`/`PUT`/`PATCH` are all permitted.
-- **Default over `--http`:** read-only, as below, unless `XYTE_MCP_ALLOW_WRITES=1`.
+- **Default on the hosted server:** read-only, as below, unless `XYTE_MCP_ALLOW_WRITES=1`.
 - **`DELETE`:** additionally requires `confirm` set to the endpoint key verbatim. This holds
   even with writes enabled — an irreversible call is the one that cannot be walked back.
 - **`XYTE_MCP_READ_ONLY=1`:** only `GET`/`HEAD` can be called. Anything else is refused
@@ -139,7 +139,7 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
+`packages/mcp/src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.
@@ -150,15 +150,15 @@ access token, not as an operator.
 To refresh after an API change:
 
 ```bash
-npm run catalog:generate -- --hub-path ../hub
-git diff src/catalog/endpoints.generated.json    # review, then commit
+node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub
+git diff packages/mcp/src/catalog/endpoints.generated.json    # review, then commit
 ```
 
 CI cannot regenerate this (it has no hub checkout), so refreshing it is a maintainer step
 in the release checklist. `--check` verifies a committed file matches a fresh generation:
 
 ```bash
-node scripts/generate-catalog.mjs --hub-path ../hub --check
+node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub --check
 ```
 
 ## Verifying a real setup
@@ -167,9 +167,9 @@ To check the server, your credential and production connectivity in one step —
 independently of any MCP host wiring:
 
 ```bash
-npm run smoke:live -- --key-stdin     # paste the key; keeps it out of shell history
+npm run smoke:live -w @xyteai/mcp -- --key-stdin     # paste the key; keeps it out of shell history
 # or
-XYTE_ORG_API_KEY=<key> npm run smoke:live
+XYTE_ORG_API_KEY=<key> npm run smoke:live -w @xyteai/mcp
 ```
 
 It spawns the built server and drives real MCP requests against the live API. The child is
@@ -180,7 +180,8 @@ nothing, the problem is the host registration, not the server.
 
 ## Remote HTTP transport
 
-`xyte-mcp --http` serves the same three tools over MCP's Streamable HTTP transport, for
+The hosted server (`packages/remote`, private: not part of the `@xyteai/mcp` npm package,
+whose binary serves stdio only) serves the same three tools over MCP's Streamable HTTP transport, for
 clients that cannot spawn a local subprocess. A deployment runs one of two authentication
 modes; setting both is a config error, so a shared bearer never sits next to the per-user
 sign-in on the same URL:
@@ -222,7 +223,7 @@ the flow), and deliberately *without* one in static mode (a challenge makes
 npm run build
 XYTE_MCP_HTTP_TOKEN=$(node -e "console.log('xmcp_'+require('node:crypto').randomBytes(32).toString('base64url'))") \
   XYTE_ORG_API_KEY=<key> PORT=3000 \
-  node dist/index.js --http
+  node packages/remote/dist/index.js
 ```
 
 It is read-only unless you set `XYTE_MCP_ALLOW_WRITES=1`: on stdio the blast radius of a
@@ -231,8 +232,8 @@ in, and `XYTE_MCP_READ_ONLY=1` still wins over it.
 
 ### Deploy it
 
-The `Procfile` is all a Heroku Node app needs — the buildpack runs `npm run build` and
-`engines.node` pins the runtime.
+The `Procfile` is all a Heroku Node app needs — the buildpack runs the root `npm run build`
+(both workspace packages) and the root `engines.node` pins the runtime.
 
 ```bash
 heroku create <app> --region eu --team <team>
@@ -291,11 +292,11 @@ No `initialize` handshake is needed, because there is no session to establish.
 ### Verify a deploy
 
 ```bash
-npm run smoke:remote -- https://<app>.herokuapp.com                               # OAuth
-XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -- https://<app>.herokuapp.com   # static
+npm run smoke:remote -w @xyteai/mcp-remote -- https://<app>.herokuapp.com                               # OAuth
+XYTE_MCP_HTTP_TOKEN=<token> npm run smoke:remote -w @xyteai/mcp-remote -- https://<app>.herokuapp.com   # static
 ```
 
-`scripts/remote-smoke.mjs` picks the mode from the deployment: OAuth metadata served means
+`packages/remote/scripts/remote-smoke.mjs` picks the mode from the deployment: OAuth metadata served means
 OAuth, and no token is needed or accepted.
 
 - **OAuth:** discovery metadata, the `401` challenge pointing at it, dynamic registration,
@@ -317,22 +318,23 @@ the boundary.
 ```bash
 npm install
 npm run typecheck
-npm test          # builds, then runs unit + protocol tests
+npm test          # builds, then runs unit + protocol tests of both packages
 npm run lint
-npm run inspect   # build and open the MCP Inspector
+npm run inspect -w @xyteai/mcp   # build and open the MCP Inspector
 ```
 
-The OAuth store contract (`tests/oauth-store.test.ts`) always runs against the in-memory store, and against Postgres too when `TEST_DATABASE_URL` names a throwaway database (its tables are truncated); otherwise the Postgres run is skipped. CI's `pg-store` job runs it against a Postgres service on every push.
+The OAuth store contract (`packages/remote/tests/oauth-store.test.ts`) always runs against the in-memory store, and against Postgres too when `TEST_DATABASE_URL` names a throwaway database (its tables are truncated); otherwise the Postgres run is skipped. CI's `pg-store` job runs it against a Postgres service on every push.
 
 Two invariants are enforced by lint rather than convention, because both erode silently:
 
 - **Nothing but JSON-RPC may reach stdout.** On stdio, stdout *is* the protocol channel; one
   stray `console.log` corrupts the stream and the host disconnects. `no-console` is an error
-  in `src/`; use `src/log.ts`, which writes to stderr.
+  in `packages/*/src/`; use `packages/mcp/src/log.ts`, which writes to stderr.
 - **Tools take `(args, ctx)` and nothing else.** No environment reads, no transport imports.
-  Credential resolution and transport wiring live in `src/transports/`.
+  Credential resolution and transport wiring live in `packages/mcp/src/transports/` (stdio) and
+  `packages/remote/src/transports/` (HTTP).
 
-That second rule is what let `--http` reuse the tools unchanged — see
+That second rule is what let the hosted server reuse the tools unchanged — see
 [Remote HTTP transport](#remote-http-transport).
 
 ## Releasing
@@ -347,21 +349,21 @@ Checklist, from `main` with a clean tree:
 ```bash
 # 1. Refresh the endpoint catalog. CI cannot do this — it has no hub checkout —
 #    so a stale catalog is the one release defect nothing else will catch.
-npm run catalog:generate -- --hub-path ../hub
-git diff src/catalog/endpoints.generated.json    # review, commit if changed
+node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub
+git diff packages/mcp/src/catalog/endpoints.generated.json    # review, commit if changed
 
 # 2. Verify everything the publish job will verify, locally.
 npm run typecheck && npm run lint && npm test
-npm run smoke:pack-install                       # packs, installs, runs the binary
+npm run smoke:pack-install -w @xyteai/mcp       # packs, installs, runs the binary
 
 # 3. Bump the version and tag it. The publish job refuses to ship a tag that
-#    disagrees with package.json.
-npm version 0.1.0 --no-git-tag-version
+#    disagrees with packages/mcp/package.json.
+npm version 0.1.0 -w @xyteai/mcp --no-git-tag-version
 git commit -am "Release v0.1.0" && git push origin main
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`node scripts/generate-catalog.mjs --hub-path ../hub --check` exits non-zero when the
+`node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub --check` exits non-zero when the
 committed catalog is stale, if you would rather assert than diff.
 
 Then verify from a machine that has never seen the repo:
@@ -379,10 +381,10 @@ MCP servers load at session start, so confirm the tools in a *new* session.
 MCP's OAuth 2.1 authorization applies to HTTP transports; for stdio the specification
 directs servers to take credentials from the environment, which is what stdio mode does.
 
-Setting `XYTE_MCP_ISSUER_URL` (the deployment's public https URL) makes `--http` a full
-authorization server. The protocol surface is the MCP TypeScript SDK's `mcpAuthRouter` —
+Setting `XYTE_MCP_ISSUER_URL` (the deployment's public https URL) makes the hosted server a
+full authorization server. The protocol surface is the MCP TypeScript SDK's `mcpAuthRouter` —
 RFC 8414 metadata, RFC 7591 dynamic client registration, `/authorize` + `/token` with PKCE,
-revocation — nothing hand-rolled. Our part (`src/oauth/`) is the policy behind it:
+revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is the policy behind it:
 
 - **Consent first.** `/authorize` never redirects straight away: it shows our own consent
   page naming the registering client (its `client_name` is self-declared, and labelled so)
@@ -469,7 +471,7 @@ a public sign-in URL.
   around. Scope it to what the agent needs.
 - Prefer passing keys through your host's secret handling rather than committing them into a
   shared `.mcp.json`.
-- `--http` is reachable from the network. Its static bearer is one shared identity — every
+- The hosted server is reachable from the network. Its static bearer is one shared identity — every
   holder acts as the process API key — so keep it to dev/CI, read-only, and rotate it by
   setting a new value and restarting the server (it is read only at boot; on Heroku,
   changing a config var restarts the dyno). OAuth gives each user their own sign-in

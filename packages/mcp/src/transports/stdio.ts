@@ -10,7 +10,7 @@ import { log } from '../log.js';
  * is what the MCP specification prescribes for stdio servers (its OAuth flow is
  * defined for HTTP transports only).
  *
- * `transports/http.ts` instead resolves a per-request credential from a
+ * The hosted server's `transports/http.ts` (packages/remote) instead resolves a per-request credential from a
  * validated OAuth token (or, in its static-bearer mode, one process-wide
  * context), and reuses `createServer` unchanged.
  */

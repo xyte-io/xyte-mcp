@@ -272,7 +272,7 @@ function main() {
     if (current !== serialized) {
       console.error(
         'FAIL committed catalog is stale.\n' +
-          'Run: npm run catalog:generate -- --hub-path <hub> and commit the result.'
+          'Run: node packages/mcp/scripts/generate-catalog.mjs --hub-path <hub> and commit the result.'
       );
       process.exit(1);
     }

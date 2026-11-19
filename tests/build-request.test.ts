@@ -33,8 +33,8 @@ describe('buildRequest', () => {
   });
 
   it('percent-encodes path parameter values', () => {
-    const request = buildRequest(spec(), { path: { device_id: 'a/b c' } }, testContext());
-    expect(request.url).toBe('https://hub.xyte.io/core/v1/organization/devices/a%2Fb%20c');
+    const request = buildRequest(spec(), { path: { device_id: 'a b?c#d' } }, testContext());
+    expect(request.url).toBe('https://hub.xyte.io/core/v1/organization/devices/a%20b%3Fc%23d');
   });
 
   it('accepts numeric path parameters', () => {
@@ -80,6 +80,14 @@ describe('buildRequest', () => {
     for (const value of ['.', '..', ' .. ']) {
       expect(() => buildRequest(spec(), { path: { device_id: value } }, testContext())).toThrow(
         /cannot be/
+      );
+    }
+  });
+
+  it('rejects "/", "\\" and "%" in a path parameter, which could reach another hub path', () => {
+    for (const value of ['../users', 'a/b', 'a\\b', '..\\users', '%2e%2e', 'a%2Fb']) {
+      expect(() => buildRequest(spec(), { path: { device_id: value } }, testContext())).toThrow(
+        /"device_id" cannot contain/
       );
     }
   });

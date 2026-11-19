@@ -142,6 +142,16 @@ function substitutePath(endpoint: EndpointSpec, pathArgs: PathArgs): string {
         `${endpoint.key}: path parameter "${name}" cannot be "${text}".`
       );
     }
+    // Encoded, "../users" still reaches the hub as "..%2Fusers", and a server
+    // or proxy that decodes it walks out of the endpoint. No hub id carries
+    // these characters, so refuse them rather than trust every hop to agree.
+    if (/[/\\%]/.test(text)) {
+      throw new XyteError(
+        'validation',
+        `${endpoint.key}: path parameter "${name}" cannot contain "/", "\\" or "%".`,
+        ['Pass the bare id, as returned by the hub.']
+      );
+    }
     return encodeURIComponent(text);
   });
 }

@@ -1,0 +1,19 @@
+{
+  "name": "xyte-mcp-workspace",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "packages/mcp",
+    "packages/remote"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run build -w @xyteai/mcp && npm run typecheck --workspaces",
+    "test": "npm run build && npm run test:unit --workspaces",
+    "lint": "eslint packages/*/src packages/*/tests packages/*/scripts",
+    "start": "node packages/remote/dist/index.js"
+  }
+}

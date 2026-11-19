@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { hubAcceptsPkce } from './support/pkce.js';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -10,6 +10,7 @@ import {
   type ServerResponse
 } from 'node:http';
 import path from 'node:path';
+import { VERSION } from '@xyteai/mcp/version.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -26,11 +27,6 @@ const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
 /** Well-formed, long enough, and no token of ours. */
 const JUNK_TOKEN = 'xmcp_junk_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
-const VERSION = (
-  JSON.parse(readFileSync(path.resolve(import.meta.dirname, '..', 'package.json'), 'utf8')) as {
-    version: string;
-  }
-).version;
 const ID_TOKEN = `h.${Buffer.from(
   JSON.stringify({ sub: 'user-1', xyte_tenant_id: 'org-1', email: 'user@example.com' })
 ).toString('base64url')}.s`;

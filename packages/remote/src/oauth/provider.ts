@@ -16,10 +16,10 @@ import type {
   OAuthTokenRevocationRequest,
   OAuthTokens
 } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { HttpClient } from '../http/client.js';
-import { XyteError, XyteHttpError } from '../http/errors.js';
-import { logError } from '../log.js';
-import { redactText } from '../redact.js';
+import type { HttpClient } from '@xyteai/mcp/http/client.js';
+import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { logError } from '@xyteai/mcp/log.js';
+import { redactText } from '@xyteai/mcp/redact.js';
 import { nowSeconds, type HubOAuth, type HubSignIn, type HubTokens } from './hub-oauth.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 

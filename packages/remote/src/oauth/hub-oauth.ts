@@ -1,5 +1,5 @@
-import { XyteError } from '../http/errors.js';
-import { logError } from '../log.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
+import { logError } from '@xyteai/mcp/log.js';
 
 /**
  * xyte-mcp as a confidential client of hub's own OAuth 2 server

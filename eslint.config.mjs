@@ -2,7 +2,7 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'tests/fixtures/**'] },
+  { ignores: ['**/dist/**', '**/node_modules/**', '**/coverage/**', '**/tests/fixtures/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
 
@@ -16,8 +16,8 @@ export default tseslint.config(
   {
     // On stdio, stdout carries the JSON-RPC frames. A single stray console.log
     // corrupts the stream and the host drops the connection. Diagnostics must
-    // go through src/log.ts, which writes to stderr.
-    files: ['src/**/*.ts'],
+    // go through packages/mcp/src/log.ts, which writes to stderr.
+    files: ['packages/*/src/**/*.ts'],
     rules: {
       'no-console': 'error'
     }
@@ -27,7 +27,7 @@ export default tseslint.config(
     // Tools must be pure functions of (args, ctx). Keeping environment access
     // and transport knowledge out of them is what lets a future HTTP/OAuth
     // transport supply per-request credentials without touching tool code.
-    files: ['src/tools/**/*.ts'],
+    files: ['packages/*/src/tools/**/*.ts'],
     rules: {
       'no-restricted-properties': [
         'error',
@@ -54,19 +54,19 @@ export default tseslint.config(
   },
 
   {
-    files: ['tests/**/*.ts'],
+    files: ['packages/*/tests/**/*.ts'],
     rules: {
       '@typescript-eslint/no-non-null-assertion': 'off'
     }
   },
 
   {
-    files: ['scripts/**/*.mjs'],
+    files: ['packages/*/scripts/**/*.mjs'],
     ...tseslint.configs.disableTypeChecked
   },
   {
     // Maintainer scripts are plain Node ESM: console/process are expected here.
-    files: ['scripts/**/*.mjs'],
+    files: ['packages/*/scripts/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2023,
       sourceType: 'module',

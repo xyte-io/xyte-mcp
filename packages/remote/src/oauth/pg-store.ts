@@ -1,6 +1,6 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { logError } from '../log.js';
+import { logError } from '@xyteai/mcp/log.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,

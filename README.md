@@ -452,7 +452,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   300 a minute per IP for requests without a valid token; over that it answers 429 with
   `Retry-After`, so a flooded IP sees 429 instead of 401 for up to a minute. `/oauth/callback`
   allows 30 a minute per IP. Counters are in memory (one dyno). An `/mcp` body over 1 MiB is
-  a 413.
+  a 413. JSON-RPC batches are refused (400), so one request is one call.
 
 **Registering at hub.** Once per hub environment, from a hub console:
 

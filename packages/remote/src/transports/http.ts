@@ -5,6 +5,7 @@ import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { isJsonContentType } from '@modelcontextprotocol/sdk/shared/mediaType.js';
 import { endpointCount } from '@xyteai/mcp/catalog/catalog.js';
 import {
   DEFAULT_HUB_URL,
@@ -203,10 +204,32 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     }
   });
 
+  // Parsed here, after auth, only to refuse JSON-RPC batches: the SDK runs up to 100
+  // messages of one POST in parallel, which would multiply the per-grant limit (and
+  // protocol 2025-06-18 has no batching). Parsed exactly when the SDK accepts the
+  // Content-Type; anything else gets the SDK's 415 before a body is read.
+  const parseMcpBody = express.json({
+    limit: MAX_MCP_BODY_BYTES,
+    inflate: false,
+    type: (req) => isJsonContentType(req.headers['content-type'])
+  });
   app.post(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
     const identity = identityOf(res);
     if (!identity) return respondUnauthorized(req, res, mcpAuth);
-    void handleMcp(req, res, identity.context);
+    parseMcpBody(req, res, (error?: unknown) => {
+      // body-parser's errors, in the JSON-RPC shape the SDK used for them.
+      const status = (error as { status?: number } | undefined)?.status;
+      if (error && status === 413) {
+        const message = `Payload Too Large: Request body must not exceed ${MAX_MCP_BODY_BYTES} bytes`;
+        return respondJsonRpcError(res, 413, -32000, message);
+      }
+      if (error) return respondJsonRpcError(res, status ?? 400, -32700, 'Parse error: Invalid JSON');
+      if (Array.isArray(req.body)) {
+        const message = 'Invalid Request: JSON-RPC batching is not supported, send one message per request';
+        return respondJsonRpcError(res, 400, -32600, message);
+      }
+      void handleMcp(req, res, identity.context, req.body);
+    });
   });
 
   // POST is the whole protocol here, and the spec lets a server say so.
@@ -308,12 +331,17 @@ interface McpIdentity {
   grantId?: string;
 }
 
-async function handleMcp(req: Request, res: Response, context: ToolContext): Promise<void> {
+async function handleMcp(
+  req: Request,
+  res: Response,
+  context: ToolContext,
+  parsedBody: unknown
+): Promise<void> {
   const server = createServer(context);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,
-    // Answered 413 (JSON-RPC) before anything is parsed.
+    // Only reached without a parsed body (no body at all); kept as the backstop cap.
     maxRequestBodySize: MAX_MCP_BODY_BYTES
   });
   // Stateless means this pair is per-request, so it has to be torn down with the
@@ -325,9 +353,9 @@ async function handleMcp(req: Request, res: Response, context: ToolContext): Pro
 
   try {
     await server.connect(transport);
-    // With no `parsedBody` the transport reads and parses the body itself, and
-    // rejects a bad Accept/Content-Type per spec before we see it.
-    await transport.handleRequest(req, res);
+    // The transport still rejects a bad Accept/Content-Type per spec, and reads
+    // the body itself when none was parsed.
+    await transport.handleRequest(req, res, parsedBody);
   } catch (error) {
     // The message could carry a credential (an upstream URL, a header dump), so
     // it goes through redactText before the log stream, and never to the client.

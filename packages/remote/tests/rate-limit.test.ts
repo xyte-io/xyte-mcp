@@ -1,4 +1,4 @@
-import type { Server } from 'node:http';
+import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer } from 'node:net';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -30,13 +30,13 @@ async function freePort(): Promise<number> {
 let listener: Server | undefined;
 let base = '';
 
-async function start(mode: 'oauth' | 'static'): Promise<void> {
+async function start(mode: 'oauth' | 'static', hubUrl = 'http://127.0.0.1:9'): Promise<void> {
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   listener = await startHttpServer({
     PORT: String(port),
     DATABASE_URL: '',
-    XYTE_HUB_URL: 'http://127.0.0.1:9',
+    XYTE_HUB_URL: hubUrl,
     ...(mode === 'oauth'
       ? {
           XYTE_MCP_ISSUER_URL: base,
@@ -162,6 +162,89 @@ describe('/mcp body cap', () => {
 
     const under = await mcp(STATIC_TOKEN, paddedToolsList(MIB - 1));
     expect(under.status).toBe(200);
+  });
+
+  it('answers a chunked body over 1 MiB (no Content-Length) with 413', async () => {
+    await start('static');
+    const body = new TextEncoder().encode(paddedToolsList(MIB + 1));
+    const chunked = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < body.length; i += 64 * 1024) {
+          controller.enqueue(body.slice(i, i + 64 * 1024));
+        }
+        controller.close();
+      }
+    });
+
+    const over = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${STATIC_TOKEN}` },
+      body: chunked,
+      duplex: 'half'
+    } as RequestInit);
+    expect(over.status).toBe(413);
+    expect(await over.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32000 } });
+  });
+
+  it('keeps the JSON-RPC parse error, 415 and 406 for a malformed request', async () => {
+    await start('static');
+    const post = (headers: Record<string, string>, body: string) =>
+      fetch(`${base}/mcp`, {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, Authorization: `Bearer ${STATIC_TOKEN}`, ...headers },
+        body
+      });
+    const valid = JSON.stringify(TOOLS_LIST);
+
+    const invalid = await post({}, '{not json');
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32700 } });
+    expect((await post({ 'Content-Type': 'text/plain' }, valid)).status).toBe(415);
+    expect((await post({ Accept: 'application/json' }, valid)).status).toBe(406);
+  });
+});
+
+describe('/mcp JSON-RPC batches', () => {
+  let hub: Server | undefined;
+  afterEach(async () => {
+    await new Promise<void>((resolve) => hub?.close(() => resolve()) ?? resolve());
+    hub = undefined;
+  });
+
+  it('refuses a batch with 400 before any message runs, so one request is one hub call', async () => {
+    let hubCalls = 0;
+    hub = createHttpServer((_req, res) => {
+      hubCalls += 1;
+      res.setHeader('Content-Type', 'application/json');
+      res.end('[]');
+    });
+    await new Promise<void>((resolve) => hub!.listen(0, '127.0.0.1', resolve));
+    // Static mode sends the process key straight to the hub; the POST path is the same.
+    await start('static', `http://127.0.0.1:${(hub.address() as { port: number }).port}`);
+    const getDevices = (id: number) => ({
+      jsonrpc: '2.0',
+      id,
+      method: 'tools/call',
+      params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+    });
+
+    const batch = await mcp(STATIC_TOKEN, [getDevices(1), getDevices(2)]);
+    expect(batch.status).toBe(400);
+    expect(await batch.json()).toMatchObject({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: expect.stringContaining('batch') }
+    });
+    expect(hubCalls).toBe(0);
+
+    // The same call on its own reaches the hub once.
+    expect((await mcp(STATIC_TOKEN, getDevices(3))).status).toBe(200);
+    expect(hubCalls).toBe(1);
+  });
+
+  it('never parses a body without a valid token', async () => {
+    await start('oauth');
+    expect((await mcp(null, [TOOLS_LIST, TOOLS_LIST])).status).toBe(401);
   });
 });
 

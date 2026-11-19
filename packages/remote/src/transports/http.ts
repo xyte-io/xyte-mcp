@@ -160,6 +160,9 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
 
   const mcpAuth: McpAuth = { staticToken, staticContext, provider, config, upstream, oauth };
   // Identify the caller before limiting, so the budget follows the grant, not the IP.
+  // Trade-off, on purpose: a throttled request still costs its token lookup, because a
+  // per-IP limit in front would also throttle valid users on a shared claude.ai or
+  // ChatGPT egress IP. Add a pre-auth IP guard if production shows store floods.
   const resolveCaller = (req: Request, res: Response, next: NextFunction) => {
     resolveIdentity(req, mcpAuth).then(
       (identity) => {

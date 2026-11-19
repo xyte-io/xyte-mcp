@@ -1290,12 +1290,15 @@ describe('XyteOAuthProvider: log events', () => {
     expect(stderr).not.toContain('user@example.com');
   });
 
-  it('logs sign_in denied for a hub error and for Deny on our consent page, failed for a broken exchange', async () => {
+  it('logs sign_in denied for access_denied and for Deny on our consent page, failed for another hub error or a broken exchange', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
     const stderr = await captureStderr(async () => {
       const denied = await approve(provider, client);
       await callback(provider, { state: denied.pending, error: 'access_denied' }, denied.cookie);
+
+      const hubError = await approve(provider, client);
+      await callback(provider, { state: hubError.pending, error: 'server_error' }, hubError.cookie);
 
       const consent = await openConsent(provider, client);
       await provider.consent(
@@ -1312,6 +1315,7 @@ describe('XyteOAuthProvider: log events', () => {
     });
     expect(eventsIn(stderr)).toEqual([
       { event: 'sign_in', outcome: 'denied' },
+      { event: 'sign_in', outcome: 'failed' },
       { event: 'sign_in', outcome: 'denied' },
       { event: 'sign_in', outcome: 'failed' }
     ]);
@@ -1373,6 +1377,27 @@ describe('XyteOAuthProvider: log events', () => {
     expect(eventsIn(stderr)).toEqual([
       { event: 'hub_refresh', connection: grantId, outcome: 'invalid_grant', hub_status: 400 },
       { event: 'revoke', connection: grantId, reason: 'invalid_grant', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('invalid_grant after someone else rotated logs hub_refresh already_rotated, not invalid_grant', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = async () => {
+      await store.rotateHubTokens(grantId, 'xort_1', {
+        accessToken: 'xoat_other',
+        refreshToken: 'xort_other',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600
+      });
+      return json(400, { error: 'invalid_grant' });
+    };
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, outcome: 'already_rotated', hub_status: 400 }
     ]);
   });
 

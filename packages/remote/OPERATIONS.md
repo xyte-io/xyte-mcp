@@ -71,8 +71,8 @@ left out.
 | Event | When | Fields |
 | --- | --- | --- |
 | `tool_call` | Every tool call | `connection`, `organization` (hub tenant id), `user` (hub user id) — OAuth mode only; `tool`; `endpoint` (catalog key of the hub request); `status` (final hub HTTP status, absent when there was no hub call or no answer); `outcome` (`ok` or `error`); `duration_ms` |
-| `sign_in` | The end of a sign-in | `outcome`: `ok` (with `connection`, `organization`, `user`), `denied` (the user said no on our consent page or at the hub), `failed` (the hub exchange broke) |
-| `hub_refresh` | The server refreshes a hub token | `connection`; `outcome`: `ok`, `rate_limited` (hub `429`, the connection is kept), `rejected` (other hub `4xx`, the connection is kept), `invalid_grant` (the hub chain is dead), `unknown` (timeout, network error, hub `5xx` or an unreadable answer: the connection ends); `hub_status` when known |
+| `sign_in` | The end of a sign-in | `outcome`: `ok` (with `connection`, `organization`, `user`), `denied` (the user said no on our consent page or at the hub), `failed` (the hub answered with an error other than `access_denied`, or the hub exchange or saving the grant failed) |
+| `hub_refresh` | The server refreshes a hub token | `connection`; `outcome`: `ok`, `rate_limited` (hub `429`, the connection is kept), `rejected` (other hub `4xx`, the connection is kept), `invalid_grant` (the hub chain is dead), `already_rotated` (hub said `invalid_grant` because another request rotated the token first; the connection is kept), `unknown` (timeout, network error, hub `5xx` or an unreadable answer: the connection ends); `hub_status` when known |
 | `revoke` | A connection ends | `connection`, `organization`, `user`; `reason`: `client` (the user disconnected), `invalid_grant` (the hub chain is dead), `refresh_unknown` (the refresh outcome was unknown) |
 
 ## Alerts
@@ -82,9 +82,9 @@ it from production data**.
 
 | Alert | Query | First guess |
 | --- | --- | --- |
-| Server down | Uptime check on `GET /healthz` | Fails 2 checks in a row. Timeout above 10 s (15 s): with a hung database the check waits up to the database pool timeout (10 s) before it answers `503`. |
+| Server down | Uptime check on `GET /healthz` | Fails 2 checks in a row. Timeout about 25 s: with a hung database the check can take up to 20 s (connect + query timeout, 10 s each) before it answers `503`. |
 | 5xx rate | Router lines with `status>=500` (this includes our own `500` and `503` answers) | More than 5% of requests over 5 minutes, with at least 20 requests |
-| Hub refresh failures | `hub_refresh` with `outcome` other than `ok` | More than 5 in 15 minutes |
+| Hub refresh failures | `hub_refresh` with `outcome` other than `ok` or `already_rotated` | More than 5 in 15 minutes |
 | Revoke spike | `revoke` events, counted by `reason` | More than 10 with a reason other than `client` in 1 hour |
 | Rate-limit hits | Router lines with `status=429` (the limits on `/register`, `/token`, `/revoke`, `/authorize`), plus `hub_refresh` with `outcome=rate_limited`, plus `tool_call` with `status=429` | More than 10 in 15 minutes |
 

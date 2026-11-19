@@ -229,7 +229,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     }
 
     if (typeof query.error === 'string') {
-      logEvent('sign_in', { outcome: 'denied' });
+      logEvent('sign_in', { outcome: query.error === 'access_denied' ? 'denied' : 'failed' });
       const description = [query.error_reason, query.error_description]
         .filter((part): part is string => typeof part === 'string' && part.length > 0)
         .join(': ');
@@ -418,11 +418,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       throw signInGone();
     }
     if (next === 'invalid_grant') {
-      logEvent('hub_refresh', { connection: grantId, outcome: 'invalid_grant', hub_status: 400 });
       const current = await this.liveHub(grantId);
       if (current && current.hub.refreshToken !== sent) {
+        logEvent('hub_refresh', { connection: grantId, outcome: 'already_rotated', hub_status: 400 });
         return current.hub.accessToken; // Someone else rotated; theirs is good.
       }
+      logEvent('hub_refresh', { connection: grantId, outcome: 'invalid_grant', hub_status: 400 });
       await this.store.revokeGrant(grantId);
       this.unsaved.delete(grantId);
       logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });

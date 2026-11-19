@@ -220,8 +220,13 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       // body-parser's errors, in the JSON-RPC shape the SDK used for them.
       const status = (error as { status?: number } | undefined)?.status;
       if (error && status === 413) {
+        // ponytail: body-parser drains the whole body before this 413; only authenticated, under-limit callers get here and Node's requestTimeout bounds it.
         const message = `Payload Too Large: Request body must not exceed ${MAX_MCP_BODY_BYTES} bytes`;
         return respondJsonRpcError(res, 413, -32000, message);
+      }
+      // A non-UTF charset, or any Content-Encoding (inflate: false).
+      if (error && status === 415) {
+        return respondJsonRpcError(res, 415, -32000, `Unsupported Media Type: ${(error as Error).message}`);
       }
       if (error) return respondJsonRpcError(res, status ?? 400, -32700, 'Parse error: Invalid JSON');
       if (Array.isArray(req.body)) {
@@ -340,9 +345,7 @@ async function handleMcp(
   const server = createServer(context);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
-    enableJsonResponse: true,
-    // Only reached without a parsed body (no body at all); kept as the backstop cap.
-    maxRequestBodySize: MAX_MCP_BODY_BYTES
+    enableJsonResponse: true
   });
   // Stateless means this pair is per-request, so it has to be torn down with the
   // response — otherwise every call leaks a transport and its listeners.

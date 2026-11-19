@@ -1,5 +1,6 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer } from 'node:net';
+import { gzipSync } from 'node:zlib';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { XyteOAuthProvider } from '../src/oauth/provider.js';
@@ -202,6 +203,20 @@ describe('/mcp body cap', () => {
     expect((await post({ 'Content-Type': 'text/plain' }, valid)).status).toBe(415);
     expect((await post({ Accept: 'application/json' }, valid)).status).toBe(406);
   });
+
+  it('answers a Content-Encoding body with 415, not a parse error', async () => {
+    await start('static');
+    const gzipped = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${STATIC_TOKEN}`, 'Content-Encoding': 'gzip' },
+      body: gzipSync(JSON.stringify(TOOLS_LIST))
+    });
+    expect(gzipped.status).toBe(415);
+    expect(await gzipped.json()).toMatchObject({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: expect.stringContaining('Unsupported Media Type') }
+    });
+  });
 });
 
 describe('/mcp JSON-RPC batches', () => {
@@ -244,7 +259,8 @@ describe('/mcp JSON-RPC batches', () => {
 
   it('never parses a body without a valid token', async () => {
     await start('oauth');
-    expect((await mcp(null, [TOOLS_LIST, TOOLS_LIST])).status).toBe(401);
+    // A pre-auth parse would answer this with 400.
+    expect((await mcp(null, '{not json')).status).toBe(401);
   });
 });
 

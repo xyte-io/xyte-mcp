@@ -1,6 +1,6 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { logError } from '@xyteai/mcp/log.js';
+import { log, logError } from '@xyteai/mcp/log.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -14,16 +14,33 @@ import {
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * Three tables, created at boot with IF NOT EXISTS instead of a migration
- * framework: this service owns its whole schema and the schema is additive —
- * columns are only ever added (nullable), never dropped, so from this release
- * on, rolling back to an older build still boots against a newer database
- * (a pre-release database needs its tables dropped once — see the README).
- * Client metadata is one jsonb blob because the server never queries inside
- * it — it goes back to the SDK exactly as registered.
+ * This service owns its whole schema: three tables, built at boot by the
+ * ordered MIGRATIONS below (see migrateOAuthSchema). Client metadata is one
+ * jsonb blob because the server never queries inside it — it goes back to the
+ * SDK exactly as registered.
  */
 
-const SCHEMA = `
+/**
+ * The schema history, oldest first; a migration's version is its index + 1.
+ * Append only — never edit or reorder a shipped entry.
+ *
+ * Each entry says whether it keeps the README promise "rolling back to an
+ * older build still boots": adding a table, a nullable column or an index
+ * keeps it (`breaksRollback: false`); dropping, renaming or tightening
+ * anything an older build reads breaks it (`true`), and an older build then
+ * refuses to boot instead of running against a schema it does not know.
+ *
+ * All pending migrations run in one transaction, so a statement that cannot
+ * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
+ * Postgres) is not allowed here. The pool's 10 s query_timeout bounds each
+ * migration statement and the wait for the lock.
+ */
+export const MIGRATIONS: ReadonlyArray<{ sql: string; breaksRollback: boolean }> = [
+  // 1 — the original schema. Keeps rollback (it is the baseline). IF NOT EXISTS,
+  // so a database created before versioning is adopted as version 1 untouched.
+  {
+    breaksRollback: false,
+    sql: `
   CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id  text PRIMARY KEY,
     data       jsonb NOT NULL,
@@ -57,10 +74,80 @@ const SCHEMA = `
   -- The sibling check on revoke (hasLiveHubSibling) joins on both.
   CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
   CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
-`;
+`
+  }
+];
 
-/** Arbitrary, constant: the advisory lock serializing schema creation. */
+/** Arbitrary, constant: the advisory lock serializing schema migrations. */
 const SCHEMA_LOCK_ID = 674_601;
+
+/**
+ * Brings the schema up to the newest migration this build knows, once per
+ * version, under a transaction-scoped advisory lock: two boots on one database
+ * (preboot, a one-off dyno) take turns, and the second finds nothing to do.
+ * Everything runs in one transaction, so a failure leaves the database exactly
+ * as it was and throws, which stops the boot.
+ */
+export async function migrateOAuthSchema(
+  pool: pg.Pool,
+  migrations: ReadonlyArray<{ sql: string; breaksRollback: boolean }> = MIGRATIONS
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    try {
+      await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
+      await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
+        version         integer PRIMARY KEY,
+        breaks_rollback boolean NOT NULL DEFAULT false,
+        applied_at      timestamptz NOT NULL DEFAULT now()
+      )`);
+      const applied = (
+        await client.query<{ version: number; breaks_rollback: boolean }>(
+          'SELECT version, breaks_rollback FROM oauth_schema_migrations ORDER BY version'
+        )
+      ).rows;
+      const newer = applied.filter((row) => row.version > migrations.length);
+      const blocking = newer.find((row) => row.breaks_rollback);
+      if (blocking) {
+        throw new Error(
+          `OAuth store schema version ${blocking.version} is newer than this build and cannot be rolled back to; deploy a build that knows it`
+        );
+      }
+      if (newer.length) {
+        log(
+          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; it keeps rollback, booting`
+        );
+      }
+      const appliedVersions = new Set(applied.map((row) => row.version));
+      for (const [index, migration] of migrations.entries()) {
+        const version = index + 1;
+        if (appliedVersions.has(version)) continue;
+        try {
+          await client.query(migration.sql);
+          await client.query(
+            'INSERT INTO oauth_schema_migrations (version, breaks_rollback) VALUES ($1, $2)',
+            [version, migration.breaksRollback]
+          );
+        } catch (error) {
+          throw new Error(
+            `OAuth store schema migration ${version} failed: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error }
+          );
+        }
+        log(`OAuth store schema migrated to version ${version}`);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      // A failed ROLLBACK (connection gone) must not hide the migration error;
+      // the server rolls the transaction back on disconnect anyway.
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  } finally {
+    client.release();
+  }
+}
 
 /**
  * An `sslmode` in the DSN decides on its own (pg lets it override this option
@@ -111,10 +198,12 @@ export class PgOAuthStore implements OAuthStore {
     // An idle client dropped server-side (maintenance, failover) is emitted here;
     // unhandled, it exits the process. The pool replaces the client on its own.
     pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
-    // One multi-statement query runs as one transaction, so the xact lock holds
-    // for all of it: two boots on an empty database (preboot, a one-off dyno)
-    // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
-    await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+    try {
+      await migrateOAuthSchema(pool);
+    } catch (error) {
+      await pool.end();
+      throw error;
+    }
     return new PgOAuthStore(pool);
   }
 

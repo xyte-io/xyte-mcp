@@ -440,8 +440,9 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   nothing dropped), so from this release on, rolling back to an older build still boots (a
   pre-release database needs the one-time drop under [Deploy it](#deploy-it)). TLS to a
   non-local database verifies the certificate (chain and hostname) against Node's CA bundle
-  plus `NODE_EXTRA_CA_CERTS` (the Procfile points it at the system bundle, which holds
-  Heroku Postgres's CAs), or a DSN `sslmode=verify-full&sslrootcert=<pem path>`. A compose
+  plus `NODE_EXTRA_CA_CERTS`, one PEM file added to Node's built-in CAs (the Procfile
+  defaults it to the system bundle, which holds Heroku Postgres's CAs; a config var of the
+  same name replaces that path), or a DSN `sslmode=verify-full&sslrootcert=<pem path>`. A compose
   or CI database without TLS takes `sslmode=disable`. `PGSSLMODE=no-verify` skips the check
   — an explicit, accepted MITM risk. A missing or wrong CA stops the boot with a message
   naming these options.

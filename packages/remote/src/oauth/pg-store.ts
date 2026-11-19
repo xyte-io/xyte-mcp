@@ -65,9 +65,10 @@ const SCHEMA_LOCK_ID = 674_601;
 
 /**
  * TLS verifies the server certificate (chain and hostname) by default, against
- * Node's CA bundle plus NODE_EXTRA_CA_CERTS. Heroku's Postgres plans present
- * AWS RDS-issued certificates whose CAs are in the platform's system bundle,
- * which the Procfile loads that way. A DSN `sslmode` (e.g. `disable` for a
+ * Node's CA bundle plus NODE_EXTRA_CA_CERTS (one PEM file). Heroku's Postgres
+ * plans present AWS RDS-issued certificates whose CAs are in the platform's
+ * system bundle, which the Procfile loads that way unless a config var of the
+ * same name replaces it. A DSN `sslmode` (e.g. `disable` for a
  * compose or CI host) still wins: pg applies it over this option. A local
  * database gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
  * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
@@ -86,10 +87,15 @@ export function bootConnectionHints(error: unknown): string[] {
   if (code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
     return ["The DATABASE_URL host must match a name on the server's certificate."];
   }
+  if (code === 'CERT_HAS_EXPIRED' || code === 'CERT_NOT_YET_VALID') {
+    return [
+      "The server certificate is expired or not yet valid — check the database's certificate, or this machine's clock."
+    ];
+  }
   // Node's verification codes: SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_VERIFY_LEAF_SIGNATURE, …
   if (code && /CERT|SIGNATURE/.test(code)) {
     return [
-      "Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path>, or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.",
+      "Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.",
       'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk).'
     ];
   }

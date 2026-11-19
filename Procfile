@@ -11,4 +11,5 @@
 #
 # NODE_EXTRA_CA_CERTS: Node does not read the system CA bundle on its own, and that
 # bundle holds the CAs of Heroku Postgres's certificates, which the server verifies.
-web: NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt node packages/remote/dist/index.js
+# A config var of the same name replaces this default.
+web: NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-/usr/lib/ssl/certs/ca-certificates.crt} node packages/remote/dist/index.js

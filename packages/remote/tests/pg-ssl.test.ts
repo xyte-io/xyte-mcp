@@ -47,6 +47,16 @@ describe('bootConnectionHints', () => {
     }
   );
 
+  it.each(['CERT_HAS_EXPIRED', 'CERT_NOT_YET_VALID'])(
+    'points a certificate outside its validity window (%s) at the certificate and clock',
+    (code) => {
+      const hints = bootConnectionHints(errorWithCode(code));
+      expect(hints).toHaveLength(1);
+      expect(hints[0]).toMatch(/expired or not yet valid/);
+      expect(hints[0]).not.toMatch(/NODE_EXTRA_CA_CERTS/);
+    }
+  );
+
   it('points a hostname mismatch at the DATABASE_URL host', () => {
     const hints = bootConnectionHints(errorWithCode('ERR_TLS_CERT_ALTNAME_INVALID'));
     expect(hints).toHaveLength(1);

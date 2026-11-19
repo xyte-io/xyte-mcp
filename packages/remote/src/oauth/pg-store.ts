@@ -70,12 +70,21 @@ const SCHEMA_LOCK_ID = 674_601;
  * system bundle, which the Procfile loads that way unless a config var of the
  * same name replaces it. A DSN `sslmode` (e.g. `disable` for a
  * compose or CI host) still wins: pg applies it over this option. A local
- * database gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
+ * database (the `host` param, which pg prefers over the URL host, or a unix
+ * socket) gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
  * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
+ * A DSN that URL can't parse but pg can (`postgres://u:p@/db?host=/socket`)
+ * is left to pg too.
  */
 export function sslOption(databaseUrl: string): { ssl?: true } {
-  const url = new URL(databaseUrl);
-  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
+  let host: string;
+  try {
+    const url = new URL(databaseUrl);
+    host = url.searchParams.get('host') ?? url.hostname;
+  } catch {
+    return {};
+  }
+  if (host === 'localhost' || host === '127.0.0.1' || host.startsWith('/')) return {};
   if (process.env.PGSSLMODE === 'no-verify' || process.env.PGSSLMODE === 'disable') return {};
   return { ssl: true };
 }
@@ -96,11 +105,11 @@ export function bootConnectionHints(error: unknown): string[] {
   if (code && /CERT|SIGNATURE/.test(code)) {
     return [
       "Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.",
-      'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk).'
+      'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk); if DATABASE_URL carries an sslmode, use sslmode=no-verify there instead.'
     ];
   }
   if (error instanceof Error && /does not support SSL/.test(error.message)) {
-    return ['A local database without TLS: add sslmode=disable to DATABASE_URL.'];
+    return ['A database without TLS: add sslmode=disable to DATABASE_URL.'];
   }
   return [];
 }

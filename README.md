@@ -257,6 +257,9 @@ An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
 unless `XYTE_MCP_ALLOW_WRITES=1`, so `XYTE_MCP_READ_ONLY=1` is no longer needed there.
 
+This build verifies the Postgres certificate; if the boot stops on it, `PGSSLMODE=no-verify`
+restores the old behaviour while the CA is sorted out.
+
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
 drop its three tables (`oauth_tokens`, `oauth_grants`, `oauth_clients`) once before this
 build starts; it recreates them at boot.
@@ -445,7 +448,9 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   same name replaces that path), or a DSN `sslmode=verify-full&sslrootcert=<pem path>`. A compose
   or CI database without TLS takes `sslmode=disable`. `PGSSLMODE=no-verify` skips the check
   — an explicit, accepted MITM risk. A missing or wrong CA stops the boot with a message
-  naming these options.
+  naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
+  one-off dyno (`heroku run`) needs it as a config var
+  (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the

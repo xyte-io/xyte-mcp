@@ -18,6 +18,19 @@ describe('sslOption', () => {
     expect(sslOption('postgres://u:p@127.0.0.1:5432/db')).toEqual({});
   });
 
+  // pg lets a `host` query param override the URL host: that is where it connects.
+  it('decides on the host param over the URL host', () => {
+    delete process.env.PGSSLMODE;
+    expect(sslOption('postgres://u:p@localhost/db?host=db.example.com')).toEqual({ ssl: true });
+    expect(sslOption('postgres://u:p@db.example.com/db?host=127.0.0.1')).toEqual({});
+  });
+
+  it('leaves a unix socket to pg (no TLS)', () => {
+    delete process.env.PGSSLMODE;
+    expect(sslOption('postgres://u:p@/db?host=/var/run/postgresql')).toEqual({});
+    expect(sslOption('postgres://u:p@localhost/db?host=/var/run/postgresql')).toEqual({});
+  });
+
   it('verifies the certificate of a remote database', () => {
     delete process.env.PGSSLMODE;
     expect(sslOption(REMOTE)).toEqual({ ssl: true });
@@ -36,7 +49,9 @@ describe('sslOption', () => {
   // sslOption no longer checks the DSN: pg applies a DSN sslmode over the passed `ssl`.
   it.each([
     ['disable', false],
-    ['no-verify', { rejectUnauthorized: false }]
+    ['no-verify', { rejectUnauthorized: false }],
+    // pg 8 treats require as verify-full ({} keeps rejectUnauthorized on); pg 9 weakens it.
+    ['require', {}]
   ])('lets a DSN sslmode=%s win in pg', (mode, expected) => {
     delete process.env.PGSSLMODE;
     const connectionString = `${REMOTE}?sslmode=${mode}`;
@@ -58,6 +73,7 @@ describe('bootConnectionHints', () => {
       const hints = bootConnectionHints(errorWithCode(code));
       expect(hints[0]).toMatch(/NODE_EXTRA_CA_CERTS/);
       expect(hints[1]).toMatch(/PGSSLMODE=no-verify/);
+      expect(hints[1]).toMatch(/sslmode=no-verify there/);
     }
   );
 
@@ -80,7 +96,7 @@ describe('bootConnectionHints', () => {
 
   it('points a server without TLS at sslmode=disable', () => {
     expect(bootConnectionHints(new Error('The server does not support SSL connections'))).toEqual([
-      expect.stringMatching(/sslmode=disable/)
+      'A database without TLS: add sslmode=disable to DATABASE_URL.'
     ]);
   });
 

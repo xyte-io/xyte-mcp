@@ -20,6 +20,7 @@ import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
 import { redactText } from '@xyteai/mcp/redact.js';
 import { createServer } from '@xyteai/mcp/server.js';
 import { log, logError } from '@xyteai/mcp/log.js';
+import { logEvent } from '../log-event.js';
 
 /**
  * Remote Streamable HTTP transport.
@@ -84,14 +85,26 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // SDK's auth router refuses the X-Forwarded-For it sees on every request.
   app.set('trust proxy', 1);
 
-  // Before the auth check: a platform health probe carries no credentials, and
-  // it reveals nothing a port scan would not.
-  app.get(HEALTH_PATH, (_req, res) => {
-    res.type('text/plain').send('ok');
-  });
-
   let store: OAuthStore | undefined;
   let provider: XyteOAuthProvider | undefined;
+
+  // Before the auth check: a platform health probe carries no credentials, and
+  // it reveals nothing a port scan would not. In OAuth mode every request needs
+  // the token store, so a dead database fails the probe (and the uptime alert).
+  app.get(HEALTH_PATH, (_req, res) => {
+    void (async () => {
+      try {
+        // ponytail: a primary-key lookup through the existing interface stands in
+        // for a ping(); add one to OAuthStore if this lookup ever stops being cheap.
+        await store?.getClient('healthz');
+        res.type('text/plain').send('ok');
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        logError(`healthz: token store check failed: ${detail}`);
+        res.status(503).type('text/plain').send('unavailable');
+      }
+    })();
+  });
   if (oauth) {
     if (oauth.databaseUrl) {
       store = await PgOAuthStore.connect(oauth.databaseUrl);
@@ -241,10 +254,21 @@ interface McpAuth {
 }
 
 async function handleMcp(req: Request, res: Response, auth: McpAuth): Promise<void> {
-  const context = await authenticate(req, res, auth);
-  if (!context) return;
+  const caller = await authenticate(req, res, auth);
+  if (!caller) return;
+  const { context, who } = caller;
 
-  const server = createServer(context);
+  const server = createServer(context, {
+    onToolCall: (call) =>
+      logEvent('tool_call', {
+        ...who,
+        tool: call.tool,
+        endpoint: call.endpoint,
+        status: call.status,
+        outcome: call.isError ? 'error' : 'ok',
+        duration_ms: call.durationMs
+      })
+  });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
@@ -287,6 +311,12 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
   respondJsonRpcError(res, 401, -32001, 'unauthorized');
 }
 
+/** An authenticated caller: its tool context, and who it is for the logs (nobody in static mode). */
+interface Caller {
+  context: ToolContext;
+  who: { connection?: string; organization?: string; user?: string };
+}
+
 /**
  * The caller's identity, or undefined once a rejection is sent. Only a bad
  * token is a 401: a store outage is a retryable 503, or every connected client
@@ -296,17 +326,17 @@ async function authenticate(
   req: Request,
   res: Response,
   auth: McpAuth
-): Promise<ToolContext | undefined> {
-  let context: ToolContext | undefined;
+): Promise<Caller | undefined> {
+  let caller: Caller | undefined;
   try {
-    context = await resolveIdentity(req, auth);
+    caller = await resolveIdentity(req, auth);
   } catch (error) {
     logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
     respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
     return undefined;
   }
-  if (!context) respondUnauthorized(req, res, auth);
-  return context;
+  if (!caller) respondUnauthorized(req, res, auth);
+  return caller;
 }
 
 /**
@@ -315,14 +345,14 @@ async function authenticate(
  * per-request context carrying its grant's hub token (refreshed on demand by
  * the provider's hub client).
  */
-async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext | undefined> {
+async function resolveIdentity(req: Request, auth: McpAuth): Promise<Caller | undefined> {
   // The auth scheme is case-insensitive (RFC 7235 2.1).
   const header = req.headers.authorization ?? '';
   if (!/^bearer\s+/i.test(header)) return undefined;
   const presented = header.replace(/^bearer\s+/i, '').trim();
 
   if (auth.staticToken && auth.staticContext) {
-    return matches(presented, auth.staticToken) ? auth.staticContext : undefined;
+    return matches(presented, auth.staticToken) ? { context: auth.staticContext, who: {} } : undefined;
   }
 
   if (!auth.provider) return undefined;
@@ -335,7 +365,10 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
       { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
       auth.provider.hubHttp(hub.grantId, auth.upstream, secrets)
     );
-    return { ...context, secrets };
+    return {
+      context: { ...context, secrets },
+      who: { connection: hub.grantId, organization: hub.tenantId, user: hub.sub }
+    };
   } catch (error) {
     if (error instanceof InvalidTokenError) return undefined;
     throw error;

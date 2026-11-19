@@ -20,7 +20,14 @@ import type { HttpClient } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 import { redactText } from '@xyteai/mcp/redact.js';
-import { nowSeconds, type HubOAuth, type HubSignIn, type HubTokens } from './hub-oauth.js';
+import { logEvent } from '../log-event.js';
+import {
+  HubRefreshError,
+  nowSeconds,
+  type HubOAuth,
+  type HubSignIn,
+  type HubTokens
+} from './hub-oauth.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 
 /**
@@ -176,6 +183,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     }
 
     if (form.decision !== 'approve') {
+      logEvent('sign_in', { outcome: 'denied' });
       this.pending.delete(pendingId);
       clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
       res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
@@ -221,6 +229,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     }
 
     if (typeof query.error === 'string') {
+      logEvent('sign_in', { outcome: 'denied' });
       const description = [query.error_reason, query.error_description]
         .filter((part): part is string => typeof part === 'string' && part.length > 0)
         .join(': ');
@@ -248,6 +257,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         ...(entry.resource ? { resource: entry.resource } : {}),
         expiresAt: nowSeconds() + CODE_TTL_SECONDS
       });
+      logEvent('sign_in', {
+        outcome: 'ok',
+        connection: grantId,
+        organization: signIn.tenantId,
+        user: signIn.sub
+      });
       res.redirect(302, clientRedirect(entry, { code }));
     } catch (error) {
       // A JSON parse error quotes its input — the id_token or the response body.
@@ -258,6 +273,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
             ? error.message
             : String(error);
       logError(`hub sign-in failed: ${detail}`);
+      logEvent('sign_in', { outcome: 'failed' });
       res.redirect(
         302,
         clientRedirect(entry, { error: 'server_error', error_description: 'Xyte sign-in failed' })
@@ -376,8 +392,17 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     try {
       next = await this.hub.refresh(sent);
     } catch (error) {
+      const hubStatus = error instanceof HubRefreshError ? error.status : undefined;
       // A plain 4xx rejection ('auth') never rotated anything: keep the grant.
-      if (error instanceof XyteError && error.kind === 'auth') throw error;
+      if (error instanceof XyteError && error.kind === 'auth') {
+        logEvent('hub_refresh', {
+          connection: grantId,
+          outcome: hubStatus === 429 ? 'rate_limited' : 'rejected',
+          hub_status: hubStatus
+        });
+        throw error;
+      }
+      logEvent('hub_refresh', { connection: grantId, outcome: 'unknown', hub_status: hubStatus });
       // Timeout, network, 5xx or an unreadable 200: hub may have rotated and
       // burned `sent`. A replay inside hub's 60 s window only gets invalid_grant
       // (no pair), and one after it ends the user's sign-in — so `sent` is never
@@ -389,17 +414,21 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       );
       await this.store.revokeGrant(grantId);
       this.unsaved.delete(grantId);
+      logEvent('revoke', { ...whoOf(grantId, hub), reason: 'refresh_unknown' });
       throw signInGone();
     }
     if (next === 'invalid_grant') {
+      logEvent('hub_refresh', { connection: grantId, outcome: 'invalid_grant', hub_status: 400 });
       const current = await this.liveHub(grantId);
       if (current && current.hub.refreshToken !== sent) {
         return current.hub.accessToken; // Someone else rotated; theirs is good.
       }
       await this.store.revokeGrant(grantId);
       this.unsaved.delete(grantId);
+      logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });
       throw signInGone();
     }
+    logEvent('hub_refresh', { connection: grantId, outcome: 'ok' });
     await this.saveHubTokens(grantId, stored, next);
     return next.accessToken;
   }
@@ -522,7 +551,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     if (!grant?.hub || grant.revoked) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
-    const hub: HubIdentity = { grantId: grant.id, accessToken: grant.hub.accessToken };
+    const hub: HubIdentity = {
+      grantId: grant.id,
+      accessToken: grant.hub.accessToken,
+      tenantId: grant.hub.tenantId,
+      sub: grant.hub.sub
+    };
     return {
       token,
       clientId: grant.clientId,
@@ -558,6 +592,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           const hub = (await this.liveHub(grant.id))?.hub;
           await this.store.revokeGrant(grant.id);
           this.unsaved.delete(grant.id);
+          logEvent('revoke', { ...whoOf(grant.id, hub), reason: 'client' });
           if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
             await this.hub.revoke(hub.refreshToken);
           }
@@ -617,12 +652,20 @@ export interface HubIdentity {
   grantId: string;
   /** As stored at verify time; hubHttp sends the current one, possibly refreshed. */
   accessToken: string;
+  /** Hub organization and user of the sign-in, for log attribution only. */
+  tenantId: string;
+  sub: string;
 }
 
 export function hubIdentityOf(auth: AuthInfo): HubIdentity {
   const hub = auth.extra?.hub as HubIdentity | undefined;
   if (!hub) throw new InvalidTokenError('token carries no hub identity');
   return hub;
+}
+
+/** A grant's log identity: the connection, plus its organization and user when known. */
+function whoOf(grantId: string, hub: HubSignIn | undefined) {
+  return { connection: grantId, organization: hub?.tenantId, user: hub?.sub };
 }
 
 function signInGone(): XyteError {

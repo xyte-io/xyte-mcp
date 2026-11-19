@@ -338,6 +338,19 @@ describe('http transport', () => {
     const result = response.result as { isError?: boolean; structuredContent?: { count: number } };
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent?.count).toBeGreaterThan(0);
+
+    // One shared identity in this mode, so the line carries none.
+    await server.waitForStderr('"event":"tool_call"');
+    const line = server.stderr
+      .join('')
+      .split('\n')
+      .find((entry) => entry.includes('"event":"tool_call"'))!;
+    expect(JSON.parse(line)).toEqual({
+      event: 'tool_call',
+      tool: 'xyte_endpoints_list',
+      outcome: 'ok',
+      duration_ms: expect.any(Number)
+    });
   });
 
   // Hosted is read-only unless writes are asked for; stdio keeps writes on.
@@ -425,6 +438,34 @@ describe('http transport: token store outage', () => {
       }
     } finally {
       getToken.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  // The uptime check on /healthz is the "server down" alert, so a dead database must fail it.
+  it('checks the database on /healthz: ok while it answers, a generic 503 when it does not', async () => {
+    const port = await freePort();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    const getClient = vi.spyOn(MemoryOAuthStore.prototype, 'getClient');
+    try {
+      const healthy = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(healthy.status).toBe(200);
+      expect(await healthy.text()).toBe('ok');
+      expect(getClient).toHaveBeenCalled();
+
+      getClient.mockRejectedValue(new Error('connect ECONNREFUSED db.internal:5432'));
+      const down = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(down.status).toBe(503);
+      expect(await down.text()).toBe('unavailable');
+    } finally {
+      getClient.mockRestore();
+      stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
   });

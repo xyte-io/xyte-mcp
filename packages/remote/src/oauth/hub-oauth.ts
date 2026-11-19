@@ -139,10 +139,7 @@ export function createHubOAuth(options: {
       }
       const error = await errorOf(response);
       if (response.status === 400 && error === 'invalid_grant') return 'invalid_grant';
-      throw new XyteError(
-        response.status >= 500 ? 'network' : 'auth',
-        `hub token refresh failed: ${response.status} ${error}`
-      );
+      throw new HubRefreshError(response.status, error);
     },
 
     /** Best effort: a failure is logged, never surfaced to the disconnecting client. */
@@ -158,6 +155,17 @@ export function createHubOAuth(options: {
       }
     }
   };
+}
+
+/** Hub answered a refresh with an error status; 5xx leaves it unknown whether hub rotated. */
+export class HubRefreshError extends XyteError {
+  constructor(
+    readonly status: number,
+    error: string
+  ) {
+    super(status >= 500 ? 'network' : 'auth', `hub token refresh failed: ${status} ${error}`);
+    this.name = 'HubRefreshError';
+  }
 }
 
 /** The RFC 6749 5.2 `error` code only — never the body, which could echo a credential. */

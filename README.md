@@ -444,7 +444,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   rolling back to an older build still boots: adding tables, nullable columns or indexes
   keeps it; dropping, renaming or tightening breaks it. An older build boots against a
   newer schema that keeps the promise, and refuses to boot (naming the version) against
-  one that breaks it. A database created before versioning is adopted as version 1 with
+  one that breaks it. A build from before versioning does not check, so never roll back
+  past this release once a breaking migration has run. A database created before versioning is adopted as version 1 with
   its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.

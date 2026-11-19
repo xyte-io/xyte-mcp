@@ -214,7 +214,7 @@ describe('/mcp body cap', () => {
     expect(gzipped.status).toBe(415);
     expect(await gzipped.json()).toMatchObject({
       jsonrpc: '2.0',
-      error: { code: -32000, message: expect.stringContaining('Unsupported Media Type') }
+      error: { code: -32000, message: 'Unsupported Media Type: send uncompressed UTF-8 JSON' }
     });
   });
 });

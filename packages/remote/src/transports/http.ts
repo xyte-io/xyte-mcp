@@ -218,7 +218,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     if (!identity) return respondUnauthorized(req, res, mcpAuth);
     parseMcpBody(req, res, (error?: unknown) => {
       // body-parser's errors, in the JSON-RPC shape the SDK used for them.
-      const status = (error as { status?: number } | undefined)?.status;
+      const { status, type } = (error ?? {}) as { status?: number; type?: string };
       if (error && status === 413) {
         // ponytail: body-parser drains the whole body before this 413; only authenticated, under-limit callers get here and Node's requestTimeout bounds it.
         const message = `Payload Too Large: Request body must not exceed ${MAX_MCP_BODY_BYTES} bytes`;
@@ -226,9 +226,14 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       }
       // A non-UTF charset, or any Content-Encoding (inflate: false).
       if (error && status === 415) {
-        return respondJsonRpcError(res, 415, -32000, `Unsupported Media Type: ${(error as Error).message}`);
+        // Fixed text: body-parser's message quotes the caller's charset / encoding back.
+        return respondJsonRpcError(res, 415, -32000, 'Unsupported Media Type: send uncompressed UTF-8 JSON');
       }
-      if (error) return respondJsonRpcError(res, status ?? 400, -32700, 'Parse error: Invalid JSON');
+      if (error && type === 'entity.parse.failed') {
+        return respondJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
+      }
+      // Aborted or short reads, stream errors: not the caller's JSON, so not -32700.
+      if (error) return respondJsonRpcError(res, status ?? 400, -32603, 'Internal error: could not read the request body');
       if (Array.isArray(req.body)) {
         const message = 'Invalid Request: JSON-RPC batching is not supported, send one message per request';
         return respondJsonRpcError(res, 400, -32600, message);

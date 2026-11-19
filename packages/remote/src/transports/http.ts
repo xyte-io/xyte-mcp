@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Server } from 'node:http';
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
@@ -59,6 +60,17 @@ const CALLBACK_PATH = '/oauth/callback';
 
 /** Caller-controlled strings are capped before they reach the log stream. */
 const MAX_LOGGED_PATH = 64;
+
+// In-memory limits: one dyno today; a shared store comes with the multi-dyno work.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+/** Per OAuth grant (one connection), not per IP: claude.ai and ChatGPT call from shared backend IPs. */
+const MCP_CALLS_PER_GRANT_PER_MINUTE = 60;
+/** Requests without a valid token, per IP: room for one 401 per connection per hour on a shared IP. */
+const MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE = 300;
+/** Per IP; a real sign-in hits the callback once. */
+const CALLBACK_CALLS_PER_IP_PER_MINUTE = 30;
+/** No catalog endpoint takes a file or base64 body; the SDK default is 4 MiB. */
+const MAX_MCP_BODY_BYTES = 1024 * 1024;
 
 /** Under Heroku's 30 s SIGTERM-to-SIGKILL window. */
 const SHUTDOWN_DEADLINE_MS = 28_000;
@@ -135,13 +147,63 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     app.post(CONSENT_PATH, express.urlencoded({ extended: false }), (req, res) => {
       void flow.consent(req, res).catch((error: unknown) => failFlow(res, error));
     });
-    app.get(CALLBACK_PATH, (req, res) => {
+    const callbackRateLimit = rateLimit({
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      limit: CALLBACK_CALLS_PER_IP_PER_MINUTE,
+      standardHeaders: 'draft-8',
+      legacyHeaders: false
+    });
+    app.get(CALLBACK_PATH, callbackRateLimit, (req, res) => {
       void flow.callback(req, res).catch((error: unknown) => failFlow(res, error));
     });
   }
 
-  app.post(MCP_PATH, (req, res) => {
-    void handleMcp(req, res, { staticToken, staticContext, provider, config, upstream, oauth });
+  const mcpAuth: McpAuth = { staticToken, staticContext, provider, config, upstream, oauth };
+  // Identify the caller before limiting, so the budget follows the grant, not the IP.
+  const resolveCaller = (req: Request, res: Response, next: NextFunction) => {
+    resolveIdentity(req, mcpAuth).then(
+      (identity) => {
+        res.locals.identity = identity;
+        next();
+      },
+      (error: unknown) => {
+        // Only a bad token is a 401: a store outage is a retryable 503, or every
+        // connected client would drop its tokens and restart the OAuth flow.
+        logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
+        respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
+      }
+    );
+  };
+  const identityOf = (res: Response) => res.locals.identity as McpIdentity | undefined;
+  const mcpRateLimit = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: (_req, res) =>
+      identityOf(res)
+        ? MCP_CALLS_PER_GRANT_PER_MINUTE
+        : MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE,
+    keyGenerator: (req, res) => {
+      const identity = identityOf(res);
+      return identity ? `grant:${identity.grantId}` : ipKeyGenerator(req.ip ?? '');
+    },
+    // The static bearer is one shared dev/CI identity, so it is not limited.
+    skip: (_req, res) => {
+      const identity = identityOf(res);
+      return identity !== undefined && identity.grantId === undefined;
+    },
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    // A flooded IP sees this instead of the 401 until its window ends.
+    handler: (req, res) => {
+      const grantId = identityOf(res)?.grantId;
+      logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
+      respondJsonRpcError(res, 429, -32000, 'rate limit exceeded, retry later');
+    }
+  });
+
+  app.post(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+    const identity = identityOf(res);
+    if (!identity) return respondUnauthorized(req, res, mcpAuth);
+    void handleMcp(req, res, identity.context);
   });
 
   // POST is the whole protocol here, and the spec lets a server say so.
@@ -151,15 +213,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // parks an idle stream on the dyno until Heroku's 55s router timeout kills
   // it, and reconnects. DELETE is the same kind of lie: it reports 200 for
   // terminating a session that was never created.
-  app.all(MCP_PATH, (req, res) => {
-    void (async () => {
-      // Auth first, as on POST: an unauthenticated caller learns nothing about
-      // the endpoint, not even which methods it supports.
-      const auth = { staticToken, staticContext, provider, config, upstream, oauth };
-      if (!(await authenticate(req, res, auth))) return;
-      res.setHeader('Allow', 'POST');
-      respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
-    })();
+  app.all(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+    // Auth first, as on POST: an unauthenticated caller learns nothing about
+    // the endpoint, not even which methods it supports.
+    if (!identityOf(res)) return respondUnauthorized(req, res, mcpAuth);
+    res.setHeader('Allow', 'POST');
+    respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
   });
 
   app.use((_req, res) => {
@@ -240,14 +299,19 @@ interface McpAuth {
   oauth?: { issuerUrl: string };
 }
 
-async function handleMcp(req: Request, res: Response, auth: McpAuth): Promise<void> {
-  const context = await authenticate(req, res, auth);
-  if (!context) return;
+/** A verified caller; `grantId` is absent for the shared static bearer. */
+interface McpIdentity {
+  context: ToolContext;
+  grantId?: string;
+}
 
+async function handleMcp(req: Request, res: Response, context: ToolContext): Promise<void> {
   const server = createServer(context);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
-    enableJsonResponse: true
+    enableJsonResponse: true,
+    // Answered 413 (JSON-RPC) before anything is parsed.
+    maxRequestBodySize: MAX_MCP_BODY_BYTES
   });
   // Stateless means this pair is per-request, so it has to be torn down with the
   // response — otherwise every call leaks a transport and its listeners.
@@ -288,41 +352,19 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
 }
 
 /**
- * The caller's identity, or undefined once a rejection is sent. Only a bad
- * token is a 401: a store outage is a retryable 503, or every connected client
- * would drop its tokens and restart the OAuth flow.
- */
-async function authenticate(
-  req: Request,
-  res: Response,
-  auth: McpAuth
-): Promise<ToolContext | undefined> {
-  let context: ToolContext | undefined;
-  try {
-    context = await resolveIdentity(req, auth);
-  } catch (error) {
-    logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
-    respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
-    return undefined;
-  }
-  if (!context) respondUnauthorized(req, res, auth);
-  return context;
-}
-
-/**
  * Map the presented bearer to an identity: in static mode the token to the
  * shared process context (constant-time compare), in OAuth mode a token to a
  * per-request context carrying its grant's hub token (refreshed on demand by
  * the provider's hub client).
  */
-async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext | undefined> {
+async function resolveIdentity(req: Request, auth: McpAuth): Promise<McpIdentity | undefined> {
   // The auth scheme is case-insensitive (RFC 7235 2.1).
   const header = req.headers.authorization ?? '';
   if (!/^bearer\s+/i.test(header)) return undefined;
   const presented = header.replace(/^bearer\s+/i, '').trim();
 
   if (auth.staticToken && auth.staticContext) {
-    return matches(presented, auth.staticToken) ? auth.staticContext : undefined;
+    return matches(presented, auth.staticToken) ? { context: auth.staticContext } : undefined;
   }
 
   if (!auth.provider) return undefined;
@@ -335,7 +377,7 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<ToolContext
       { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
       auth.provider.hubHttp(hub.grantId, auth.upstream, secrets)
     );
-    return { ...context, secrets };
+    return { context: { ...context, secrets }, grantId: hub.grantId };
   } catch (error) {
     if (error instanceof InvalidTokenError) return undefined;
     throw error;

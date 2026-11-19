@@ -9,12 +9,13 @@
  *
  * Static-bearer mode asserts the positives (health, handshake, tool list, a
  * real read with the configured key) *and* the denials that fail silently
- * otherwise: no token, wrong token, unknown path, and a mutating endpoint on a
- * read-only server. Pass `--expect-writes` for a deploy that opted into writes
+ * otherwise: no token (with rate-limit headers), wrong token, unknown path, a
+ * body over the 1 MiB cap, and a mutating endpoint on a read-only server. Pass `--expect-writes` for a deploy that opted into writes
  * (`XYTE_MCP_ALLOW_WRITES=1`); the write probe then never runs.
  *
  * OAuth mode needs no token and smokes the browser-free part of the flow:
- * discovery metadata, the 401 challenge pointing at it, dynamic registration,
+ * discovery metadata, the 401 challenge pointing at it (with rate-limit
+ * headers), dynamic registration,
  * the consent page for a valid PKCE request, refusal of an unregistered
  * redirect_uri, a junk bearer, health and unknown paths. Signing in happens at
  * hub in a browser, so the rest is verified by connecting a real client.
@@ -41,6 +42,8 @@ const MCP_HEADERS = {
 const PROTOCOL_VERSION = '2025-06-18';
 const TIMEOUT_MS = 20_000;
 const JUNK_TOKEN = 'xmcp_not_a_token_0123456789abcdef';
+/** The server's /mcp body cap. */
+const MAX_BODY_BYTES = 1024 * 1024;
 
 async function readStdin() {
   const chunks = [];
@@ -161,7 +164,8 @@ check('POST with no token is 401', async ({ base, oauth }) => {
     // A challenge sends mcp-remote off to a browser OAuth flow that does not exist.
     throw new Error('unexpected WWW-Authenticate challenge on 401');
   }
-  return oauth ? '401 with resource-metadata challenge' : '401, no challenge';
+  if (!response.headers.get('ratelimit-policy')) throw new Error('no RateLimit-Policy header');
+  return oauth ? '401 with resource-metadata challenge, rate-limited' : '401, no challenge, rate-limited';
 });
 
 check('POST with a token that is not ours is 401', async ({ base }) => {
@@ -257,6 +261,20 @@ check(
       if (response.status !== 405) throw new Error(`${method}: expected 405, got ${response.status}`);
     }
     return '405 on both';
+  },
+  { mode: 'static' }
+);
+
+check(
+  'a body over the 1 MiB cap is 413',
+  async (ctx) => {
+    const response = await request(`${ctx.base}/mcp`, {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${ctx.token}` },
+      body: 'x'.repeat(MAX_BODY_BYTES + 1)
+    });
+    if (response.status !== 413) throw new Error(`expected 413, got ${response.status}`);
+    return '413';
   },
   { mode: 'static' }
 );

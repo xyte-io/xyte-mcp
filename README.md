@@ -448,7 +448,11 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Rate limits.** Per IP (behind Heroku's router, `trust proxy` 1): `/register` 1000/hour,
   `/token` 2000 and `/revoke` 500 per 15 minutes, `/authorize` the SDK's 100 per 15 minutes.
   The first three are raised from the SDK defaults because claude.ai and ChatGPT call them
-  from shared backend IPs.
+  from shared backend IPs. `/mcp` allows 60 calls a minute per connection (OAuth grant) and
+  300 a minute per IP for requests without a valid token; over that it answers 429 with
+  `Retry-After`, so a flooded IP sees 429 instead of 401 for up to a minute. `/oauth/callback`
+  allows 30 a minute per IP. Counters are in memory (one dyno). An `/mcp` body over 1 MiB is
+  a 413.
 
 **Registering at hub.** Once per hub environment, from a hub console:
 

@@ -1,3 +1,4 @@
+import pg from 'pg';
 import { afterEach, describe, expect, it } from 'vitest';
 import { isXyteError } from '@xyteai/mcp/http/errors.js';
 import { bootConnectionHints, PgOAuthStore, sslOption } from '../src/oauth/pg-store.js';
@@ -30,6 +31,19 @@ describe('sslOption', () => {
   it('keeps verifying on any other PGSSLMODE value', () => {
     process.env.PGSSLMODE = 'noverify';
     expect(sslOption(REMOTE)).toEqual({ ssl: true });
+  });
+
+  // sslOption no longer checks the DSN: pg applies a DSN sslmode over the passed `ssl`.
+  it.each([
+    ['disable', false],
+    ['no-verify', { rejectUnauthorized: false }]
+  ])('lets a DSN sslmode=%s win in pg', (mode, expected) => {
+    delete process.env.PGSSLMODE;
+    const connectionString = `${REMOTE}?sslmode=${mode}`;
+    const client = new pg.Client({ connectionString, ...sslOption(connectionString) });
+    expect((client as unknown as { connectionParameters: { ssl: unknown } }).connectionParameters.ssl).toEqual(
+      expected
+    );
   });
 });
 

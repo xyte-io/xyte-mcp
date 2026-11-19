@@ -80,8 +80,12 @@ export function sslOption(databaseUrl: string): { ssl?: true } {
 }
 
 /** What to try when the boot connection fails, by the kind of failure. */
-function bootConnectionHints(error: unknown): string[] {
+export function bootConnectionHints(error: unknown): string[] {
   const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  // A trusted certificate for another name: no CA setting fixes that.
+  if (code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+    return ["The DATABASE_URL host must match a name on the server's certificate."];
+  }
   // Node's verification codes: SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_VERIFY_LEAF_SIGNATURE, …
   if (code && /CERT|SIGNATURE/.test(code)) {
     return [
@@ -141,7 +145,7 @@ export class PgOAuthStore implements OAuthStore {
       const message = error instanceof Error ? error.message : String(error);
       throw new XyteError(
         'config',
-        `Postgres connection failed at boot: ${message}`,
+        `Postgres setup failed at boot: ${message}`,
         bootConnectionHints(error)
       );
     }

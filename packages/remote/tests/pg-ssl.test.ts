@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { isXyteError } from '@xyteai/mcp/http/errors.js';
-import { PgOAuthStore, sslOption } from '../src/oauth/pg-store.js';
+import { bootConnectionHints, PgOAuthStore, sslOption } from '../src/oauth/pg-store.js';
 
 const REMOTE = 'postgres://u:p@db.example.com:5432/db';
 const SAVED_PGSSLMODE = process.env.PGSSLMODE;
@@ -33,12 +33,44 @@ describe('sslOption', () => {
   });
 });
 
+function errorWithCode(code: string, message = code): Error {
+  return Object.assign(new Error(message), { code });
+}
+
+describe('bootConnectionHints', () => {
+  it.each(['SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'])(
+    'points an untrusted certificate (%s) at the CA settings',
+    (code) => {
+      const hints = bootConnectionHints(errorWithCode(code));
+      expect(hints[0]).toMatch(/NODE_EXTRA_CA_CERTS/);
+      expect(hints[1]).toMatch(/PGSSLMODE=no-verify/);
+    }
+  );
+
+  it('points a hostname mismatch at the DATABASE_URL host', () => {
+    const hints = bootConnectionHints(errorWithCode('ERR_TLS_CERT_ALTNAME_INVALID'));
+    expect(hints).toHaveLength(1);
+    expect(hints[0]).toMatch(/DATABASE_URL host/);
+    expect(hints[0]).not.toMatch(/NODE_EXTRA_CA_CERTS/);
+  });
+
+  it('points a server without TLS at sslmode=disable', () => {
+    expect(bootConnectionHints(new Error('The server does not support SSL connections'))).toEqual([
+      expect.stringMatching(/sslmode=disable/)
+    ]);
+  });
+
+  it('gives no hint for a refused connection', () => {
+    expect(bootConnectionHints(errorWithCode('ECONNREFUSED', 'connect ECONNREFUSED'))).toEqual([]);
+  });
+});
+
 describe('PgOAuthStore.connect', () => {
   it('turns a boot connection failure into a config error', async () => {
     const error = await PgOAuthStore.connect('postgres://u:p@127.0.0.1:1/db?sslmode=disable').catch(
       (caught: unknown) => caught
     );
     expect(isXyteError(error)).toBe(true);
-    expect((error as Error).message).toMatch(/^Postgres connection failed at boot/);
+    expect((error as Error).message).toMatch(/^Postgres setup failed at boot/);
   });
 });

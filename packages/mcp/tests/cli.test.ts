@@ -1,6 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
 
@@ -13,6 +14,12 @@ function runBin(args: string[]) {
   });
 }
 
+beforeAll(() => {
+  if (!existsSync(DIST_ENTRY)) {
+    throw new Error(`Build first: ${DIST_ENTRY} is missing (npm run build).`);
+  }
+});
+
 describe('xyte-mcp bin', () => {
   it('refuses --http: the hosted server is not part of this package', () => {
     const result = runBin(['--http']);
@@ -23,10 +30,19 @@ describe('xyte-mcp bin', () => {
     expect(result.stdout).toBe('');
   });
 
+  it('refuses --http before complaining about other unknown arguments', () => {
+    const result = runBin(['--http', '--bogus']);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('hosted server is not part of @xyteai/mcp');
+    expect(result.stdout).toBe('');
+  });
+
   it('no longer advertises --http in its usage', () => {
     const result = runBin(['--help']);
 
     expect(result.status).toBe(0);
+    expect(result.stderr).toContain('Usage:');
     expect(result.stderr).not.toContain('--http');
   });
 });

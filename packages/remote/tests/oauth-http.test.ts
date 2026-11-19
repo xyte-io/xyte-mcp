@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { hubAcceptsPkce } from './support/pkce.js';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import {
   createServer,
   request as httpRequest,
@@ -9,12 +9,12 @@ import {
   type Server,
   type ServerResponse
 } from 'node:http';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import { VERSION } from '@xyteai/mcp/version.js';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 /**
- * The whole OAuth dance against a real `--http` child process, with a fake hub
+ * The whole OAuth dance against a real HTTP server child process, with a fake hub
  * behind it: discovery → dynamic registration → /authorize consent page →
  * approve → hub /oauth/authorize → callback → code → /token with PKCE → an
  * authenticated MCP tool call that reaches the hub under the grant's hub
@@ -24,6 +24,12 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
+/** Read from the public package's manifest, not its VERSION export, so a broken version lookup cannot pass. */
+const EXPECTED_VERSION = (
+  JSON.parse(
+    readFileSync(createRequire(import.meta.url).resolve('@xyteai/mcp/package.json'), 'utf8')
+  ) as { version: string }
+).version;
 /** Well-formed, long enough, and no token of ours. */
 const JUNK_TOKEN = 'xmcp_junk_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
@@ -114,7 +120,7 @@ beforeAll(async () => {
 
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
-  child = spawn(process.execPath, [DIST_ENTRY, '--http'], {
+  child = spawn(process.execPath, [DIST_ENTRY], {
     env: {
       ...process.env,
       PORT: String(port),
@@ -384,7 +390,8 @@ describe('oauth over http, in order', () => {
     expect(hubRequest.url).toMatch(/^\/core\/v1\/organization\/devices/);
     const headers = hubRequest.headers as Record<string, string>;
     expect(headers.authorization).toBe('Bearer xoat_1');
-    expect(headers['x-xyte-client']).toBe(`xyte-mcp/${VERSION}`);
+    expect(EXPECTED_VERSION).not.toBe('0.0.0');
+    expect(headers['x-xyte-client']).toBe(`xyte-mcp/${EXPECTED_VERSION}`);
     expect(headers.tenant).toBeUndefined();
   });
 

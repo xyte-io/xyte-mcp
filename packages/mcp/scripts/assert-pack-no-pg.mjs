@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// Packs @xyteai/mcp exactly as `npm publish` would and fails if the remote server's
-// dependencies (pg, express) or its code leaked into the public package.
+// Packs @xyteai/mcp as `npm publish` would and fails if the remote server's dependencies
+// (pg, express), the remote package itself, or its code leaked into the public package.
+// `--ignore-scripts` does not stop npm 10 from running `prepare` on pack, so this builds dist
+// first; it only skips the other lifecycle scripts.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const PKG_DIR = path.resolve(import.meta.dirname, '..');
-const FORBIDDEN = ['pg', 'express', '@types/pg', '@types/express'];
-const IMPORT_RE = /(?:from\s*|import\s*\(\s*|require\s*\(\s*)['"](pg|express)(?:\/[^'"]*)?['"]/;
+const FORBIDDEN = ['pg', 'express', '@types/pg', '@types/express', '@xyteai/mcp-remote'];
+const IMPORT_RE = /(?:from\s*|import\s*\(\s*|import\s+|require\s*\(\s*)['"](pg|express)(?:\/[^'"]*)?['"]/;
 
 const tmp = mkdtempSync(path.join(tmpdir(), 'xyte-mcp-pack-'));
 const failures = [];
@@ -39,7 +41,7 @@ try {
     .map((entry) => path.relative(root, path.join(entry.parentPath, entry.name)).split(path.sep).join('/'));
   for (const file of files) {
     if (/^dist\/(oauth\/|transports\/http\.)/.test(file)) failures.push(`remote-only file packed: ${file}`);
-    if (/\.(js|d\.ts)$/.test(file) && IMPORT_RE.test(readFileSync(path.join(root, file), 'utf8'))) {
+    if (/\.(m|c)?js$|\.d\.(m|c)?ts$/.test(file) && IMPORT_RE.test(readFileSync(path.join(root, file), 'utf8'))) {
       failures.push(`imports pg/express: ${file}`);
     }
   }

@@ -2,8 +2,10 @@
 
 An [MCP](https://modelcontextprotocol.io) server for the [Xyte](https://www.xyte.io) platform
 API. It gives an AI agent typed, validated access to the public Xyte REST API — endpoint
-discovery plus a generic call tool — over stdio locally, or over Streamable HTTP as a
-remote server.
+discovery plus a generic call tool. The `@xyteai/mcp` package serves it over stdio, for a
+local MCP host. A separate hosted server, kept in the
+[GitHub repository](https://github.com/xyte-io/xyte-mcp#remote-http-transport) and not
+published to npm, serves the same tools over Streamable HTTP.
 
 Locally, reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it a
 read-only server. The hosted HTTP server is read-only unless `XYTE_MCP_ALLOW_WRITES=1`.
@@ -92,6 +94,9 @@ at all, it decides, so a server pinned shut with `XYTE_MCP_ALLOW_WRITES=0` stays
 the upgrade. Where the two disagree, the restrictive one wins. New stdio configuration should
 use `XYTE_MCP_READ_ONLY`; on the hosted server, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
 writes on (`XYTE_MCP_READ_ONLY=0` alone does not).
+
+From the next release, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
+`package.json` `exports`; deep imports into `dist/` no longer resolve.
 
 ## Tools
 

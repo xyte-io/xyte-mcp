@@ -1,5 +1,6 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
@@ -63,16 +64,35 @@ const SCHEMA = `
 const SCHEMA_LOCK_ID = 674_601;
 
 /**
- * An `sslmode` in the DSN decides on its own (pg lets it override this option
- * anyway), so a compose or CI host can opt out with `sslmode=disable`. Without
- * one: none for a local database, and Heroku's TLS otherwise — it requires TLS
- * but presents a chain the dyno can't verify.
+ * TLS verifies the server certificate (chain and hostname) by default, against
+ * Node's CA bundle plus NODE_EXTRA_CA_CERTS. Heroku's Postgres plans present
+ * AWS RDS-issued certificates whose CAs are in the platform's system bundle,
+ * which the Procfile loads that way. A DSN `sslmode` (e.g. `disable` for a
+ * compose or CI host) still wins: pg applies it over this option. A local
+ * database gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
+ * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
  */
-function sslOption(databaseUrl: string): { ssl?: { rejectUnauthorized: false } } {
+export function sslOption(databaseUrl: string): { ssl?: true } {
   const url = new URL(databaseUrl);
-  if (url.searchParams.has('sslmode')) return {};
   if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
-  return { ssl: { rejectUnauthorized: false } };
+  if (process.env.PGSSLMODE === 'no-verify' || process.env.PGSSLMODE === 'disable') return {};
+  return { ssl: true };
+}
+
+/** What to try when the boot connection fails, by the kind of failure. */
+function bootConnectionHints(error: unknown): string[] {
+  const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  // Node's verification codes: SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_VERIFY_LEAF_SIGNATURE, …
+  if (code && /CERT|SIGNATURE/.test(code)) {
+    return [
+      "Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path>, or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.",
+      'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk).'
+    ];
+  }
+  if (error instanceof Error && /does not support SSL/.test(error.message)) {
+    return ['A local database without TLS: add sslmode=disable to DATABASE_URL.'];
+  }
+  return [];
 }
 
 interface TokenRow {
@@ -114,7 +134,17 @@ export class PgOAuthStore implements OAuthStore {
     // One multi-statement query runs as one transaction, so the xact lock holds
     // for all of it: two boots on an empty database (preboot, a one-off dyno)
     // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
-    await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+    try {
+      await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+    } catch (error) {
+      await pool.end().catch(() => {});
+      const message = error instanceof Error ? error.message : String(error);
+      throw new XyteError(
+        'config',
+        `Postgres connection failed at boot: ${message}`,
+        bootConnectionHints(error)
+      );
+    }
     return new PgOAuthStore(pool);
   }
 

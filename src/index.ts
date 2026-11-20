@@ -2,13 +2,15 @@
 import { ENV } from './config.js';
 import { isXyteError } from './http/errors.js';
 import { logError } from './log.js';
+import { startHttpServer } from './transports/http.js';
 import { startStdioServer } from './transports/stdio.js';
 import { VERSION } from './version.js';
 
 const USAGE = `xyte-mcp ${VERSION} — MCP server for the Xyte platform API
 
 Usage:
-  xyte-mcp                Serve over stdio (the only transport today).
+  xyte-mcp                Serve over stdio (the default, for a local MCP host).
+  xyte-mcp --http         Serve over Streamable HTTP, for a remote MCP client.
   xyte-mcp --version      Print version and exit.
   xyte-mcp --help         Print this message and exit.
 
@@ -19,6 +21,10 @@ Environment:
   ${ENV.hubUrl}            Override the hub base URL (default https://hub.xyte.io).
   ${ENV.entryUrl}          Override the entry base URL.
   ${ENV.timeoutMs}     Per-request timeout in ms (default 15000).
+
+Environment, --http only:
+  ${ENV.httpToken}   Static bearer token every request must present. Required.
+  ${ENV.httpPort}                     Port to listen on (default 3000).
 
 Example MCP host configuration:
   {
@@ -39,7 +45,8 @@ async function main(): Promise<void> {
     process.stderr.write(`${VERSION}\n`);
     return;
   }
-  const unknown = args.filter((arg) => arg.startsWith('-'));
+  const http = args.includes('--http');
+  const unknown = args.filter((arg) => arg.startsWith('-') && arg !== '--http');
   if (unknown.length) {
     logError(`unknown argument(s): ${unknown.join(', ')}`);
     process.stderr.write(USAGE);
@@ -47,6 +54,10 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (http) {
+    await startHttpServer();
+    return; // The listener keeps the process alive.
+  }
   await startStdioServer();
 }
 

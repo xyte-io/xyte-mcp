@@ -188,9 +188,74 @@ describe('resolveHttpConfig', () => {
       resolveHttpConfig({
         ...hubClientEnv,
         [ENV.issuerUrl]: issuer,
-        [ENV.databaseUrl]: 'postgres://x'
+        [ENV.databaseUrl]: 'postgres://x',
+        [ENV.tokenKey]: tokenKey
       }).oauth
-    ).toEqual({ issuerUrl: issuer, databaseUrl: 'postgres://x', hubClient });
+    ).toEqual({
+      issuerUrl: issuer,
+      databaseUrl: 'postgres://x',
+      hubClient,
+      tokenKey: Buffer.from(tokenKey, 'base64')
+    });
+  });
+
+  const tokenKey = Buffer.alloc(32, 7).toString('base64');
+  const previousTokenKey = Buffer.alloc(32, 9).toString('base64');
+  const pgOAuthEnv = {
+    ...hubClientEnv,
+    [ENV.issuerUrl]: 'https://mcp.example.com',
+    [ENV.databaseUrl]: 'postgres://x'
+  };
+
+  // The stored hub tokens are encrypted under it; without one they would sit in plain text.
+  it('refuses a Postgres token store without a valid token key, never echoing the value', () => {
+    for (const bad of [
+      undefined,
+      '',
+      Buffer.alloc(16, 7).toString('base64'), // too short
+      Buffer.alloc(33, 7).toString('base64'), // too long
+      `${tokenKey.slice(0, 10)}!${tokenKey.slice(11)}`, // a character base64 silently drops
+      tokenKey.replace(/=$/, '') // unpadded
+    ]) {
+      const env = { ...pgOAuthEnv, ...(bad === undefined ? {} : { [ENV.tokenKey]: bad }) };
+      expect(() => resolveHttpConfig(env), String(bad)).toThrow(XyteError);
+      expect(() => resolveHttpConfig(env)).toThrow(new RegExp(ENV.tokenKey));
+      try {
+        resolveHttpConfig(env);
+      } catch (error) {
+        const { message, hints } = error as XyteError;
+        expect(message + JSON.stringify(hints)).toContain("randomBytes(32).toString('base64')");
+        if (bad) expect(message + JSON.stringify(hints)).not.toContain(bad);
+      }
+    }
+  });
+
+  it('takes an optional previous token key, validated the same way', () => {
+    expect(
+      resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: ` ${tokenKey} `,
+        [ENV.previousTokenKey]: previousTokenKey
+      }).oauth
+    ).toMatchObject({
+      tokenKey: Buffer.from(tokenKey, 'base64'),
+      previousTokenKey: Buffer.from(previousTokenKey, 'base64')
+    });
+    expect(() =>
+      resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: tokenKey,
+        [ENV.previousTokenKey]: 'not-a-key'
+      })
+    ).toThrow(new RegExp(ENV.previousTokenKey));
+  });
+
+  it('needs no token key for the in-memory store', () => {
+    const { [ENV.databaseUrl]: _unused, ...memoryEnv } = pgOAuthEnv;
+    expect(resolveHttpConfig(memoryEnv).oauth).toEqual({
+      issuerUrl: 'https://mcp.example.com',
+      hubClient
+    });
   });
 
   it('refuses OAuth without the hub client credentials', () => {

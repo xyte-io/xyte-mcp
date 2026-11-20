@@ -17,9 +17,10 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "@xyteai/mcp": "*",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
     "pg": "^8.23.0"
   },
   "devDependencies": {

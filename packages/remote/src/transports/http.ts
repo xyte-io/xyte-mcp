@@ -1,9 +1,11 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Server } from 'node:http';
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
+import { ipKeyGenerator, rateLimit, type RateLimitInfo } from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { isJsonContentType } from '@modelcontextprotocol/sdk/shared/mediaType.js';
 import { endpointCount } from '@xyteai/mcp/catalog/catalog.js';
 import {
   DEFAULT_HUB_URL,
@@ -60,6 +62,22 @@ const CALLBACK_PATH = '/oauth/callback';
 
 /** Caller-controlled strings are capped before they reach the log stream. */
 const MAX_LOGGED_PATH = 64;
+
+// In-memory limits: one dyno today; a shared store comes with the multi-dyno work.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+/** Per OAuth grant (one connection), not per IP: claude.ai and ChatGPT call from shared backend IPs. */
+const MCP_CALLS_PER_GRANT_PER_MINUTE = 60;
+/** Requests without a valid token, per IP: room for one 401 per connection per hour on a shared IP. */
+const MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE = 300;
+/** Per IP; a real sign-in hits the callback once. */
+const CALLBACK_CALLS_PER_IP_PER_MINUTE = 30;
+/** No catalog endpoint takes a file or base64 body; the SDK default is 4 MiB. */
+const MAX_MCP_BODY_BYTES = 1024 * 1024;
+
+/** Heroku's router gives up after 30 s, so a slower request is a dead socket. */
+const REQUEST_TIMEOUT_MS = 30_000;
+/** For the headers alone; Node requires it not to exceed REQUEST_TIMEOUT_MS. */
+const HEADERS_TIMEOUT_MS = 20_000;
 
 /** Under Heroku's 30 s SIGTERM-to-SIGKILL window. */
 const SHUTDOWN_DEADLINE_MS = 28_000;
@@ -168,13 +186,116 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     app.post(CONSENT_PATH, express.urlencoded({ extended: false }), (req, res) => {
       void flow.consent(req, res).catch((error: unknown) => failFlow(res, error));
     });
-    app.get(CALLBACK_PATH, (req, res) => {
+    const callbackRateLimit = rateLimit({
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      limit: CALLBACK_CALLS_PER_IP_PER_MINUTE,
+      standardHeaders: 'draft-8',
+      legacyHeaders: false,
+      // A browser lands here, so the same page as any other sign-in failure.
+      handler: (req, res) => {
+        logError(`429 ${req.method} ${CALLBACK_PATH} — rate limited (per IP)`);
+        sendSignInFailedPage(res, 429, 'Too many attempts. Wait a minute, then restart the connection.');
+      }
+    });
+    app.get(CALLBACK_PATH, callbackRateLimit, (req, res) => {
       void flow.callback(req, res).catch((error: unknown) => failFlow(res, error));
     });
   }
 
-  app.post(MCP_PATH, (req, res) => {
-    void handleMcp(req, res, { staticToken, staticContext, provider, config, upstream, oauth });
+  const mcpAuth: McpAuth = { staticToken, staticContext, provider, config, upstream, oauth };
+  // Identify the caller before limiting, so the budget follows the grant, not the IP.
+  // Trade-off, on purpose: a throttled request still costs its token lookup, because a
+  // per-IP limit in front would also throttle valid users on a shared claude.ai or
+  // ChatGPT egress IP. Add a pre-auth IP guard if production shows store floods.
+  const resolveCaller = (req: Request, res: Response, next: NextFunction) => {
+    resolveIdentity(req, mcpAuth).then(
+      (identity) => {
+        res.locals.identity = identity;
+        next();
+      },
+      (error: unknown) => {
+        // Only a bad token is a 401: a store outage is a retryable 503, or every
+        // connected client would drop its tokens and restart the OAuth flow.
+        logError(`token check failed: ${errorCodeOf(error)}`);
+        respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
+      }
+    );
+  };
+  const identityOf = (res: Response) => res.locals.identity as Caller | undefined;
+  const mcpRateLimit = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: (_req, res) =>
+      identityOf(res)
+        ? MCP_CALLS_PER_GRANT_PER_MINUTE
+        : MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE,
+    keyGenerator: (req, res) => {
+      const identity = identityOf(res);
+      return identity ? `grant:${identity.who.connection}` : ipKeyGenerator(req.ip ?? '');
+    },
+    // The static bearer is one shared dev/CI identity, so it is not limited.
+    skip: (_req, res) => {
+      const identity = identityOf(res);
+      return identity !== undefined && identity.who.connection === undefined;
+    },
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    // A flooded IP sees this instead of the 401 until its window ends.
+    handler: (req, res) => {
+      const { used, limit, resetTime } = (req as Request & { rateLimit: RateLimitInfo }).rateLimit;
+      // Only the first refusal per key per window: a flood would otherwise log every call.
+      if (used === limit + 1) {
+        const grantId = identityOf(res)?.who.connection;
+        logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
+      }
+      // Clients surface the message, not Retry-After, so the wait goes in the text too.
+      const resetMs = resetTime ? resetTime.getTime() - Date.now() : RATE_LIMIT_WINDOW_MS;
+      const waitSeconds = Math.max(1, Math.ceil(resetMs / 1000));
+      respondJsonRpcError(res, 429, -32000, `rate limit exceeded, retry in ${waitSeconds} s`);
+    }
+  });
+
+  // Parsed here, after auth, only to refuse JSON-RPC batches: the SDK runs up to 100
+  // messages of one POST in parallel, which would multiply the per-grant limit (and
+  // protocol 2025-06-18 has no batching). Parsed exactly when the SDK accepts the
+  // Content-Type; anything else gets the SDK's 415 before a body is read.
+  const parseMcpBody = express.json({
+    limit: MAX_MCP_BODY_BYTES,
+    inflate: false,
+    type: (req) => isJsonContentType(req.headers['content-type'])
+  });
+  app.post(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+    const identity = identityOf(res);
+    if (!identity) return respondUnauthorized(req, res, mcpAuth);
+    parseMcpBody(req, res, (error?: unknown) => {
+      // body-parser's errors, in the JSON-RPC shape the SDK used for them.
+      const { status, type } = (error ?? {}) as { status?: number; type?: string };
+      if (error && status === 413) {
+        // ponytail: body-parser drains the whole body before this 413; only authenticated, under-limit callers get here and REQUEST_TIMEOUT_MS (30 s) bounds it.
+        const message = `Payload Too Large: Request body must not exceed ${MAX_MCP_BODY_BYTES} bytes`;
+        return respondJsonRpcError(res, 413, -32000, message);
+      }
+      // A non-UTF charset, or any Content-Encoding (inflate: false).
+      if (error && status === 415) {
+        // Fixed text: body-parser's message quotes the caller's charset / encoding back.
+        return respondJsonRpcError(res, 415, -32000, 'Unsupported Media Type: send uncompressed UTF-8 JSON');
+      }
+      if (error && type === 'entity.parse.failed') {
+        return respondJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
+      }
+      // Aborted or short reads, stream errors: not the caller's JSON, so not -32700.
+      if (error) {
+        // Type and status only, never body content; a client hanging up is not worth a line.
+        if (type !== 'request.aborted') {
+          logError(`${status ?? 400} ${req.method} ${MCP_PATH} — could not read the request body (${type ?? 'unknown'})`);
+        }
+        return respondJsonRpcError(res, status ?? 400, -32603, 'Internal error: could not read the request body');
+      }
+      if (Array.isArray(req.body)) {
+        const message = 'Invalid Request: JSON-RPC batching is not supported, send one message per request';
+        return respondJsonRpcError(res, 400, -32600, message);
+      }
+      void handleMcp(req, res, identity, req.body);
+    });
   });
 
   // POST is the whole protocol here, and the spec lets a server say so.
@@ -184,15 +305,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // parks an idle stream on the dyno until Heroku's 55s router timeout kills
   // it, and reconnects. DELETE is the same kind of lie: it reports 200 for
   // terminating a session that was never created.
-  app.all(MCP_PATH, (req, res) => {
-    void (async () => {
-      // Auth first, as on POST: an unauthenticated caller learns nothing about
-      // the endpoint, not even which methods it supports.
-      const auth = { staticToken, staticContext, provider, config, upstream, oauth };
-      if (!(await authenticate(req, res, auth))) return;
-      res.setHeader('Allow', 'POST');
-      respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
-    })();
+  app.all(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+    // Auth first, as on POST: an unauthenticated caller learns nothing about
+    // the endpoint, not even which methods it supports.
+    if (!identityOf(res)) return respondUnauthorized(req, res, mcpAuth);
+    res.setHeader('Allow', 'POST');
+    respondJsonRpcError(res, 405, -32000, `only POST is supported at ${MCP_PATH}`);
   });
 
   app.use((_req, res) => {
@@ -206,6 +324,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     });
     server.once('error', reject);
   });
+  listener.requestTimeout = REQUEST_TIMEOUT_MS;
+  listener.headersTimeout = HEADERS_TIMEOUT_MS;
   // Once listening, a server error (EMFILE on accept, …) is fatal; say so
   // rather than crash on an unhandled 'error' event, and let the platform restart us.
   listener.on('error', (error) => {
@@ -273,11 +393,13 @@ interface McpAuth {
   oauth?: { issuerUrl: string };
 }
 
-async function handleMcp(req: Request, res: Response, auth: McpAuth): Promise<void> {
-  const caller = await authenticate(req, res, auth);
-  if (!caller) return;
+async function handleMcp(
+  req: Request,
+  res: Response,
+  caller: Caller,
+  parsedBody: unknown
+): Promise<void> {
   const { context, who } = caller;
-
   const server = createServer(context, {
     onToolCall: (call) =>
       logEvent('tool_call', {
@@ -302,9 +424,9 @@ async function handleMcp(req: Request, res: Response, auth: McpAuth): Promise<vo
 
   try {
     await server.connect(transport);
-    // With no `parsedBody` the transport reads and parses the body itself, and
-    // rejects a bad Accept/Content-Type per spec before we see it.
-    await transport.handleRequest(req, res);
+    // The transport still rejects a bad Accept/Content-Type per spec, and reads
+    // the body itself when none was parsed.
+    await transport.handleRequest(req, res, parsedBody);
   } catch (error) {
     // The message could carry a credential (an upstream URL, a header dump), so
     // it goes through redactText before the log stream, and never to the client.
@@ -335,28 +457,6 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
 interface Caller {
   context: ToolContext;
   who: { connection?: string; organization?: string; user?: string };
-}
-
-/**
- * The caller's identity, or undefined once a rejection is sent. Only a bad
- * token is a 401: a store outage is a retryable 503, or every connected client
- * would drop its tokens and restart the OAuth flow.
- */
-async function authenticate(
-  req: Request,
-  res: Response,
-  auth: McpAuth
-): Promise<Caller | undefined> {
-  let caller: Caller | undefined;
-  try {
-    caller = await resolveIdentity(req, auth);
-  } catch (error) {
-    logError(`token check failed: ${errorCodeOf(error)}`);
-    respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
-    return undefined;
-  }
-  if (!caller) respondUnauthorized(req, res, auth);
-  return caller;
 }
 
 /**
@@ -405,7 +505,11 @@ function failFlow(res: Response, error: unknown): void {
   logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
   logEvent('sign_in', { outcome: 'failed', reason: 'error' });
   if (res.headersSent) return;
-  res.status(500).type('html').send('<p>Sign-in failed. Restart the connection.</p>');
+  sendSignInFailedPage(res, 500, 'Restart the connection.');
+}
+
+function sendSignInFailedPage(res: Response, status: number, nextStep: string): void {
+  res.status(status).type('html').send(`<p>Sign-in failed. ${nextStep}</p>`);
 }
 
 /**

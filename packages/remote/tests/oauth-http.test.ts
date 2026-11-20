@@ -653,7 +653,7 @@ describe('oauth over http, in order', () => {
 
     await vi.waitFor(() =>
       expect(stderr.slice(logged).join('')).toMatch(
-        /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ revoked grant\(s\), 1 unused client\(s\)/
+        /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\)/
       )
     );
     const left = await admin!.query(

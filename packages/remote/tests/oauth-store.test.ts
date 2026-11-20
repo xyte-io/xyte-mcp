@@ -243,6 +243,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     });
 
     it('keeps a revoked grant that still has a live token, and any unrevoked grant', async () => {
+      await store().saveClient(client('c1'));
       const revoked = await store().createGrant('c1', signIn());
       const unrevoked = await store().createGrant('c1', signIn());
       await store().revokeGrant(revoked);
@@ -252,6 +253,17 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
       expect(await store().getGrant(revoked)).toBeDefined();
       expect(await store().getGrant(unrevoked)).toBeDefined();
+    });
+
+    // A sign-in whose client the sweep deleted while it was at the hub.
+    it('deletes an unrevoked grant without tokens whose client is gone', async () => {
+      const id = await store().createGrant('gone', signIn());
+      await token(id, 'code', NOW() + 600);
+
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
     });
 
     it('deletes a client without grants once the retention has passed, never one with a grant', async () => {

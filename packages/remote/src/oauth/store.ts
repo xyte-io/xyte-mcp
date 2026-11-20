@@ -97,11 +97,16 @@ export interface OAuthStore {
   deleteToken(token: string, kind: TokenKind): Promise<boolean>;
 
   /**
-   * Deletes, as of `now` (seconds since epoch): expired tokens; revoked grants
-   * with no token left, revoked more than REVOKED_GRANT_RETENTION_SECONDS ago;
+   * Deletes, as of `now` (seconds since epoch): expired tokens; grants with no
+   * token left that were revoked more than REVOKED_GRANT_RETENTION_SECONDS ago,
+   * or are unrevoked but whose client is gone (a sign-in still at the hub when
+   * a sweep deleted its client: nothing can use it, /token needs the client);
    * clients with no grant, registered more than UNUSED_CLIENT_RETENTION_SECONDS
-   * ago. Never an unrevoked grant: a refresh exchange deletes the old refresh
-   * token before it saves the new pair, so a live grant can briefly have none.
+   * ago. Never an unrevoked grant whose client exists: a refresh exchange
+   * deletes the old refresh token before it saves the new pair, so a live grant
+   * can briefly have none (and a client with a grant is never deleted).
+   * An orphan's hub tokens are not revoked at hub: nobody holds them once the
+   * row is gone, and hub ends the chain by itself.
    * Safe while requests are served; a second run deletes nothing more.
    */
   sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts>;
@@ -205,8 +210,14 @@ export class MemoryOAuthStore implements OAuthStore {
       if (token.expiresAt <= now && this.tokens.delete(key)) deleted.tokens += 1;
     }
     const grantsWithTokens = new Set([...this.tokens.values()].map((token) => token.grantId));
-    for (const [id, revokedAt] of this.grantRevokedAt) {
-      if (revokedAt < now - REVOKED_GRANT_RETENTION_SECONDS && !grantsWithTokens.has(id)) {
+    for (const [id, grant] of this.grants) {
+      if (grantsWithTokens.has(id)) continue;
+      const revokedAt = this.grantRevokedAt.get(id);
+      const ended =
+        revokedAt === undefined
+          ? !this.clients.has(grant.clientId)
+          : revokedAt < now - REVOKED_GRANT_RETENTION_SECONDS;
+      if (ended) {
         this.grants.delete(id);
         this.grantRevokedAt.delete(id);
         deleted.grants += 1;

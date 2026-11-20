@@ -354,7 +354,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         if (deleted.tokens || deleted.grants || deleted.clients) {
           log(
             `OAuth store cleanup: deleted ${deleted.tokens} expired token(s), ` +
-              `${deleted.grants} revoked grant(s), ${deleted.clients} unused client(s)`
+              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s)`
           );
         }
       } catch (error) {

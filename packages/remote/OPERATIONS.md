@@ -106,9 +106,10 @@ of the same `connection` just before it.
 ### Cleanup of old rows
 
 At boot and then every hour the server deletes expired tokens, revoked connections with no
-token left 7 days after the revoke, and registered clients with no connection 30 days after
+token left 7 days after the revoke, connections left without a client (a sign-in still in
+progress when its client was deleted), and registered clients with no connection 30 days after
 registration. When it deletes anything it writes one line:
-`[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> revoked grant(s), <n>
+`[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended grant(s), <n>
 unused client(s)`. A failed run writes `OAuth store cleanup failed, retried within an hour:
 the <tokens|grants|clients> step failed: <code>`, and the next run tries again.
 

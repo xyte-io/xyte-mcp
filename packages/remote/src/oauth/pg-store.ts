@@ -668,6 +668,10 @@ export class PgOAuthStore implements OAuthStore {
    * Token expiries come from this app's clock, created_at and revoked_at from
    * Postgres now(); a skew between the two is harmless at day-scale retentions.
    *
+   * The grants step also deletes an unrevoked grant with no token whose client
+   * is gone (see OAuthStore.sweepExpiredOAuthRows); no time cutoff, its code
+   * row lives 10 minutes, so it goes on the run after the code expires.
+   *
    * ponytail: unbatched deletes, and no index on oauth_tokens.expires_at nor
    * oauth_grants.client_id, so each step scans its table and the client step is
    * one hash anti-join. Fine at pilot scale: the /register rate limit caps junk
@@ -681,8 +685,11 @@ export class PgOAuthStore implements OAuthStore {
       [
         'grants',
         `DELETE FROM oauth_grants g
-          WHERE g.revoked_at < to_timestamp($1)
-            AND NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)`,
+          WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)
+            AND (g.revoked_at < to_timestamp($1)
+              -- An orphan: its sign-in was at the hub when its client was swept.
+              OR (g.revoked_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM oauth_clients c WHERE c.client_id = g.client_id)))`,
         now - REVOKED_GRANT_RETENTION_SECONDS
       ],
       [

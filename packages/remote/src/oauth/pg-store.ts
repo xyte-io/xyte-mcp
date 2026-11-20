@@ -14,31 +14,53 @@ import {
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * This service owns its whole schema: three tables, built at boot by the
- * ordered MIGRATIONS below (see migrateOAuthSchema). Client metadata is one
- * jsonb blob because the server never queries inside it — it goes back to the
- * SDK exactly as registered.
+ * This service owns its whole schema: three tables built at boot by the
+ * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
+ * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
+ * server never queries inside it — it goes back to the SDK exactly as
+ * registered.
  */
 
 /**
- * The schema history, oldest first; a migration's version is its index + 1.
- * Append only — never edit or reorder a shipped entry.
+ * One schema change. `version` must equal its place in MIGRATIONS (checked at
+ * boot), and `name` is recorded with it: a database whose version N came from
+ * another build's migration N (two branches each adding one) refuses to boot
+ * instead of skipping this build's N.
+ */
+export interface Migration {
+  version: number;
+  name: string;
+  sql: string;
+  breaksRollback: boolean;
+}
+
+/**
+ * The schema history, oldest first. Append only — never edit, renumber or
+ * reorder a shipped entry.
  *
- * Each entry says whether it keeps the README promise "rolling back to an
- * older build still boots": adding a table, a nullable column or an index
- * keeps it (`breaksRollback: false`); dropping, renaming or tightening
- * anything an older build reads breaks it (`true`), and an older build then
- * refuses to boot instead of running against a schema it does not know.
+ * Each entry says whether it is rollback-safe, i.e. whether an older build
+ * still boots against the schema it leaves: adding a table, a nullable column
+ * or an index is safe (`breaksRollback: false`); dropping, renaming or
+ * tightening anything an older build reads is not (`true`), and an older build
+ * then refuses to boot instead of running against a schema it does not know.
+ *
+ * The flag guards a later boot of an older build, not the rollout itself:
+ * during a deploy the old dyno keeps serving against the new schema until it
+ * stops. So a breaking migration may only drop or rewrite what the previous
+ * release already stopped reading — ship the reader change one release ahead.
  *
  * All pending migrations run in one transaction, so a statement that cannot
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
- * Postgres) is not allowed here. The pool's 10 s query_timeout bounds each
- * migration statement and the wait for the lock.
+ * Postgres) is not allowed here. Statements have no time limit, but they run
+ * before the server listens, so a long data rewrite still counts against the
+ * platform's boot timeout — keep those out of the boot path.
  */
-export const MIGRATIONS: ReadonlyArray<{ sql: string; breaksRollback: boolean }> = [
-  // 1 — the original schema. Keeps rollback (it is the baseline). IF NOT EXISTS,
-  // so a database created before versioning is adopted as version 1 untouched.
+export const MIGRATIONS: ReadonlyArray<Migration> = [
+  // IF NOT EXISTS, so a database created before versioning is adopted as
+  // version 1 untouched.
   {
+    version: 1,
+    name: 'baseline',
     breaksRollback: false,
     sql: `
   CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -81,71 +103,122 @@ export const MIGRATIONS: ReadonlyArray<{ sql: string; breaksRollback: boolean }>
 /** Arbitrary, constant: the advisory lock serializing schema migrations. */
 const SCHEMA_LOCK_ID = 674_601;
 
+/** The error a failed schema step throws, with the pg fields that locate it. */
+function schemaError(step: string, error: unknown): Error {
+  const pgError = error as Partial<pg.DatabaseError>;
+  const details = [
+    pgError.code && `code ${pgError.code}`,
+    pgError.detail,
+    pgError.hint,
+    pgError.position && `at character ${pgError.position}`
+  ]
+    .filter(Boolean)
+    .join('; ');
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(`OAuth store schema ${step} failed: ${message}${details ? ` (${details})` : ''}`, {
+    cause: error
+  });
+}
+
 /**
  * Brings the schema up to the newest migration this build knows, once per
  * version, under a transaction-scoped advisory lock: two boots on one database
- * (preboot, a one-off dyno) take turns, and the second finds nothing to do.
- * Everything runs in one transaction, so a failure leaves the database exactly
- * as it was and throws, which stops the boot.
+ * (preboot, a one-off dyno) take turns, and the second finds nothing left to
+ * apply. Everything runs in one transaction, so a failure leaves the database
+ * exactly as it was and throws, which stops the boot.
  */
 export async function migrateOAuthSchema(
   pool: pg.Pool,
-  migrations: ReadonlyArray<{ sql: string; breaksRollback: boolean }> = MIGRATIONS
+  migrations: ReadonlyArray<Migration> = MIGRATIONS
 ): Promise<void> {
+  const misplaced = migrations.findIndex((migration, index) => migration.version !== index + 1);
+  if (misplaced !== -1) {
+    throw new Error(
+      `OAuth store migration at position ${misplaced + 1} says version ${migrations[misplaced]!.version}; versions must run 1, 2, 3 in order`
+    );
+  }
   const client = await pool.connect();
+  let failed = false;
   try {
     await client.query('BEGIN');
     try {
-      await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
-      await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
-        version         integer PRIMARY KEY,
-        breaks_rollback boolean NOT NULL DEFAULT false,
-        applied_at      timestamptz NOT NULL DEFAULT now()
-      )`);
-      const applied = (
-        await client.query<{ version: number; breaks_rollback: boolean }>(
-          'SELECT version, breaks_rollback FROM oauth_schema_migrations ORDER BY version'
-        )
-      ).rows;
+      let applied: Array<{ version: number; name: string; breaks_rollback: boolean }>;
+      let adopting: boolean;
+      try {
+        // Server-side, unlike pg's client-side query_timeout: waiting longer
+        // than this for another boot's lock, or for a table a running query
+        // holds, fails the boot instead of hanging it.
+        await client.query(`SET LOCAL lock_timeout = '10s'`);
+        await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
+        await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
+          version         integer PRIMARY KEY,
+          name            text NOT NULL,
+          breaks_rollback boolean NOT NULL DEFAULT false,
+          applied_at      timestamptz NOT NULL DEFAULT now()
+        )`);
+        applied = (
+          await client.query<{ version: number; name: string; breaks_rollback: boolean }>(
+            'SELECT version, name, breaks_rollback FROM oauth_schema_migrations ORDER BY version'
+          )
+        ).rows;
+        adopting =
+          !applied.length &&
+          (await client.query<{ found: boolean }>(`SELECT to_regclass('oauth_grants') IS NOT NULL AS found`))
+            .rows[0]!.found;
+      } catch (error) {
+        throw schemaError('lock/version check', error);
+      }
+      const renamed = applied.find(
+        (row) => row.version <= migrations.length && row.name !== migrations[row.version - 1]!.name
+      );
+      if (renamed) {
+        throw new Error(
+          `OAuth store schema version ${renamed.version} in the database is "${renamed.name}", but this build's version ${renamed.version} is "${migrations[renamed.version - 1]!.name}"; two builds added different migrations under one version — renumber the newer one`
+        );
+      }
       const newer = applied.filter((row) => row.version > migrations.length);
       const blocking = newer.find((row) => row.breaks_rollback);
       if (blocking) {
         throw new Error(
-          `OAuth store schema version ${blocking.version} is newer than this build and cannot be rolled back to; deploy a build that knows it`
+          `OAuth store schema is at version ${blocking.version}, which this build (up to version ${migrations.length}) does not know and which breaks rollback; release a build at version ${blocking.version} or later instead of rolling back`
         );
       }
       if (newer.length) {
         log(
-          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; it keeps rollback, booting`
+          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, booting`
         );
       }
       const appliedVersions = new Set(applied.map((row) => row.version));
-      for (const [index, migration] of migrations.entries()) {
-        const version = index + 1;
-        if (appliedVersions.has(version)) continue;
+      for (const migration of migrations) {
+        if (appliedVersions.has(migration.version)) continue;
+        const label = `${migration.version} (${migration.name})`;
         try {
           await client.query(migration.sql);
           await client.query(
-            'INSERT INTO oauth_schema_migrations (version, breaks_rollback) VALUES ($1, $2)',
-            [version, migration.breaksRollback]
+            'INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES ($1, $2, $3)',
+            [migration.version, migration.name, migration.breaksRollback]
           );
         } catch (error) {
-          throw new Error(
-            `OAuth store schema migration ${version} failed: ${error instanceof Error ? error.message : String(error)}`,
-            { cause: error }
-          );
+          throw schemaError(`migration ${label}`, error);
         }
-        log(`OAuth store schema migrated to version ${version}`);
+        log(
+          adopting && migration.version === 1
+            ? `OAuth store adopted the existing schema as version ${label}`
+            : `OAuth store schema migrated to version ${label}`
+        );
       }
       await client.query('COMMIT');
     } catch (error) {
+      failed = true;
       // A failed ROLLBACK (connection gone) must not hide the migration error;
       // the server rolls the transaction back on disconnect anyway.
       await client.query('ROLLBACK').catch(() => {});
       throw error;
     }
   } finally {
-    client.release();
+    // After a failure the connection may still hold an open transaction:
+    // destroy it rather than hand it back to the pool.
+    client.release(failed);
   }
 }
 
@@ -186,24 +259,27 @@ export class PgOAuthStore implements OAuthStore {
   private constructor(private readonly pool: pg.Pool) {}
 
   static async connect(databaseUrl: string): Promise<PgOAuthStore> {
-    const pool = new pg.Pool({
+    const connection = {
       connectionString: databaseUrl,
       ...sslOption(databaseUrl),
-      max: 5,
       // Unbounded by default: an unreachable or hung database would hang boot
       // past Heroku's R10 and every token check instead of failing with a 503.
-      connectionTimeoutMillis: 10_000,
-      query_timeout: 10_000
-    });
+      connectionTimeoutMillis: 10_000
+    };
+    // Migrations get their own connection without query_timeout: pg's timeout
+    // only abandons a statement client-side, so a migration statement over
+    // 10 s could never commit. lock_timeout bounds their waits instead.
+    const migrationPool = new pg.Pool({ ...connection, max: 1 });
+    migrationPool.on('error', (error) => logError(`postgres migration pool: ${error.message}`));
+    try {
+      await migrateOAuthSchema(migrationPool);
+    } finally {
+      await migrationPool.end();
+    }
+    const pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
     // An idle client dropped server-side (maintenance, failover) is emitted here;
     // unhandled, it exits the process. The pool replaces the client on its own.
     pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
-    try {
-      await migrateOAuthSchema(pool);
-    } catch (error) {
-      await pool.end();
-      throw error;
-    }
     return new PgOAuthStore(pool);
   }
 

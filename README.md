@@ -439,14 +439,16 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   logs users out. The schema is versioned: at boot the server applies the migrations it
   has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
   so two booting dynos take turns. All of them run in one transaction, so a failed
-  migration leaves the database unchanged and stops the boot with the migration's number
-  and the database error. Each migration declares whether it keeps the promise that
-  rolling back to an older build still boots: adding tables, nullable columns or indexes
-  keeps it; dropping, renaming or tightening breaks it. An older build boots against a
-  newer schema that keeps the promise, and refuses to boot (naming the version) against
-  one that breaks it. A build from before versioning does not check, so never roll back
-  past this release once a breaking migration has run. A database created before versioning is adopted as version 1 with
-  its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
+  migration leaves the database unchanged and stops the boot with the migration's version
+  and the database error. Each migration declares whether it is rollback-safe, i.e. whether
+  an older build still boots against it: adding tables, nullable columns or indexes is
+  safe; dropping, renaming or tightening is not. An older build boots against a newer
+  rollback-safe schema, and refuses to boot (naming the version) against one that is not.
+  A build from before versioning does not check, so never roll back past this release
+  once a breaking migration has run. During a deploy the old dyno still serves against the
+  new schema, so a breaking migration may only drop or rewrite what the previous release
+  already stopped reading. A database created before versioning is adopted as version 1
+  with its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the

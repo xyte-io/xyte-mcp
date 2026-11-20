@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { MIGRATIONS, migrateOAuthSchema } from '../src/oauth/pg-store.js';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MIGRATIONS, PgOAuthStore, migrateOAuthSchema, type Migration } from '../src/oauth/pg-store.js';
 
 /**
  * The schema migrator against a throwaway database (TEST_DATABASE_URL). Each
@@ -10,6 +10,8 @@ import { MIGRATIONS, migrateOAuthSchema } from '../src/oauth/pg-store.js';
  */
 
 const PG_URL = process.env.TEST_DATABASE_URL;
+
+const BASELINE = { version: 1, name: 'baseline', breaks_rollback: false };
 
 describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
   let admin: pg.Pool;
@@ -28,12 +30,19 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
         [schema]
       )
     ).rows.map((row) => row.table_name);
-  const appliedVersions = async (): Promise<Array<{ version: number; breaks_rollback: boolean }>> =>
+  const appliedVersions = async (): Promise<
+    Array<{ version: number; name: string; breaks_rollback: boolean }>
+  > =>
     (
-      await admin.query<{ version: number; breaks_rollback: boolean }>(
-        `SELECT version, breaks_rollback FROM ${schema}.oauth_schema_migrations ORDER BY version`
+      await admin.query<{ version: number; name: string; breaks_rollback: boolean }>(
+        `SELECT version, name, breaks_rollback FROM ${schema}.oauth_schema_migrations ORDER BY version`
       )
     ).rows;
+  /** Silences log() and returns a reader for what it wrote since. */
+  const captureLog = (): (() => string) => {
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    return () => write.mock.calls.map((call) => String(call[0])).join('');
+  };
 
   beforeAll(() => {
     admin = new pg.Pool({ connectionString: PG_URL, max: 2 });
@@ -47,11 +56,13 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     await admin.query(`CREATE SCHEMA ${schema}`);
   });
   afterEach(async () => {
+    vi.restoreAllMocks();
     await Promise.all(pools.map((pool) => pool.end()));
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
   });
 
   it('creates the schema on an empty database and records version 1', async () => {
+    const logText = captureLog();
     await migrateOAuthSchema(poolForSchema());
 
     expect(await tablesIn()).toEqual([
@@ -60,7 +71,8 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
       'oauth_schema_migrations',
       'oauth_tokens'
     ]);
-    expect(await appliedVersions()).toEqual([{ version: 1, breaks_rollback: false }]);
+    expect(await appliedVersions()).toEqual([BASELINE]);
+    expect(logText()).toContain('OAuth store schema migrated to version 1 (baseline)');
   });
 
   it('adopts a database created before versioning as version 1, keeping its rows', async () => {
@@ -72,9 +84,11 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
        VALUES ('c1', 'sub', 'tenant', 'a', 'r', now())`
     );
 
+    const logText = captureLog();
     await migrateOAuthSchema(pool);
 
-    expect(await appliedVersions()).toEqual([{ version: 1, breaks_rollback: false }]);
+    expect(await appliedVersions()).toEqual([BASELINE]);
+    expect(logText()).toContain('adopted the existing schema as version 1 (baseline)');
     expect((await pool.query('SELECT client_id FROM oauth_clients')).rows).toEqual([
       { client_id: 'c1' }
     ]);
@@ -85,34 +99,77 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
   it('runs nothing again on a second boot', async () => {
     const pool = poolForSchema();
-    const counted = [
-      { sql: 'CREATE TABLE runs (n int); INSERT INTO runs VALUES (1);', breaksRollback: false }
+    const counted: Migration[] = [
+      { version: 1, name: 'runs', sql: 'CREATE TABLE runs (n int); INSERT INTO runs VALUES (1);', breaksRollback: false }
     ];
     await migrateOAuthSchema(pool, counted);
     await migrateOAuthSchema(pool, counted);
 
     expect((await pool.query('SELECT count(*)::int AS n FROM runs')).rows).toEqual([{ n: 1 }]);
-    expect(await appliedVersions()).toEqual([{ version: 1, breaks_rollback: false }]);
+    expect(await appliedVersions()).toEqual([{ version: 1, name: 'runs', breaks_rollback: false }]);
   });
 
   it('lets two boots migrate an empty database at once without racing', async () => {
     await Promise.all([migrateOAuthSchema(poolForSchema()), migrateOAuthSchema(poolForSchema())]);
 
-    expect(await appliedVersions()).toEqual([{ version: 1, breaks_rollback: false }]);
+    expect(await appliedVersions()).toEqual([BASELINE]);
+  });
+
+  it('records whether a migration breaks rollback', async () => {
+    await migrateOAuthSchema(poolForSchema(), [
+      MIGRATIONS[0]!,
+      { version: 2, name: 'breaking', sql: 'SELECT 1', breaksRollback: true }
+    ]);
+
+    expect(await appliedVersions()).toEqual([
+      BASELINE,
+      { version: 2, name: 'breaking', breaks_rollback: true }
+    ]);
+  });
+
+  it('refuses a migration list whose versions do not run 1, 2, 3 in order', async () => {
+    await expect(
+      migrateOAuthSchema(poolForSchema(), [
+        MIGRATIONS[0]!,
+        { version: 3, name: 'skipped', sql: 'SELECT 1', breaksRollback: false }
+      ])
+    ).rejects.toThrow(/^OAuth store migration at position 2 says version 3/);
+    expect(await tablesIn()).toEqual([]);
+  });
+
+  it('refuses to boot when a recorded version came from a different migration', async () => {
+    const pool = poolForSchema();
+    await migrateOAuthSchema(pool, [
+      MIGRATIONS[0]!,
+      { version: 2, name: 'branch_a', sql: 'SELECT 1', breaksRollback: false }
+    ]);
+
+    await expect(
+      migrateOAuthSchema(pool, [
+        MIGRATIONS[0]!,
+        { version: 2, name: 'branch_b', sql: 'CREATE TABLE branch_b (n int)', breaksRollback: false }
+      ])
+    ).rejects.toThrow(
+      /^OAuth store schema version 2 in the database is "branch_a", but this build's version 2 is "branch_b"/
+    );
+    expect(await tablesIn()).not.toContain('branch_b');
   });
 
   it('leaves the database unchanged when a migration fails, naming it', async () => {
-    const failing = [
+    const failing: Migration[] = [
       MIGRATIONS[0]!,
       {
+        version: 2,
+        name: 'half_done',
         sql: 'CREATE TABLE half_done (n int); SELECT no_such_column FROM half_done;',
         breaksRollback: false
       }
     ];
 
-    await expect(migrateOAuthSchema(poolForSchema(), failing)).rejects.toThrow(
-      /^OAuth store schema migration 2 failed: column "no_such_column" does not exist$/
-    );
+    await expect(migrateOAuthSchema(poolForSchema(), failing)).rejects.toMatchObject({
+      message: expect.stringMatching(/^OAuth store schema migration 2 \(half_done\) failed: .*\(code 42703/),
+      cause: expect.objectContaining({ code: '42703' })
+    });
 
     // One transaction: not even version 1 or the version table survives.
     expect(await tablesIn()).toEqual([]);
@@ -122,32 +179,69 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
 
-    const failing = [
+    const failing: Migration[] = [
       MIGRATIONS[0]!,
-      { sql: 'CREATE TABLE half_done (n int); SELECT 1/0;', breaksRollback: false }
+      { version: 2, name: 'half_done', sql: 'CREATE TABLE half_done (n int); SELECT 1/0;', breaksRollback: false }
     ];
 
-    await expect(migrateOAuthSchema(pool, failing)).rejects.toThrow(/^OAuth store schema migration 2 failed: division by zero$/);
+    await expect(migrateOAuthSchema(pool, failing)).rejects.toMatchObject({
+      message: expect.stringMatching(/^OAuth store schema migration 2 \(half_done\) failed: /),
+      cause: expect.objectContaining({ code: '22012' })
+    });
 
     expect(await tablesIn()).not.toContain('half_done');
-    expect(await appliedVersions()).toEqual([{ version: 1, breaks_rollback: false }]);
+    expect(await appliedVersions()).toEqual([BASELINE]);
   });
 
-  it('boots against a newer version that keeps the rollback promise', async () => {
+  it('boots against a newer version that is rollback-safe, changing nothing', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
-    await pool.query('INSERT INTO oauth_schema_migrations (version, breaks_rollback) VALUES (2, false)');
+    await pool.query(
+      `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (2, 'newer', false)`
+    );
 
+    const logText = captureLog();
     await expect(migrateOAuthSchema(pool)).resolves.toBeUndefined();
+
+    expect(await appliedVersions()).toEqual([BASELINE, { version: 2, name: 'newer', breaks_rollback: false }]);
+    expect(logText()).toContain(
+      "OAuth store schema is at version 2, newer than this build's 1; those versions are rollback-safe, booting"
+    );
+    expect(logText()).not.toContain('migrated to version');
   });
 
-  it('refuses to boot against a newer version that breaks rollback', async () => {
+  it('refuses to boot against a newer version that breaks rollback, before running anything', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
-    await pool.query('INSERT INTO oauth_schema_migrations (version, breaks_rollback) VALUES (2, true)');
+    await pool.query(
+      `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (3, 'breaking', true)`
+    );
+    const before = await appliedVersions();
 
-    await expect(migrateOAuthSchema(pool)).rejects.toThrow(
-      'OAuth store schema version 2 is newer than this build and cannot be rolled back to; deploy a build that knows it'
+    await expect(
+      migrateOAuthSchema(pool, [
+        MIGRATIONS[0]!,
+        { version: 2, name: 'pending', sql: 'CREATE TABLE should_not_exist (n int)', breaksRollback: false }
+      ])
+    ).rejects.toThrow(
+      'OAuth store schema is at version 3, which this build (up to version 2) does not know and which breaks rollback; release a build at version 3 or later instead of rolling back'
+    );
+
+    expect(await tablesIn()).not.toContain('should_not_exist');
+    expect(await appliedVersions()).toEqual(before);
+  });
+
+  it('fails PgOAuthStore.connect with the migration error', async () => {
+    const pool = poolForSchema();
+    await migrateOAuthSchema(pool);
+    await pool.query(
+      `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (2, 'breaking', true)`
+    );
+    const url = new URL(PG_URL!);
+    url.searchParams.set('options', `-c search_path=${schema}`);
+
+    await expect(PgOAuthStore.connect(url.toString())).rejects.toThrow(
+      /^OAuth store schema is at version 2, which this build/
     );
   });
 });

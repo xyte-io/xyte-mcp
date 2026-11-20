@@ -97,7 +97,7 @@ the upgrade. Where the two disagree, the restrictive one wins. New stdio configu
 use `XYTE_MCP_READ_ONLY`; on the hosted server, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
 writes on (`XYTE_MCP_READ_ONLY=0` alone does not).
 
-From the next release, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
+From 0.4.0, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
 `package.json` `exports`; deep imports into `dist/` no longer resolve.
 
 ## Tools
@@ -206,10 +206,13 @@ It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
 and a restart costs a client nothing.
 
+Stopping it, cutting off one organization or connection, its log events and alerts:
+[packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md).
+
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
-| `GET /healthz` | none | Liveness probe for uptime monitors and the smoke script. Reveals nothing a port scan would not. |
+| `GET /healthz` | none | Health probe for uptime monitors and the smoke script. In OAuth mode it also checks the token database: `503` when the database does not answer. Reveals nothing a port scan would not. |
 | `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /oauth/consent`, `GET /oauth/callback` | — | OAuth mode only; the MCP SDK's auth router plus our consent page and hub's callback. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
@@ -264,8 +267,8 @@ checked on the `heroku-24` stack; run the app on that stack. If the boot stops o
 `PGSSLMODE=no-verify` restores the old behaviour while the CA is sorted out.
 
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
-drop its three tables (`oauth_tokens`, `oauth_grants`, `oauth_clients`) once before this
-build starts; it recreates them at boot.
+drop its tables (`oauth_tokens`, `oauth_grants`, `oauth_clients` and, if present,
+`oauth_schema_migrations`) once before this build starts; it recreates them at boot.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
@@ -369,9 +372,9 @@ npm run smoke:pack-install -w @xyteai/mcp       # packs, installs, runs the bina
 
 # 3. Bump the version and tag it. The publish job refuses to ship a tag that
 #    disagrees with packages/mcp/package.json.
-npm version 0.1.0 -w @xyteai/mcp --no-git-tag-version
-git commit -am "Release v0.1.0" && git push origin main
-git tag v0.1.0 && git push origin v0.1.0
+npm version <x.y.z> -w @xyteai/mcp --no-git-tag-version
+git commit -am "Release v<x.y.z>" && git push origin main
+git tag v<x.y.z> && git push origin v<x.y.z>
 ```
 
 `node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub --check` exits non-zero when the
@@ -442,10 +445,20 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   other live grant rides the same sign-in.
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. The schema is created at boot and only ever extended (nullable columns,
-  nothing dropped), so from this release on, rolling back to an older build still boots (a
-  pre-release database needs the one-time drop under [Deploy it](#deploy-it)). TLS to a
-  non-local database verifies the certificate (chain and hostname) against Node's CA bundle
+  logs users out. The schema is versioned: at boot the server applies the migrations it
+  has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
+  so two booting dynos take turns. All of them run in one transaction, so a failed
+  migration leaves the database unchanged and stops the boot with the migration's version
+  and the database error. Each migration declares whether it is rollback-safe, i.e. whether
+  an older build still boots against it: adding tables, nullable columns or indexes is
+  safe; dropping, renaming or tightening is not. An older build boots against a newer
+  rollback-safe schema, and refuses to boot (naming the version) against one that is not.
+  A build from before versioning does not check, so never roll back past this release
+  once a breaking migration has run. During a deploy the old dyno still serves against the
+  new schema, so a breaking migration may only drop or rewrite what the previous release
+  already stopped reading. A database created before versioning is adopted as version 1
+  with its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
+  TLS to a non-local database verifies the certificate (chain and hostname) against Node's CA bundle
   plus `NODE_EXTRA_CA_CERTS`, one PEM file added to Node's built-in CAs (the Procfile
   defaults it to the system bundle, which holds Heroku Postgres's CAs; a config var of the
   same name replaces that path), or a DSN `sslmode=verify-full&sslrootcert=<pem path>`. A compose

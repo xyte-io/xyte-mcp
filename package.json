@@ -13,7 +13,7 @@
     "build": "npm run build --workspaces",
     "typecheck": "npm run build -w @xyteai/mcp && npm run typecheck --workspaces",
     "test": "npm run build && npm run test:unit --workspaces",
-    "lint": "eslint packages/mcp/src packages/mcp/tests packages/mcp/scripts packages/remote/src packages/remote/tests packages/remote/scripts",
+    "lint": "eslint packages",
     "start": "node packages/remote/dist/index.js"
   }
 }

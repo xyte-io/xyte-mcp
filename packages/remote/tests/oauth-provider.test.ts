@@ -1264,3 +1264,246 @@ describe('XyteOAuthProvider: several organizations on one server', () => {
     ).resolves.toBeTruthy();
   });
 });
+
+/** The JSON event lines in captured stderr, in order. */
+function eventsIn(stderr: string): Array<Record<string, unknown>> {
+  return stderr
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+describe('XyteOAuthProvider: log events', () => {
+  const get = { method: 'GET' as const, url: `${HUB}/x`, headers: {}, endpointKey: 'k' };
+
+  it('logs sign_in ok with the connection, organization and user — never a token or email', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    let grantId = '';
+    const stderr = await captureStderr(async () => {
+      ({ grantId } = await connected(provider, client));
+    });
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'ok', connection: grantId, organization: 'org-1', user: 'user-1' }
+    ]);
+    expect(stderr).not.toContain('xoat_');
+    expect(stderr).not.toContain('user@example.com');
+  });
+
+  it('logs sign_in denied for access_denied and for Deny on our consent page, failed for another hub error or a broken exchange', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const stderr = await captureStderr(async () => {
+      const denied = await approve(provider, client);
+      await callback(provider, { state: denied.pending, error: 'access_denied' }, denied.cookie);
+
+      const hubError = await approve(provider, client);
+      await callback(provider, { state: hubError.pending, error: 'server_error' }, hubError.cookie);
+
+      const consent = await openConsent(provider, client);
+      await provider.consent(
+        fakeReq({
+          body: { pending: consent.pending, csrf: consent.csrf, decision: 'deny' },
+          cookie: consent.cookie
+        }),
+        fakeRes().res
+      );
+
+      const failed = await approve(provider, client);
+      hub.onCode = () => json(502, {});
+      await callback(provider, { state: failed.pending, code: 'hub-code' }, failed.cookie);
+    });
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'denied', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'hub_error', client: 'client-1' },
+      { event: 'sign_in', outcome: 'denied', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'exchange', client: 'client-1' }
+    ]);
+  });
+
+  it('logs sign_in failed for a sign-in that ends on the expired page', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const stderr = await captureStderr(async () => {
+      // Consent: unknown pending id, wrong CSRF token, wrong browser cookie.
+      await provider.consent(fakeReq({ body: { pending: 'gone', csrf: 'x', decision: 'approve' } }), fakeRes().res);
+      const badCsrf = await openConsent(provider, client);
+      await provider.consent(
+        fakeReq({ body: { pending: badCsrf.pending, csrf: 'wrong', decision: 'approve' }, cookie: badCsrf.cookie }),
+        fakeRes().res
+      );
+      await provider.consent(
+        fakeReq({ body: { pending: badCsrf.pending, csrf: badCsrf.csrf, decision: 'approve' } }),
+        fakeRes().res
+      );
+
+      // Callback: unknown state, wrong browser cookie, never approved.
+      await callback(provider, { state: 'gone', code: 'hub-code' });
+      const approved = await approve(provider, client);
+      await callback(provider, { state: approved.pending, code: 'hub-code' });
+      const unapproved = await openConsent(provider, client);
+      await callback(provider, { state: unapproved.pending, code: 'hub-code' }, unapproved.cookie);
+    });
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'failed', reason: 'expired' },
+      { event: 'sign_in', outcome: 'failed', reason: 'csrf', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'cookie', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'expired' },
+      { event: 'sign_in', outcome: 'failed', reason: 'cookie', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'not_approved', client: 'client-1' }
+    ]);
+  });
+
+  it('logs hub_refresh ok', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'ok' }
+    ]);
+  });
+
+  it('a hub 429 on refresh keeps the grant and logs rate_limited with the status', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.onRefresh = () => json(429, { error: 'rate_limited' });
+    const stderr = await captureStderr(() =>
+      expect(provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)).rejects.toMatchObject({
+        kind: 'auth'
+      })
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'rate_limited', hub_status: 429 }
+    ]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  it('a plain 4xx on refresh logs rejected with the status', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => json(401, { error: 'invalid_client' });
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'rejected', hub_status: 401 }
+    ]);
+  });
+
+  it('invalid_grant on refresh logs hub_refresh invalid_grant, then revoke invalid_grant', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => json(400, { error: 'invalid_grant' });
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 },
+      { event: 'revoke', connection: grantId, reason: 'invalid_grant', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('invalid_grant after someone else rotated logs hub_refresh already_rotated, not invalid_grant', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = async () => {
+      await store.rotateHubTokens(grantId, 'xort_1', {
+        accessToken: 'xoat_other',
+        refreshToken: 'xort_other',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600
+      });
+      return json(400, { error: 'invalid_grant' });
+    };
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'already_rotated', hub_status: 400 }
+    ]);
+  });
+
+  it('an unknown refresh outcome logs hub_refresh unknown (with a 5xx status), then revoke refresh_unknown', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => json(503, {});
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'unknown', hub_status: 503 },
+      { event: 'revoke', connection: grantId, reason: 'refresh_unknown', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('a refresh timeout logs hub_refresh unknown without a status', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => Promise.reject(new DOMException('slow', 'TimeoutError'));
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'unknown' },
+      { event: 'revoke', connection: grantId, reason: 'refresh_unknown', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('invalid_grant on a grant already ended meanwhile logs hub_refresh, but no second revoke', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    // The operator's SQL cut-off lands while the refresh is at the hub.
+    hub.onRefresh = async () => {
+      await store.revokeGrant(grantId);
+      return json(400, { error: 'invalid_grant' });
+    };
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 }
+    ]);
+  });
+
+  it('a client revoke logs revoke client with the organization and user', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    const stderr = await captureStderr(() =>
+      provider.revokeToken(client, { token: tokens.access_token })
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'revoke', connection: grantId, reason: 'client', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('a client revoke of a grant whose hub sign-in is already gone logs only the connection and reason', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    // The grant passes the revoke's own check, then its hub sign-in is gone by the time it is read.
+    const getGrant = store.getGrant.bind(store);
+    vi.spyOn(store, 'getGrant').mockImplementationOnce(getGrant).mockResolvedValueOnce(undefined);
+    const stderr = await captureStderr(() =>
+      provider.revokeToken(client, { token: tokens.access_token })
+    );
+    expect(eventsIn(stderr)).toEqual([{ event: 'revoke', connection: grantId, reason: 'client' }]);
+  });
+});

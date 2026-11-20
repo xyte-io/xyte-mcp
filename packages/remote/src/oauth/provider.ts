@@ -20,7 +20,14 @@ import type { HttpClient } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 import { redactText } from '@xyteai/mcp/redact.js';
-import { nowSeconds, type HubOAuth, type HubSignIn, type HubTokens } from './hub-oauth.js';
+import { logEvent } from '../log-event.js';
+import {
+  HubRefreshError,
+  nowSeconds,
+  type HubOAuth,
+  type HubSignIn,
+  type HubTokens
+} from './hub-oauth.js';
 import type { OAuthStore, TokenRecord } from './store.js';
 
 /**
@@ -169,13 +176,22 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
     // A mismatch leaves the entry alone: the pending id travels in URLs, so
     // dropping it here would let anyone who saw one cancel that login.
-    if (!entry || !same(form.csrf, entry.csrf) || !same(cookie, entry.browserKey)) {
-      if (!entry && cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
-      res.status(400).type('html').send(errorPage(EXPIRED));
+    if (!entry) {
+      if (cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+      endOnExpiredPage(res, 'expired');
+      return;
+    }
+    if (!same(form.csrf, entry.csrf)) {
+      endOnExpiredPage(res, 'csrf', entry.clientId);
+      return;
+    }
+    if (!same(cookie, entry.browserKey)) {
+      endOnExpiredPage(res, 'cookie', entry.clientId);
       return;
     }
 
     if (form.decision !== 'approve') {
+      logEvent('sign_in', { outcome: 'denied', client: entry.clientId });
       this.pending.delete(pendingId);
       clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
       res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
@@ -207,20 +223,30 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
     // Without the cookie the entry is left alone, as in consent(): the state is
     // in hub's URL, and knowing it must not be enough to cancel the login.
-    if (!entry || !same(cookie, entry.browserKey)) {
-      if (!entry && cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
-      res.status(400).type('html').send(errorPage(EXPIRED));
+    if (!entry) {
+      if (cookie !== undefined) clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+      endOnExpiredPage(res, 'expired');
+      return;
+    }
+    if (!same(cookie, entry.browserKey)) {
+      endOnExpiredPage(res, 'cookie', entry.clientId);
       return;
     }
     // Single-use from here: a replayed callback must not mint twice.
     this.pending.delete(pendingId);
     clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
     if (!entry.approved) {
-      res.status(400).type('html').send(errorPage(EXPIRED));
+      endOnExpiredPage(res, 'not_approved', entry.clientId);
       return;
     }
 
     if (typeof query.error === 'string') {
+      logEvent(
+        'sign_in',
+        query.error === 'access_denied'
+          ? { outcome: 'denied', client: entry.clientId }
+          : { outcome: 'failed', reason: 'hub_error', client: entry.clientId }
+      );
       const description = [query.error_reason, query.error_description]
         .filter((part): part is string => typeof part === 'string' && part.length > 0)
         .join(': ');
@@ -248,6 +274,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         ...(entry.resource ? { resource: entry.resource } : {}),
         expiresAt: nowSeconds() + CODE_TTL_SECONDS
       });
+      logEvent('sign_in', {
+        outcome: 'ok',
+        connection: grantId,
+        organization: signIn.tenantId,
+        user: signIn.sub
+      });
       res.redirect(302, clientRedirect(entry, { code }));
     } catch (error) {
       // A JSON parse error quotes its input — the id_token or the response body.
@@ -258,6 +290,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
             ? error.message
             : String(error);
       logError(`hub sign-in failed: ${detail}`);
+      logEvent('sign_in', { outcome: 'failed', reason: 'exchange', client: entry.clientId });
       res.redirect(
         302,
         clientRedirect(entry, { error: 'server_error', error_description: 'Xyte sign-in failed' })
@@ -376,8 +409,17 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     try {
       next = await this.hub.refresh(sent);
     } catch (error) {
+      const hubStatus = error instanceof HubRefreshError ? error.status : undefined;
       // A plain 4xx rejection ('auth') never rotated anything: keep the grant.
-      if (error instanceof XyteError && error.kind === 'auth') throw error;
+      if (error instanceof XyteError && error.kind === 'auth') {
+        logEvent('hub_refresh', {
+          ...whoOf(grantId, hub),
+          outcome: hubStatus === 429 ? 'rate_limited' : 'rejected',
+          hub_status: hubStatus
+        });
+        throw error;
+      }
+      logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'unknown', hub_status: hubStatus });
       // Timeout, network, 5xx or an unreadable 200: hub may have rotated and
       // burned `sent`. A replay inside hub's 60 s window only gets invalid_grant
       // (no pair), and one after it ends the user's sign-in — so `sent` is never
@@ -389,17 +431,24 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       );
       await this.store.revokeGrant(grantId);
       this.unsaved.delete(grantId);
+      logEvent('revoke', { ...whoOf(grantId, hub), reason: 'refresh_unknown' });
       throw signInGone();
     }
     if (next === 'invalid_grant') {
       const current = await this.liveHub(grantId);
       if (current && current.hub.refreshToken !== sent) {
+        logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'already_rotated', hub_status: 400 });
         return current.hub.accessToken; // Someone else rotated; theirs is good.
       }
+      logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'invalid_grant', hub_status: 400 });
       await this.store.revokeGrant(grantId);
       this.unsaved.delete(grantId);
+      // Undefined: the grant was ended meanwhile (the operator's SQL cut-off),
+      // so this refresh did not end it.
+      if (current) logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });
       throw signInGone();
     }
+    logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
     await this.saveHubTokens(grantId, stored, next);
     return next.accessToken;
   }
@@ -522,7 +571,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     if (!grant?.hub || grant.revoked) {
       throw new InvalidTokenError('access token is invalid or expired');
     }
-    const hub: HubIdentity = { grantId: grant.id, accessToken: grant.hub.accessToken };
+    const hub: HubIdentity = {
+      grantId: grant.id,
+      accessToken: grant.hub.accessToken,
+      tenantId: grant.hub.tenantId,
+      sub: grant.hub.sub
+    };
     return {
       token,
       clientId: grant.clientId,
@@ -558,6 +612,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           const hub = (await this.liveHub(grant.id))?.hub;
           await this.store.revokeGrant(grant.id);
           this.unsaved.delete(grant.id);
+          logEvent('revoke', { ...whoOf(grant.id, hub), reason: 'client' });
           if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
             await this.hub.revoke(hub.refreshToken);
           }
@@ -617,12 +672,26 @@ export interface HubIdentity {
   grantId: string;
   /** As stored at verify time; hubHttp sends the current one, possibly refreshed. */
   accessToken: string;
+  /** Hub organization and user of the sign-in, for log attribution only. */
+  tenantId: string;
+  sub: string;
 }
 
 export function hubIdentityOf(auth: AuthInfo): HubIdentity {
   const hub = auth.extra?.hub as HubIdentity | undefined;
   if (!hub) throw new InvalidTokenError('token carries no hub identity');
   return hub;
+}
+
+/** A grant's log identity: the connection, plus its organization and user when known. */
+function whoOf(grantId: string, hub: HubSignIn | undefined) {
+  return { connection: grantId, organization: hub?.tenantId, user: hub?.sub };
+}
+
+/** A consent or callback that cannot go on: the expired page, and the sign-in's end in the logs. */
+function endOnExpiredPage(res: Response, reason: string, clientId?: string): void {
+  logEvent('sign_in', { outcome: 'failed', reason, client: clientId });
+  res.status(400).type('html').send(errorPage(EXPIRED));
 }
 
 function signInGone(): XyteError {

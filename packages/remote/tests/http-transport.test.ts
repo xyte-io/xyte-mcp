@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -14,6 +14,12 @@ import { startHttpServer } from '../src/transports/http.js';
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
+// The hosted server reports @xyteai/mcp's version.
+const MCP_PACKAGE_VERSION = (
+  JSON.parse(
+    readFileSync(path.resolve(import.meta.dirname, '..', '..', 'mcp', 'package.json'), 'utf8')
+  ) as { version: string }
+).version;
 const TOKEN = 'xmcp_test_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
 const MCP_HEADERS = {
@@ -338,6 +344,19 @@ describe('http transport', () => {
     const result = response.result as { isError?: boolean; structuredContent?: { count: number } };
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent?.count).toBeGreaterThan(0);
+
+    // One shared identity in this mode, so the line carries none.
+    await server.waitForStderr('"event":"tool_call"');
+    const line = server.stderr
+      .join('')
+      .split('\n')
+      .find((entry) => entry.includes('"event":"tool_call"'))!;
+    expect(JSON.parse(line)).toEqual({
+      event: 'tool_call',
+      tool: 'xyte_endpoints_list',
+      outcome: 'ok',
+      duration_ms: expect.any(Number)
+    });
   });
 
   // Hosted is read-only unless writes are asked for; stdio keeps writes on.
@@ -386,6 +405,7 @@ describe('http transport', () => {
 
     expect(code).toBe(1);
     expect(stderr).toContain('are both set');
+    expect(stderr).toContain('  - Unset XYTE_MCP_HTTP_TOKEN for OAuth');
   });
 
   it('refuses to start without a bearer token, naming the variable', async () => {
@@ -406,7 +426,8 @@ describe('http transport: token store outage', () => {
     const port = await freePort();
     const getToken = vi
       .spyOn(MemoryOAuthStore.prototype, 'getToken')
-      .mockRejectedValue(new Error('db down'));
+      .mockRejectedValue(Object.assign(new Error('db down at db.internal'), { code: '57P01' }));
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const listener = await startHttpServer({
       PORT: String(port),
       XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
@@ -423,8 +444,78 @@ describe('http transport: token store outage', () => {
         expect(response.status, method).toBe(503);
         expect(response.headers.get('www-authenticate'), method).toBeNull();
       }
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('token check failed: 57P01');
+      expect(logged).not.toContain('db.internal');
     } finally {
       getToken.mockRestore();
+      stderr.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  // The uptime check on /healthz is the "server down" alert, so a dead database must fail it.
+  it('checks the database on /healthz: ok while it answers, a generic 503 when it does not', async () => {
+    const port = await freePort();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    const getClient = vi.spyOn(MemoryOAuthStore.prototype, 'getClient');
+    // Only Date is faked: the probe answer is kept for a couple of seconds.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const healthy = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(healthy.status).toBe(200);
+      expect(await healthy.text()).toBe('ok');
+      expect(getClient).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(Date.now() + 3_000);
+      getClient.mockRejectedValue(
+        Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+      );
+      const down = await fetch(`http://127.0.0.1:${port}/healthz`);
+      expect(down.status).toBe(503);
+      expect(await down.text()).toBe('unavailable');
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('healthz: token store check failed: ECONNREFUSED');
+      expect(logged).not.toContain('db.internal');
+    } finally {
+      vi.useRealTimers();
+      getClient.mockRestore();
+      stderr.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  // An unauthenticated flood of probes must not turn into a flood of database queries.
+  it('runs at most one database check per couple of seconds on /healthz, however many probes', async () => {
+    const port = await freePort();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    const getClient = vi.spyOn(MemoryOAuthStore.prototype, 'getClient');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const probe = () => fetch(`http://127.0.0.1:${port}/healthz`).then((response) => response.status);
+      expect(await Promise.all([probe(), probe(), probe()])).toEqual([200, 200, 200]);
+      expect(await probe()).toBe(200);
+      expect(getClient).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(Date.now() + 3_000);
+      expect(await probe()).toBe(200);
+      expect(getClient).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      getClient.mockRestore();
+      stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
   });
@@ -451,6 +542,8 @@ describe('http transport: token store outage', () => {
       const html = await response.text();
       expect(html).toContain('Sign-in failed');
       expect(html).not.toContain('secret-ish');
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('{"event":"sign_in","outcome":"failed","reason":"error"}');
     } finally {
       consent.mockRestore();
       stderr.mockRestore();
@@ -474,17 +567,24 @@ describe('cli', () => {
     expect(stderr).toContain('unknown argument');
   });
 
+  it('has no --help: it is an unknown argument, exit code 2', async () => {
+    const { code, stderr } = await runToExit(['--help'], {});
+
+    expect(code).toBe(2);
+    expect(stderr).toContain('unknown argument(s): --help');
+  });
+
   it('prints the version and exits for --version, without listening', async () => {
     const { code, stderr } = await runToExit(['--version'], {});
 
     expect(code).toBe(0);
-    expect(stderr).toMatch(/^\d+\.\d+\.\d+/);
+    expect(stderr.trim()).toBe(MCP_PACKAGE_VERSION);
   });
 
   it('prints the version even next to an unknown argument, as --version wins', async () => {
     const { code, stderr } = await runToExit(['--version', '-x'], {});
 
     expect(code).toBe(0);
-    expect(stderr).toMatch(/^\d+\.\d+\.\d+/);
+    expect(stderr.trim()).toBe(MCP_PACKAGE_VERSION);
   });
 });

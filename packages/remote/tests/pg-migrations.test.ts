@@ -241,7 +241,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     url.searchParams.set('options', `-c search_path=${schema}`);
 
     await expect(PgOAuthStore.connect(url.toString())).rejects.toThrow(
-      /^OAuth store schema is at version 2, which this build/
+      /^Postgres setup failed at boot: OAuth store schema is at version 2, which this build/
     );
   });
 });

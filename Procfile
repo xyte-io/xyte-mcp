@@ -8,4 +8,8 @@
 # the pending consent/sign-in state and the per-grant hub-token refresh
 # single-flight live in this process's memory: a second dyno would lose
 # callbacks and race single-use hub refresh tokens (which hub reads as replay).
-web: node packages/remote/dist/index.js
+#
+# NODE_EXTRA_CA_CERTS: Node does not read the system CA bundle on its own, and that
+# bundle holds the CAs of Heroku Postgres's certificates, which the server verifies.
+# A config var of the same name replaces this default.
+web: NODE_EXTRA_CA_CERTS=${NODE_EXTRA_CA_CERTS:-/usr/lib/ssl/certs/ca-certificates.crt} node packages/remote/dist/index.js

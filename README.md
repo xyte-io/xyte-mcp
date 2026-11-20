@@ -446,7 +446,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the
   key id (the first 8 hex characters of the key's SHA-256) is logged at boot, the key never.
   A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
-  logged with its id, the key id and the reason, and reads as signed out: the client gets a
+  logged with its id, the key id and the reason, and revoked on first read: the client gets a
   `401` and its user connects again. Upgrading from a build that stored them unencrypted
   signs every existing connection out once. The schema is versioned: at boot the server applies the migrations it
   has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock

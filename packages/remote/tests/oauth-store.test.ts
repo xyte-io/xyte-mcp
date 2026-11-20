@@ -275,32 +275,71 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
 
   it('reads rows under the previous key, rewrites them under the current one on rotation', async () => {
     const underA = await open(KEY_A);
-    const idle = await underA.createGrant('c1', signIn());
-    const active = await underA.createGrant('c1', signIn());
+    const first = signIn(); // once: signIn() reads the clock
+    const idle = await underA.createGrant('c1', first);
+    const active = await underA.createGrant('c1', first);
 
     const rotating = await open(KEY_B, KEY_A);
-    expect((await rotating.getGrant(idle))?.hub).toEqual(signIn());
+    expect((await rotating.getGrant(idle))?.hub).toEqual(first);
     const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
     expect(await rotating.rotateHubTokens(active, 'xort_1', next)).toBe(true);
     const idB = new TokenCipher(KEY_B).currentKeyId;
     expect((await row(active)).hub_access_token).toMatch(new RegExp(`^v1\\.${idB}\\.`));
     expect((await row(active)).hub_refresh_token).toMatch(new RegExp(`^v1\\.${idB}\\.`));
 
-    // PREVIOUS dropped: the row never rewritten is signed out, the rotated one is not.
+    // PREVIOUS dropped: the row never rewritten is revoked, the rotated one is not.
     const onlyB = await open(KEY_B);
+    const storedIdle = await row(idle);
     const logText = captureLog();
     const lost = await onlyB.getGrant(idle);
     vi.restoreAllMocks();
-    expect(lost).toEqual({ id: idle, clientId: 'c1', revoked: false });
+    expect(lost).toEqual({ id: idle, clientId: 'c1', revoked: true });
     expect((await onlyB.getGrant(active))?.hub).toEqual(signIn(next));
     const idA = new TokenCipher(KEY_A).currentKeyId;
     expect(logText()).toContain(`grant ${idle}`);
     expect(logText()).toContain(`unknown key id (key id ${idA})`);
-    expect(logText()).not.toContain((await row(idle)).hub_access_token!);
+    expect(logText()).toContain('revoking the grant');
+    expect(logText()).not.toContain(storedIdle.hub_access_token!);
+    expect(logText()).not.toContain(storedIdle.hub_refresh_token!);
+  });
+
+  // Else it would count as a live sibling, and a disconnect of the user's next
+  // sign-in would skip the hub revoke.
+  it('revokes an unreadable grant on read: no longer a live sibling, and logged once', async () => {
+    const store = await open(KEY_A);
+    const unreadable = await store.createGrant('c1', signIn());
+    const next = await store.createGrant('c1', signIn({ refreshToken: 'xort_n' }));
+    for (const id of [unreadable, next]) {
+      await store.saveToken({ token: `${id}-refresh`, kind: 'refresh', grantId: id, expiresAt: NOW() + 600 });
+    }
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [unreadable]
+    );
+    expect(await store.hasLiveHubSibling('user-1', 'org-1', next)).toBe(true);
+
+    const logText = captureLog();
+    expect(await store.getGrant(unreadable)).toEqual({ id: unreadable, clientId: 'c1', revoked: true });
+    const firstLog = logText();
+    expect(await store.getGrant(unreadable)).toEqual({ id: unreadable, clientId: 'c1', revoked: true });
+    vi.restoreAllMocks();
+    expect(firstLog).toContain(`grant ${unreadable}`);
+    expect(logText()).toBe(firstLog);
+
+    expect(await row(unreadable)).toEqual({
+      hub_access_token: null,
+      hub_refresh_token: null,
+      hub_refresh_token_hash: null
+    });
+    expect(
+      (await admin.query('SELECT 1 FROM oauth_grants WHERE id = $1 AND revoked_at IS NOT NULL', [unreadable]))
+        .rowCount
+    ).toBe(1);
+    expect(await store.hasLiveHubSibling('user-1', 'org-1', next)).toBe(false);
   });
 
   // An old dyno still serving during the deploy writes plain text.
-  it('reads a plaintext row as signed out, without logging the token', async () => {
+  it('revokes a plaintext row on read, without logging the token', async () => {
     const store = await open(KEY_A);
     const id = await store.createGrant('c1', signIn());
     await admin.query(
@@ -308,7 +347,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
       [id]
     );
     const logText = captureLog();
-    expect(await store.getGrant(id)).toEqual({ id, clientId: 'c1', revoked: false });
+    expect(await store.getGrant(id)).toEqual({ id, clientId: 'c1', revoked: true });
     vi.restoreAllMocks();
     expect(logText()).toContain('not encrypted');
     expect(logText()).not.toContain('xoat_plain');

@@ -351,6 +351,12 @@ export class PgOAuthStore implements OAuthStore {
     const row = result.rows[0];
     if (!row) return undefined;
     const tokens = this.hubTokensOf(row);
+    if (tokens === 'unreadable') {
+      // Revoked, not just signed out: a grant left unrevoked would still count
+      // as a live sibling and skip the hub revoke of the user's next sign-in.
+      await this.revokeGrant(row.id);
+      return { id: row.id, clientId: row.client_id, revoked: true };
+    }
     return {
       id: row.id,
       clientId: row.client_id,
@@ -370,11 +376,13 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   /**
-   * The decrypted pair, or undefined when there is none or it cannot be read
-   * (a plaintext row from an older build, a key no longer configured): the
-   * grant then reads as signed out, and its user connects again.
+   * The decrypted pair; undefined when there is none; 'unreadable' when it
+   * cannot be read (a plaintext row from an older build, a key no longer
+   * configured): the grant is then revoked, and its user connects again.
    */
-  private hubTokensOf(row: GrantRow): { accessToken: string; refreshToken: string } | undefined {
+  private hubTokensOf(
+    row: GrantRow
+  ): { accessToken: string; refreshToken: string } | 'unreadable' | undefined {
     if (row.hub_access_token === null || row.hub_refresh_token === null) return undefined;
     try {
       return {
@@ -383,8 +391,8 @@ export class PgOAuthStore implements OAuthStore {
       };
     } catch (error) {
       if (!(error instanceof TokenDecryptError)) throw error;
-      logError(`grant ${row.id}: ${error.message}; it reads as signed out`);
-      return undefined;
+      logError(`grant ${row.id}: ${error.message}; revoking the grant`);
+      return 'unreadable';
     }
   }
 

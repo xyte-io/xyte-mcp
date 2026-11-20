@@ -39,6 +39,7 @@ function fakeHub() {
   const hub = {
     calls,
     expiresIn: 3600,
+    revokeStatus: 200,
     idToken: ID_TOKEN,
     challenge: undefined as string | undefined,
     onRefresh: undefined as undefined | ((form: URLSearchParams) => Promise<Response> | Response),
@@ -49,7 +50,7 @@ function fakeHub() {
       const path = new URL(url).pathname;
       const form = new URLSearchParams(String(init.body));
       calls.push({ path, form, auth: String((init.headers as Record<string, string>).Authorization) });
-      if (path === '/oauth/revoke') return new Response(null, { status: 200 });
+      if (path === '/oauth/revoke') return new Response(null, { status: hub.revokeStatus });
       if (form.get('grant_type') === 'refresh_token' && hub.onRefresh) return hub.onRefresh(form);
       if (form.get('grant_type') === 'authorization_code' && hub.onCode) return hub.onCode();
       if (
@@ -907,7 +908,9 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
-    await connected(provider, client); // a second connection on the same hub sign-in
+    // A second connection on the same hub sign-in.
+    const { grantId: siblingId } = await connected(provider, client);
+    const siblingHub = (await store.getGrant(siblingId))?.hub;
     hub.expiresIn = 3600;
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
@@ -915,7 +918,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       return rotate(id, previous, next);
     });
 
-    await captureStderr(() =>
+    const stderr = await captureStderr(() =>
       expect(
         provider
           .hubHttp(grantId, upstreamOk())
@@ -923,7 +926,66 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       ).rejects.toMatchObject({ kind: 'auth' })
     );
     expect(hub.revokes()).toEqual([]);
+    expect(stderr).toContain(
+      `grant ${grantId}: revoked during the hub refresh; a live sibling shares the hub sign-in, so the new hub pair is kept`
+    );
+    expect(siblingHub).toBeDefined();
+    expect((await store.getGrant(siblingId))?.hub).toEqual(siblingHub);
   });
+
+  it('still fails as signed out when the hub revoke of the orphaned pair fails, and logs it', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    hub.revokeStatus = 503;
+    const rotate = store.rotateHubTokens.bind(store);
+    vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
+      await store.revokeGrant(id);
+      return rotate(id, previous, next);
+    });
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider
+          .hubHttp(grantId, upstreamOk())
+          .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    expect(hub.revokes()).toHaveLength(1);
+    expect(stderr).toContain('hub revoke failed');
+    expect(stderr).not.toContain('xort_2');
+  });
+
+  // Whether a sibling still rides the pair is unknown, so hub is not asked to revoke it.
+  it.each(['getGrant', 'hasLiveHubSibling'] as const)(
+    'after a lost compare-and-set, a failing %s logs and fails as signed out, with no hub revoke',
+    async (failing) => {
+      const { provider, store, hub } = makeProvider();
+      hub.expiresIn = 30;
+      const client = await registeredClient(provider);
+      const { grantId } = await connected(provider, client);
+      hub.expiresIn = 3600;
+      vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id) => {
+        if (failing === 'hasLiveHubSibling') await store.revokeGrant(id);
+        vi.spyOn(store, failing).mockRejectedValueOnce(new Error('db down'));
+        return false;
+      });
+
+      const stderr = await captureStderr(() =>
+        expect(
+          provider
+            .hubHttp(grantId, upstreamOk())
+            .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+        ).rejects.toThrow(/sign-in behind this connection has ended/)
+      );
+      expect(hub.revokes()).toEqual([]);
+      expect(stderr).toContain(`grant ${grantId}: could not check the grant after a lost hub token save`);
+      expect(stderr).not.toContain('xort_2');
+      expect(stderr).not.toContain('xoat_2');
+    }
+  );
 
   it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
     const { provider, store, hub } = makeProvider();

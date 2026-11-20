@@ -265,6 +265,8 @@ Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
 `XYTE_MCP_TOKEN_KEY` before deploying this version; every connection then signs in once; then
 rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
 (schema version 2) cannot be rolled back: an older build refuses to boot against it.
+Deploy this release with preboot off (`heroku features:disable preboot -a <app>`), so the old
+and new process overlap only for the shutdown drain.
 
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
@@ -457,9 +459,10 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the
   key id (the first 8 hex characters of the key's SHA-256) is logged at boot, the key never.
   A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
-  logged with its id, the key id and the reason, and revoked on first read: the client gets a
-  `401` and its user connects again. A live grant with plain-text tokens (written by an older
-  build still serving during a deploy) is revoked at the next boot, which logs their count.
+  logged with its id, the key id when there is one (a plain-text or malformed value has none)
+  and the reason, and revoked on first read: the client gets a `401` and its user connects
+  again. A live grant with a plain-text or malformed token (written by an older build still
+  serving during a deploy) is revoked at the next boot, which logs their count.
   Upgrading from a build that stored them unencrypted
   signs every existing connection out once. That clears the plain-text tokens only in this
   database: a backup, fork or follower taken before still holds hub refresh tokens. They are
@@ -478,7 +481,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   that is not. A build from before versioning does not check, so never roll back past this
   release once a breaking migration has run. During a deploy the old dyno still serves
   against the new schema, so a breaking migration may only drop or rewrite what the previous
-  release already stopped reading. A database created before versioning is adopted as
+  release already stopped reading (schema version 2 is a deliberate pre-launch exception: see
+  the upgrade note under [Deploy it](#deploy-it)). A database created before versioning is adopted as
   version 1 with its data; a pre-release database needs the one-time drop under
   [Deploy it](#deploy-it).
   TLS to a non-local database verifies the certificate (chain and hostname) against Node's CA bundle
@@ -533,15 +537,18 @@ a public sign-in URL.
   changing a config var restarts the dyno). OAuth gives each user their own sign-in
   instead. See [Remote HTTP transport](#remote-http-transport) and [OAuth 2.1](#oauth-21).
 - `XYTE_MCP_TOKEN_KEY` protects every stored hub token: keep it in the platform's config and
-  a copy in a secret store, never next to a database backup. Rotate it in two config changes, since a dyno
+  a copy in a secret store, never next to a database backup. Use a different key per
+  environment: the key id in each boot line would show a reuse. Rotate it in two config changes, since a dyno
   running the old config keeps serving while the new one starts: first keep
   `XYTE_MCP_TOKEN_KEY` and set the new key as `XYTE_MCP_TOKEN_KEY_PREVIOUS` (every dyno can
   now read it; none writes with it yet); once that is fully rolled out, change both in one
   config change: the new key as `XYTE_MCP_TOKEN_KEY` and the old one as
-  `XYTE_MCP_TOKEN_KEY_PREVIOUS` together (setting only `XYTE_MCP_TOKEN_KEY` to the new key
-  makes the server refuse to boot). A grant is rewritten
+  `XYTE_MCP_TOKEN_KEY_PREVIOUS` together. Setting only `XYTE_MCP_TOKEN_KEY` to the new key
+  makes the server refuse to boot while any live connection still uses the old key; with none
+  it boots, and the old process may then write rows under the old key that get revoked on
+  read — so always change both together. A grant is rewritten
   under the new key only at its next hub refresh, which a tool call triggers once the hub
-  access token has expired (hourly); refreshing this server's own tokens does not reach the
+  access token has expired (hourly by default at the hub); refreshing this server's own tokens does not reach the
   hub. Count the live connections still on the old key; its id is the one the boot line shows
   as "previous" after the second change (or as "key id" before the rotation began):
 

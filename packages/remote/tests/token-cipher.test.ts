@@ -26,6 +26,14 @@ describe('TokenCipher', () => {
     expect(cipher.decrypt(stored, 'hub_access_token')).toBe('xoat_1');
   });
 
+  // IV and tag only (28 bytes) is a valid empty token; one byte short is not.
+  it('round-trips an empty token, and calls a payload shorter than IV + tag malformed', () => {
+    const cipher = new TokenCipher(KEY_A);
+    expect(cipher.decrypt(cipher.encrypt('', 'hub_access_token'), 'hub_access_token')).toBe('');
+    const short = `v1.${cipher.currentKeyId}.${randomBytes(27).toString('base64url')}`;
+    expect(decryptFailure(cipher, short)).toMatchObject({ reason: 'malformed', keyId: cipher.currentKeyId });
+  });
+
   it('refuses a tampered payload', () => {
     const cipher = new TokenCipher(KEY_A);
     const stored = cipher.encrypt('xoat_1', 'hub_access_token');

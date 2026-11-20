@@ -3,7 +3,7 @@ import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { XyteError } from '@xyteai/mcp/http/errors.js';
 import { log, logError } from '@xyteai/mcp/log.js';
-import { errorCodeOf } from '../log-event.js';
+import { errorCodeOf, logEvent } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -13,7 +13,7 @@ import {
   type TokenKind,
   type TokenRecord
 } from './store.js';
-import { KEY_ID_PATTERN, TokenDecryptError, type TokenCipher } from './token-cipher.js';
+import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
 
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
@@ -53,6 +53,7 @@ export interface Migration {
  * during a deploy the old dyno keeps serving against the new schema until it
  * stops. So a breaking migration may only drop or rewrite what the previous
  * release already stopped reading — ship the reader change one release ahead.
+ * Version 2 is a deliberate pre-launch exception (README, "Deploy it").
  *
  * All pending migrations run in one transaction, so a statement that cannot
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
@@ -336,6 +337,74 @@ export function bootFailureMessage(error: unknown): string {
   return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
 }
 
+/**
+ * The shape of an encrypted value up to its key id, as a Postgres regex (a
+ * parameter, so no escaping rules apply). Anything else is plain text from an
+ * older build or a malformed value.
+ */
+const ENCRYPTED_SHAPE = '^v1\\.[0-9a-f]{8}\\.';
+
+/**
+ * Boot checks over the live grants, in one transaction under the migrations'
+ * lock_timeout, so a boot never hangs on a row a running query holds.
+ *
+ * First revoke (same columns as revokeGrant) every live grant with either
+ * token not in the encrypted shape: an older build still serving during the
+ * rollout writes plain text, which must not stay at rest. Then, as a wrong key
+ * would revoke every remaining live grant on its first read, refuse to boot
+ * (rolling the sweep back) while any uses a key id this build lacks. Revoked
+ * rows are never decrypted, so they don't count. Only an 8-hex key id is ever
+ * read out, so the error never echoes a token.
+ */
+async function checkAndSweepHubTokens(pool: pg.Pool, cipher: TokenCipher): Promise<void> {
+  const client = await pool.connect();
+  let failed = false;
+  try {
+    await client.query('BEGIN');
+    try {
+      await client.query(`SET LOCAL lock_timeout = '10s'`);
+      const plaintext = await client.query(
+        `UPDATE oauth_grants
+            SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+                hub_refresh_token_hash = NULL
+          WHERE revoked_at IS NULL
+            AND (COALESCE(hub_access_token, '') !~ $1 OR COALESCE(hub_refresh_token, '') !~ $1)`,
+        [ENCRYPTED_SHAPE]
+      );
+      // ponytail: two sequential scans of every grants row, revoked ones included
+      // (nothing indexes revoked_at); a partial index on live grants if it ever matters.
+      const { rows } = await client.query<{ key_id: string }>(
+        `SELECT DISTINCT split_part(token, '.', 2) AS key_id FROM (
+           SELECT hub_refresh_token AS token FROM oauth_grants WHERE revoked_at IS NULL
+           UNION ALL
+           SELECT hub_access_token FROM oauth_grants WHERE revoked_at IS NULL
+         ) live WHERE token ~ $1`,
+        [ENCRYPTED_SHAPE]
+      );
+      const unknown = rows
+        .map((row) => row.key_id)
+        .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
+      if (unknown.length) {
+        // A key problem, not a connection one: thrown as is past the boot wrapper.
+        throw new XyteError(
+          'config',
+          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
+        );
+      }
+      await client.query('COMMIT');
+      if (plaintext.rowCount) {
+        log(`OAuth store: revoked ${plaintext.rowCount} live grant(s) holding unencrypted hub tokens`);
+      }
+    } catch (error) {
+      failed = true;
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  } finally {
+    client.release(failed);
+  }
+}
+
 interface TokenRow {
   grant_id: string;
   code_challenge: string | null;
@@ -380,41 +449,7 @@ export class PgOAuthStore implements OAuthStore {
       migrationPool = new pg.Pool({ ...connection, max: 1 });
       migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
       await migrateOAuthSchema(migrationPool);
-      // A wrong key would revoke every live grant on its first read: refuse to
-      // boot instead. Revoked rows are never decrypted, so they don't count.
-      // ponytail: a sequential scan of every grants row, revoked ones included
-      // (nothing indexes revoked_at); a partial index on live grants if it ever matters.
-      const { rows } = await migrationPool.query<{ key_id: string; grants: string }>(
-        `SELECT split_part(hub_refresh_token, '.', 2) AS key_id, count(*) AS grants FROM oauth_grants
-          WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.%' GROUP BY 1`
-      );
-      // Only an 8-hex id is echoed: a malformed value could hold a token. Those are
-      // no key problem (revoked on first read), so they alone don't stop the boot.
-      const unknown = rows
-        .map((row) => row.key_id)
-        .filter((keyId) => KEY_ID_PATTERN.test(keyId))
-        .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
-      const malformed = rows
-        .filter((row) => !KEY_ID_PATTERN.test(row.key_id))
-        .reduce((sum, row) => sum + Number(row.grants), 0);
-      if (unknown.length) {
-        // A key problem, not a connection one: thrown as is past the wrapper below.
-        throw new XyteError(
-          'config',
-          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}${malformed ? ` (and ${malformed} malformed)` : ''}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
-        );
-      }
-      // An older build still serving during the rollout writes plain text: revoke
-      // it now (same columns as revokeGrant) rather than leave it at rest.
-      const plaintext = await migrationPool.query(
-        `UPDATE oauth_grants
-            SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
-                hub_refresh_token_hash = NULL
-          WHERE revoked_at IS NULL AND hub_refresh_token NOT LIKE 'v1.%'`
-      );
-      if (plaintext.rowCount) {
-        log(`OAuth store: revoked ${plaintext.rowCount} live grant(s) holding unencrypted hub tokens`);
-      }
+      await checkAndSweepHubTokens(migrationPool, cipher);
       pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
       // An idle client dropped server-side (maintenance, failover) is emitted here;
       // unhandled, it exits the process. The pool replaces the client on its own.
@@ -485,6 +520,14 @@ export class PgOAuthStore implements OAuthStore {
       // Revoked, not just signed out: a grant left unrevoked would still count
       // as a live sibling and skip the hub revoke of the user's next sign-in.
       await this.revokeGrant(row.id);
+      if (row.revoked_at === null) {
+        logEvent('revoke', {
+          connection: row.id,
+          organization: row.hub_tenant,
+          user: row.hub_sub,
+          reason: 'unreadable_token'
+        });
+      }
       return { id: row.id, clientId: row.client_id, revoked: true };
     }
     return {

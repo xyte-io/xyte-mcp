@@ -20,7 +20,7 @@ import type { HttpClient } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 import { redactText } from '@xyteai/mcp/redact.js';
-import { logEvent } from '../log-event.js';
+import { errorCodeOf, logEvent } from '../log-event.js';
 import {
   HubRefreshError,
   nowSeconds,
@@ -476,6 +476,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
           continue;
         }
+        // Known limit: a grant revoked outside the provider (operator cut-off, revoke-on-read)
+        // drops an unsaved pair without a hub revoke; it expires on its own.
         this.unsaved.set(grantId, next);
         const detail = error instanceof Error ? error.message : String(error);
         logError(
@@ -487,12 +489,23 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       }
       this.unsaved.delete(grantId);
       if (rotated) return;
-      if (await this.liveHub(grantId)) {
-        logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
-        return;
+      let sibling: boolean;
+      try {
+        if (await this.liveHub(grantId)) {
+          logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
+          return;
+        }
+        // Same rule as a disconnect: hub's revoke ends the sign-in for every client.
+        sibling = await this.store.hasLiveHubSibling(signIn.sub, signIn.tenantId, grantId);
+      } catch (error) {
+        // Whether a sibling rides the new pair is unknown, so hub is not asked to
+        // revoke it; unused, it expires on its own.
+        logError(
+          `grant ${grantId}: could not check the grant after a lost hub token save ` +
+            `(${errorCodeOf(error)}); not revoking the new hub pair`
+        );
+        throw signInGone();
       }
-      // Same rule as a disconnect: hub's revoke ends the sign-in for every client.
-      const sibling = await this.store.hasLiveHubSibling(signIn.sub, signIn.tenantId, grantId);
       logError(
         `grant ${grantId}: revoked during the hub refresh; ` +
           (sibling ? 'a live sibling shares the hub sign-in, so the new hub pair is kept' : 'revoking the new hub pair')
@@ -521,7 +534,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         const next = this.unsaved.get(grantId);
         if (live && next) await this.saveHubTokens(grantId, live.hub, live.stored, next);
       } catch {
-        // The grant read failed; the pair is still unsaved.
+        // The grant read failed (the pair is still unsaved), or the grant was
+        // revoked mid-save: saveHubTokens threw signInGone and dropped the pair.
       }
       if (this.unsaved.has(grantId)) {
         logError(`ERROR grant ${grantId}: rotated hub tokens lost at shutdown`);

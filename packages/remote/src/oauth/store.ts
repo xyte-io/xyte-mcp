@@ -124,7 +124,7 @@ export class MemoryOAuthStore implements OAuthStore {
     next: HubTokens
   ): Promise<boolean> {
     const grant = this.grants.get(grantId);
-    if (!grant?.hub || grant.hub.refreshToken !== previousRefreshToken) return false;
+    if (!grant?.hub || grant.revoked || grant.hub.refreshToken !== previousRefreshToken) return false;
     grant.hub = { ...grant.hub, ...next };
     return true;
   }

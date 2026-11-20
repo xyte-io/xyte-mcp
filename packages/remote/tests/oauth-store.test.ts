@@ -235,6 +235,8 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   afterAll(async () => {
     vi.restoreAllMocks();
     await Promise.all(stores.map((store) => store.close()));
+    // Live rows under this run's random keys would stop the next run's boots.
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
     await admin.end();
   });
 
@@ -391,8 +393,32 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(await store.getGrant(id)).toEqual({ id, clientId: 'c1', revoked: true });
     vi.restoreAllMocks();
     expect(logText()).toContain('not encrypted');
+    expect(logText()).toContain(
+      `${JSON.stringify({ event: 'revoke', connection: id, organization: 'org-1', user: 'user-1', reason: 'unreadable_token' })}\n`
+    );
     expect(logText()).not.toContain('xoat_plain');
     expect(logText()).not.toContain('xort_plain');
+  });
+
+  it('revokes a grant whose refresh token alone fails to authenticate, dropping both tokens', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    const stored = (await row(id)).hub_refresh_token!;
+    const bytes = Buffer.from(stored.split('.')[2]!, 'base64url');
+    bytes[12]! ^= 1; // the GCM tag
+    await admin.query('UPDATE oauth_grants SET hub_refresh_token = $2 WHERE id = $1', [
+      id,
+      `${stored.split('.').slice(0, 2).join('.')}.${bytes.toString('base64url')}`
+    ]);
+    const logText = captureLog();
+    expect(await store.getGrant(id)).toEqual({ id, clientId: 'c1', revoked: true });
+    vi.restoreAllMocks();
+    expect(logText()).toContain('authentication failed');
+    expect(await row(id)).toEqual({
+      hub_access_token: null,
+      hub_refresh_token: null,
+      hub_refresh_token_hash: null
+    });
   });
 
   // Only a TokenDecryptError means "unreadable": any other failure is a bug, not a reason to sign out.
@@ -434,7 +460,28 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(logText()).not.toContain('xort_plain');
   });
 
-  it('names only well-formed key ids in the boot refusal, and counts the rest', async () => {
+  // Either column, and a plain value that happens to start with 'v1.'.
+  it('revokes at boot a live grant with either token not in the encrypted shape', async () => {
+    const store = await open(KEY_A);
+    const ids = [
+      await store.createGrant('c1', signIn()),
+      await store.createGrant('c1', signIn()),
+      await store.createGrant('c1', signIn())
+    ];
+    await admin.query(`UPDATE oauth_grants SET hub_access_token = 'v1.xoat_plain' WHERE id = $1`, [ids[0]]);
+    await admin.query(`UPDATE oauth_grants SET hub_refresh_token = 'v1.xort_secret.AAAA' WHERE id = $1`, [
+      ids[1]
+    ]);
+    const logText = captureLog();
+    await open(KEY_A);
+    vi.restoreAllMocks();
+    expect(logText()).toContain('revoked 2 live grant(s) holding unencrypted hub tokens');
+    expect((await row(ids[0]!)).hub_access_token).toBeNull();
+    expect((await row(ids[1]!)).hub_refresh_token).toBeNull();
+    expect((await store.getGrant(ids[2]!))?.revoked).toBe(false);
+  });
+
+  it('names only well-formed key ids in the boot refusal, and boots over malformed values alone', async () => {
     const store = await open(KEY_A);
     const ids = [await store.createGrant('c1', signIn()), await store.createGrant('c1', signIn())];
     await admin.query(`UPDATE oauth_grants SET hub_refresh_token = 'v1.xort_secret.AAAA' WHERE id = $1`, [
@@ -442,10 +489,24 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     ]);
     const idA = new TokenCipher(KEY_A).currentKeyId;
     const refused = open(KEY_B);
-    await expect(refused).rejects.toThrow(new RegExp(`key id\\(s\\) ${idA} \\(and 1 malformed\\)`));
+    await expect(refused).rejects.toThrow(new RegExp(`key id\\(s\\) ${idA}, which`));
     await expect(refused).rejects.not.toThrow('xort_secret');
-    // Malformed alone is no key problem: it boots, and that grant is revoked on first read.
+    // Malformed alone is no key problem: it boots, and the boot sweep revokes that grant.
     await store.revokeGrant(ids[1]!);
     await open(KEY_B);
+    expect((await row(ids[0]!)).hub_refresh_token).toBeNull();
+  });
+
+  it('refuses to boot while a live grant holds an access token under a key it does not have', async () => {
+    const KEY_C = randomBytes(32);
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query('UPDATE oauth_grants SET hub_access_token = $2 WHERE id = $1', [
+      id,
+      new TokenCipher(KEY_C).encrypt('xoat_1', 'hub_access_token')
+    ]);
+    await expect(open(KEY_A)).rejects.toThrow(
+      new RegExp(`key id\\(s\\) ${new TokenCipher(KEY_C).currentKeyId}, which`)
+    );
   });
 });

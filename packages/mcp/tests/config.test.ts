@@ -257,6 +257,18 @@ describe('resolveHttpConfig', () => {
     }
   });
 
+  it('treats an empty or whitespace previous token key as unset', () => {
+    for (const blank of ['', '   ']) {
+      const oauth = resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: tokenKey,
+        [ENV.previousTokenKey]: blank
+      }).oauth;
+      expect(oauth).toMatchObject({ tokenKey: Buffer.from(tokenKey, 'base64') });
+      expect(oauth).not.toHaveProperty('previousTokenKey');
+    }
+  });
+
   // Same key twice is a rotation step done wrong (KEY changed, PREVIOUS not, or vice versa).
   it('refuses a previous token key equal to the current one, never echoing it', () => {
     const env = { ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.previousTokenKey]: ` ${tokenKey}` };
@@ -276,11 +288,18 @@ describe('resolveHttpConfig', () => {
     expect(oauth).not.toHaveProperty('tokenKey');
   });
 
-  it('needs no token key for the in-memory store', () => {
+  it('needs no token key for the in-memory store, and ignores an invalid one', () => {
     expect(resolveHttpConfig({ ...pgOAuthEnv, [ENV.databaseUrl]: '' }).oauth).toEqual({
       issuerUrl: 'https://mcp.example.com',
       hubClient
     });
+    expect(
+      resolveHttpConfig({
+        ...hubClientEnv,
+        [ENV.issuerUrl]: 'https://mcp.example.com',
+        [ENV.tokenKey]: 'not-a-key'
+      }).oauth
+    ).toEqual({ issuerUrl: 'https://mcp.example.com', hubClient });
   });
 
   it('refuses OAuth without the hub client credentials', () => {

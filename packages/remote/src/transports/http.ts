@@ -1,7 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { Server } from 'node:http';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { ipKeyGenerator, rateLimit, type RateLimitInfo } from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
@@ -72,6 +72,11 @@ const MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE = 300;
 const CALLBACK_CALLS_PER_IP_PER_MINUTE = 30;
 /** No catalog endpoint takes a file or base64 body; the SDK default is 4 MiB. */
 const MAX_MCP_BODY_BYTES = 1024 * 1024;
+
+/** Heroku's router gives up after 30 s, so a slower request is a dead socket. */
+const REQUEST_TIMEOUT_MS = 30_000;
+/** For the headers alone; Node requires it not to exceed REQUEST_TIMEOUT_MS. */
+const HEADERS_TIMEOUT_MS = 20_000;
 
 /** Under Heroku's 30 s SIGTERM-to-SIGKILL window. */
 const SHUTDOWN_DEADLINE_MS = 28_000;
@@ -152,7 +157,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       windowMs: RATE_LIMIT_WINDOW_MS,
       limit: CALLBACK_CALLS_PER_IP_PER_MINUTE,
       standardHeaders: 'draft-8',
-      legacyHeaders: false
+      legacyHeaders: false,
+      // A browser lands here, so the same page as any other sign-in failure.
+      handler: (req, res) => {
+        logError(`429 ${req.method} ${CALLBACK_PATH} — rate limited (per IP)`);
+        sendSignInFailedPage(res, 429, 'Too many attempts. Wait a minute, then restart the connection.');
+      }
     });
     app.get(CALLBACK_PATH, callbackRateLimit, (req, res) => {
       void flow.callback(req, res).catch((error: unknown) => failFlow(res, error));
@@ -198,9 +208,16 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     legacyHeaders: false,
     // A flooded IP sees this instead of the 401 until its window ends.
     handler: (req, res) => {
-      const grantId = identityOf(res)?.grantId;
-      logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
-      respondJsonRpcError(res, 429, -32000, 'rate limit exceeded, retry later');
+      const { used, limit, resetTime } = (req as Request & { rateLimit: RateLimitInfo }).rateLimit;
+      // Only the first refusal per key per window: a flood would otherwise log every call.
+      if (used === limit + 1) {
+        const grantId = identityOf(res)?.grantId;
+        logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
+      }
+      // Clients surface the message, not Retry-After, so the wait goes in the text too.
+      const resetMs = resetTime ? resetTime.getTime() - Date.now() : RATE_LIMIT_WINDOW_MS;
+      const waitSeconds = Math.max(1, Math.ceil(resetMs / 1000));
+      respondJsonRpcError(res, 429, -32000, `rate limit exceeded, retry in ${waitSeconds} s`);
     }
   });
 
@@ -220,7 +237,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       // body-parser's errors, in the JSON-RPC shape the SDK used for them.
       const { status, type } = (error ?? {}) as { status?: number; type?: string };
       if (error && status === 413) {
-        // ponytail: body-parser drains the whole body before this 413; only authenticated, under-limit callers get here and Node's requestTimeout bounds it.
+        // ponytail: body-parser drains the whole body before this 413; only authenticated, under-limit callers get here and REQUEST_TIMEOUT_MS (30 s) bounds it.
         const message = `Payload Too Large: Request body must not exceed ${MAX_MCP_BODY_BYTES} bytes`;
         return respondJsonRpcError(res, 413, -32000, message);
       }
@@ -233,7 +250,13 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         return respondJsonRpcError(res, 400, -32700, 'Parse error: Invalid JSON');
       }
       // Aborted or short reads, stream errors: not the caller's JSON, so not -32700.
-      if (error) return respondJsonRpcError(res, status ?? 400, -32603, 'Internal error: could not read the request body');
+      if (error) {
+        // Type and status only, never body content; a client hanging up is not worth a line.
+        if (type !== 'request.aborted') {
+          logError(`${status ?? 400} ${req.method} ${MCP_PATH} — could not read the request body (${type ?? 'unknown'})`);
+        }
+        return respondJsonRpcError(res, status ?? 400, -32603, 'Internal error: could not read the request body');
+      }
       if (Array.isArray(req.body)) {
         const message = 'Invalid Request: JSON-RPC batching is not supported, send one message per request';
         return respondJsonRpcError(res, 400, -32600, message);
@@ -268,6 +291,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     });
     server.once('error', reject);
   });
+  listener.requestTimeout = REQUEST_TIMEOUT_MS;
+  listener.headersTimeout = HEADERS_TIMEOUT_MS;
   // Once listening, a server error (EMFILE on accept, …) is fatal; say so
   // rather than crash on an unhandled 'error' event, and let the platform restart us.
   listener.on('error', (error) => {
@@ -432,7 +457,11 @@ function withSecret(context: ToolContext, secret: string): ToolContext {
 function failFlow(res: Response, error: unknown): void {
   logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
   if (res.headersSent) return;
-  res.status(500).type('html').send('<p>Sign-in failed. Restart the connection.</p>');
+  sendSignInFailedPage(res, 500, 'Restart the connection.');
+}
+
+function sendSignInFailedPage(res: Response, status: number, nextStep: string): void {
+  res.status(status).type('html').send(`<p>Sign-in failed. ${nextStep}</p>`);
 }
 
 /**

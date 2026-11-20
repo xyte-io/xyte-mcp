@@ -1,6 +1,7 @@
 import { createServer as createHttpServer, type Server } from 'node:http';
 import { createServer } from 'node:net';
-import { gzipSync } from 'node:zlib';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
+import express from 'express';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { XyteOAuthProvider } from '../src/oauth/provider.js';
@@ -105,10 +106,18 @@ describe('/mcp rate limit', () => {
     expect(first.headers.get('ratelimit-policy')).toContain('q=60; w=60');
     expect(await burst(59, () => mcp('grant-a'))).toEqual(Array(59).fill(200));
 
+    const limited = await mcp('grant-a');
+    const { message } = ((await limited.clone().json()) as { error: { message: string } }).error;
+    const waitSeconds = Number(/^rate limit exceeded, retry in (\d+) s$/.exec(message)?.[1]);
+    expect(waitSeconds).toBeGreaterThan(0);
+    expect(waitSeconds).toBeLessThanOrEqual(60);
+    await expectRateLimited(limited);
     await expectRateLimited(await mcp('grant-a'));
-    expect(process.stderr.write).toHaveBeenCalledWith(
-      expect.stringContaining('429 POST /mcp — rate limited (grant grant-a)')
-    );
+    // One log line per key per window, not one per refused call.
+    const logged = vi
+      .mocked(process.stderr.write)
+      .mock.calls.filter(([line]) => String(line).includes('429 POST /mcp — rate limited (grant grant-a)'));
+    expect(logged).toHaveLength(1);
     // A second sign-in from the same IP has its own budget.
     expect((await mcp('grant-b')).status).toBe(200);
   });
@@ -124,6 +133,37 @@ describe('/mcp rate limit', () => {
     expect((await mcp('grant-a')).status).toBe(200);
     const get = await fetch(`${base}/mcp`, { headers: { Authorization: 'Bearer grant-a' } });
     expect(get.status).toBe(405);
+  });
+
+  it('keys the per-IP bucket on the X-Forwarded-For entry the one trusted proxy appended', async () => {
+    await start('oauth');
+    const from = (forwardedFor: string) =>
+      fetch(`${base}/mcp`, {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, 'X-Forwarded-For': forwardedFor },
+        body: JSON.stringify(TOOLS_LIST)
+      });
+
+    expect(await burst(300, () => from('1.1.1.1'))).toEqual(Array(300).fill(401));
+    await expectRateLimited(await from('1.1.1.1'));
+    expect((await from('2.2.2.2')).status).toBe(401);
+    // A spoofed left-most entry does not change the bucket.
+    await expectRateLimited(await from('9.9.9.9, 1.1.1.1'));
+  });
+
+  it('answers 503, never 429, to a burst during a token store outage', async () => {
+    await start('oauth');
+    vi.mocked(XyteOAuthProvider.prototype.verifyAccessToken).mockRejectedValue(new Error('store down'));
+
+    expect(await burst(301, () => mcp('grant-a'))).toEqual(Array(301).fill(503));
+  });
+
+  it('counts a grant\'s 405s against its POST budget', async () => {
+    await start('oauth');
+
+    const gets = await burst(60, () => fetch(`${base}/mcp`, { headers: { Authorization: 'Bearer grant-a' } }));
+    expect(gets).toEqual(Array(60).fill(405));
+    await expectRateLimited(await mcp('grant-a'));
   });
 
   it('applies the per-IP limit to non-POST methods too', async () => {
@@ -154,8 +194,11 @@ describe('/mcp body cap', () => {
     return JSON.stringify({ ...TOOLS_LIST, params: { _meta: { pad: 'x'.repeat(bytes - empty.length) } } });
   }
 
-  it('answers a body over 1 MiB with 413, and serves one just under', async () => {
+  it('answers a body over 1 MiB with 413, and serves one of exactly 1 MiB or just under', async () => {
     await start('static');
+    // Under Heroku's 30 s router timeout, so a slow upload cannot hold a socket for Node's 300 s default.
+    expect(listener?.requestTimeout).toBe(30_000);
+    expect(listener?.headersTimeout).toBe(20_000);
 
     const over = await mcp(STATIC_TOKEN, paddedToolsList(MIB + 1));
     expect(over.status).toBe(413);
@@ -163,6 +206,7 @@ describe('/mcp body cap', () => {
 
     const under = await mcp(STATIC_TOKEN, paddedToolsList(MIB - 1));
     expect(under.status).toBe(200);
+    expect((await mcp(STATIC_TOKEN, paddedToolsList(MIB))).status).toBe(200);
   });
 
   it('answers a chunked body over 1 MiB (no Content-Length) with 413', async () => {
@@ -204,18 +248,57 @@ describe('/mcp body cap', () => {
     expect((await post({ Accept: 'application/json' }, valid)).status).toBe(406);
   });
 
-  it('answers a Content-Encoding body with 415, not a parse error', async () => {
+  const valid = JSON.stringify(TOOLS_LIST);
+  it.each([
+    ['gzip', { 'Content-Encoding': 'gzip' }, gzipSync(valid)],
+    ['deflate', { 'Content-Encoding': 'deflate' }, deflateSync(valid)],
+    ['br', { 'Content-Encoding': 'br' }, brotliCompressSync(valid)],
+    ['a latin-1 charset', { 'Content-Type': 'application/json; charset=iso-8859-1' }, valid]
+  ])('answers a %s body with 415, not a parse error', async (_name, headers, body) => {
     await start('static');
-    const gzipped = await fetch(`${base}/mcp`, {
+    const refused = await fetch(`${base}/mcp`, {
       method: 'POST',
-      headers: { ...MCP_HEADERS, Authorization: `Bearer ${STATIC_TOKEN}`, 'Content-Encoding': 'gzip' },
-      body: gzipSync(JSON.stringify(TOOLS_LIST))
+      headers: { ...MCP_HEADERS, Authorization: `Bearer ${STATIC_TOKEN}`, ...headers },
+      body
     });
-    expect(gzipped.status).toBe(415);
-    expect(await gzipped.json()).toMatchObject({
+    expect(refused.status).toBe(415);
+    expect(await refused.json()).toMatchObject({
       jsonrpc: '2.0',
       error: { code: -32000, message: 'Unsupported Media Type: send uncompressed UTF-8 JSON' }
     });
+  });
+
+  it.each([
+    ['text/plain', { 'Content-Type': 'text/plain' }],
+    ['no Content-Type', {}]
+  ])('answers a 2 MiB %s body with 415 before reading it', async (_name, headers) => {
+    await start('static');
+    const refused = await fetch(`${base}/mcp`, {
+      method: 'POST',
+      headers: { Accept: MCP_HEADERS.Accept, Authorization: `Bearer ${STATIC_TOKEN}`, ...headers },
+      // A byte body, so fetch adds no Content-Type of its own.
+      body: new TextEncoder().encode(paddedToolsList(2 * MIB))
+    });
+    expect(refused.status).toBe(415);
+    expect(await refused.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32000 } });
+  });
+
+  it('logs a body read failure, except a client abort', async () => {
+    const failWith = { status: 500, type: 'stream.encoding.set' };
+    vi.spyOn(express, 'json').mockReturnValue((_req, _res, next) => next(Object.assign(new Error('read failed'), failWith)));
+    await start('static');
+    const logged = () =>
+      vi.mocked(process.stderr.write).mock.calls.filter(([line]) => String(line).includes('could not read the request body'));
+
+    const failed = await mcp(STATIC_TOKEN);
+    expect(failed.status).toBe(500);
+    expect(await failed.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32603 } });
+    expect(logged()).toHaveLength(1);
+    expect(String(logged()[0]?.[0])).toContain('500 POST /mcp — could not read the request body (stream.encoding.set)');
+
+    Object.assign(failWith, { status: 400, type: 'request.aborted' });
+    expect((await mcp(STATIC_TOKEN)).status).toBe(400);
+    expect(logged()).toHaveLength(1);
   });
 });
 
@@ -273,5 +356,19 @@ describe('/oauth/callback rate limit', () => {
     const limited = await callback();
     expect(limited.status).toBe(429);
     expect(Number(limited.headers.get('retry-after'))).toBeGreaterThan(0);
+    expect(limited.headers.get('ratelimit-policy')).toContain('q=30; w=60');
+    // A browser shows this page, so it reads like every other sign-in failure.
+    expect(limited.headers.get('content-type')).toContain('text/html');
+    expect(await limited.text()).toContain('Sign-in failed');
+    const logged = vi
+      .mocked(process.stderr.write)
+      .mock.calls.map(([line]) => String(line))
+      .filter((line) => line.includes('429 GET /oauth/callback'));
+    // Path only: no query value (state, code) reaches the log.
+    expect(logged).toEqual([expect.stringContaining('429 GET /oauth/callback — rate limited (per IP)')]);
+    expect(logged[0]).not.toContain('nope');
+
+    // The /mcp bucket is separate.
+    expect((await mcp(null)).status).toBe(401);
   });
 });

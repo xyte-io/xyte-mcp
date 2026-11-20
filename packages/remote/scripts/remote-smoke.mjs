@@ -274,7 +274,12 @@ check(
       body: 'x'.repeat(MAX_BODY_BYTES + 1)
     });
     if (response.status !== 413) throw new Error(`expected 413, got ${response.status}`);
-    return '413';
+    // A router's or proxy's own 413 would not carry the server's JSON-RPC error.
+    const { error } = await response.json().catch(() => ({}));
+    if (error?.code !== -32000 || !error.message?.startsWith('Payload Too Large')) {
+      throw new Error(`413 is not the server's JSON-RPC error: ${JSON.stringify(error)}`);
+    }
+    return '413 from the server cap';
   },
   { mode: 'static' }
 );

@@ -221,6 +221,9 @@ Any other path is `404`. A missing or wrong token is `401` — with a `WWW-Authe
 challenge pointing at the resource metadata when OAuth is on (RFC 9728, how clients discover
 the flow), and deliberately *without* one in static mode (a challenge makes
 `mcp-remote` open a browser for an OAuth flow that does not exist there).
+`/mcp` can also answer `429` (rate limited; `405`s count against the same budget), `413`
+(body over 1 MiB), `415` (the body must be uncompressed UTF-8 JSON) and `400` (a JSON-RPC
+batch); see the rate limits under [OAuth 2.1](#oauth-21).
 
 ### Run it
 
@@ -307,10 +310,11 @@ OAuth, and no token is needed or accepted.
 - **OAuth:** discovery metadata, the `401` challenge pointing at it, dynamic registration,
   the consent page for a valid PKCE `/authorize`, refusal of an unregistered `redirect_uri`,
   a junk bearer, health and unknown paths. The hub sign-in needs a browser, so verify the
-  rest of the flow by connecting a real client.
+  rest of the flow by connecting a real client. The `401` must carry rate-limit headers.
 - **Static bearer:** health, handshake, tool list, a real read with the configured key
-  (organization, or partner on a partner-only deploy), and the denials: no token, wrong
-  token, unknown path, and — only on a server that reported itself read-only — a mutating
+  (organization, or partner on a partner-only deploy), and the denials: no token (with
+  rate-limit headers), wrong token, unknown path, a body over 1 MiB answered `413` by the
+  server itself, and — only on a server that reported itself read-only — a mutating
   endpoint refused. A writable server fails the handshake check unless you pass
   `--expect-writes`, and is never sent a write.
 
@@ -439,8 +443,9 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   logs users out. The schema is created at boot and only ever extended (nullable columns,
   nothing dropped), so from this release on, rolling back to an older build still boots (a
   pre-release database needs the one-time drop under [Deploy it](#deploy-it)).
-- **One dyno.** The pending consent state and the refresh single-flight are in memory, so
-  the app must run on a single dyno.
+- **One dyno.** The pending consent state, the refresh single-flight and the rate-limit
+  counters are in memory, so the app must run on a single dyno (a second one doubles every
+  budget).
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of
@@ -450,10 +455,14 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   The first three are raised from the SDK defaults because claude.ai and ChatGPT call them
   from shared backend IPs. `/mcp` allows 60 calls a minute per connection (OAuth grant) and
   300 a minute per IP for requests without a valid token; over that it answers 429 with
-  `Retry-After`, so a flooded IP sees 429 instead of 401 for up to a minute. `/oauth/callback`
+  `Retry-After` and draft-8 `RateLimit` / `RateLimit-Policy` headers (sent on every `/mcp`
+  answer), so a flooded IP sees 429 instead of 401 for up to a minute. `/oauth/callback`
   allows 30 a minute per IP. The per-IP limits assume exactly one trusted proxy hop
-  (Heroku's router); behind a CDN, or with no proxy, `X-Forwarded-For` decides the IP.
-  Counters are in memory (one dyno). An `/mcp` body over 1 MiB is a 413. JSON-RPC batches are refused (400), so one request is one call.
+  (Heroku's router): behind a CDN every client counts as the CDN's egress IP (raise the hop
+  count), and with no proxy the client's own `X-Forwarded-For` decides, so the per-IP limit
+  is spoofable. An `/mcp` body over 1 MiB is a 413, a compressed or non-UTF-8 body a 415, and
+  a JSON-RPC batch a 400, so one request is one call. These are JSON-RPC error bodies:
+  `-32000` (429, 413, 415) and `-32600` (batch).
 
 **Registering at hub.** Once per hub environment, from a hub console:
 

@@ -84,6 +84,8 @@ Everything below is about running the server itself.
 | `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
 | `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: an `sslmode` in the DSN decides; without one, none for `localhost`, otherwise TLS without chain verification (Heroku's). |
+| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Base64 of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. |
+| `XYTE_MCP_TOKEN_KEY_PREVIOUS` | **Hosted server + OAuth + `DATABASE_URL`, optional.** The key being rotated out, same format: only decrypts. See [Security notes](#security-notes) for rotation. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
 `XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for
@@ -247,7 +249,8 @@ The `Procfile` is all a Heroku Node app needs — the buildpack runs the root `n
 heroku create <app> --region eu --team <team>
 heroku addons:create heroku-postgresql:essential-0 -a <app>   # OAuth token store (sets DATABASE_URL)
 heroku config:edit -a <app>    # XYTE_MCP_ISSUER_URL, XYTE_HUB_URL,
-                                # XYTE_MCP_HUB_OAUTH_CLIENT_ID / _SECRET
+                                # XYTE_MCP_HUB_OAUTH_CLIENT_ID / _SECRET,
+                                # XYTE_MCP_TOKEN_KEY
                                 # (or, for the static mode instead: XYTE_MCP_HTTP_TOKEN
                                 #  and XYTE_ORG_API_KEY — never both modes)
 git push heroku HEAD:main       # HEAD, so a branch can be deployed without merging it
@@ -331,7 +334,7 @@ npm run lint
 npm run inspect -w @xyteai/mcp   # build and open the MCP Inspector
 ```
 
-The OAuth store contract (`packages/remote/tests/oauth-store.test.ts`) always runs against the in-memory store, and against Postgres too when `TEST_DATABASE_URL` names a throwaway database (its tables are truncated); otherwise the Postgres run is skipped. CI's `pg-store` job runs it against a Postgres service on every push.
+The OAuth store contract (`packages/remote/tests/oauth-store.test.ts`) always runs against the in-memory store, and against Postgres too when `TEST_DATABASE_URL` names a throwaway database (its tables are truncated); otherwise the Postgres run is skipped. CI's `pg-store` job runs it against a Postgres service on every push. With `TEST_DATABASE_URL` set, the spawned-server OAuth flow (`oauth-http.test.ts`) also runs on Postgres, in a schema of its own, adding a restart that must keep the connection.
 
 Two invariants are enforced by lint rather than convention, because both erode silently:
 
@@ -439,7 +442,13 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   other live grant rides the same sign-in.
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. The schema is versioned: at boot the server applies the migrations it
+  logs users out. The hub tokens in each grant are encrypted with AES-256-GCM under
+  `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the
+  key id (the first 8 hex characters of the key's SHA-256) is logged at boot, the key never.
+  A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
+  logged with its id, the key id and the reason, and reads as signed out: the client gets a
+  `401` and its user connects again. Upgrading from a build that stored them unencrypted
+  signs every existing connection out once. The schema is versioned: at boot the server applies the migrations it
   has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
   so two booting dynos take turns. All of them run in one transaction, so a failed
   migration leaves the database unchanged and stops the boot with the migration's version
@@ -494,6 +503,21 @@ a public sign-in URL.
   setting a new value and restarting the server (it is read only at boot; on Heroku,
   changing a config var restarts the dyno). OAuth gives each user their own sign-in
   instead. See [Remote HTTP transport](#remote-http-transport) and [OAuth 2.1](#oauth-21).
+- `XYTE_MCP_TOKEN_KEY` protects every stored hub token: keep it only in the platform's
+  config, never next to a database backup. To rotate it, set the new key as
+  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS` in one config
+  change. A connection in use is rewritten under the new key at its next hub refresh
+  (hourly); an idle one when it is next used, and one idle for 30 days can no longer
+  refresh anyway (our refresh tokens' lifetime). Count the live connections still on the old
+  key, with its id from the boot log:
+
+  ```sql
+  SELECT count(*) FROM oauth_grants
+   WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
+  ```
+
+  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0, or after 30 days. A wrong or missing
+  previous key signs those users out for good: they have to connect again.
 
 ## License
 

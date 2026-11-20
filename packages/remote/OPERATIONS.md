@@ -56,7 +56,8 @@ from the logs:
 
 ```sql
 UPDATE oauth_grants
-   SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
+   SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+       hub_refresh_token_hash = NULL
  WHERE id = <connection> AND revoked_at IS NULL;
 ```
 

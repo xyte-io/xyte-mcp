@@ -43,8 +43,9 @@ export interface NewToken extends TokenRecord {
 }
 
 /**
- * How long a revoked grant is kept once it has no tokens left: a week to look
- * at the row when answering "why was I signed out". Its hub tokens are already
+ * How long a revoked grant is kept once it has no tokens left: a week, so the
+ * row still shows who (subject, tenant, email) and when it was revoked; the
+ * reason is on the `revoke` log line, read with it. Its hub tokens are already
  * gone at revoke, so it holds nothing usable. A revoked grant keeps its token
  * rows until they expire, so the real retention is at least this.
  */
@@ -56,7 +57,10 @@ export const REVOKED_GRANT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
  * sign-in chain 90 days after the first sign-in (README "OAuth 2.1"), so such a
  * grant can never reach hub again; plus a week's margin, like the revoked-grant
  * retention. A refresh exchange that loses the race with this delete answers
- * 500 where the user would get invalid_grant anyway.
+ * 500; if that was the client's last grant and the client is past
+ * UNUSED_CLIENT_RETENTION_SECONDS, the same run deletes the client too, so the
+ * next attempt gets invalid_client and the connector must be re-added (without
+ * the race the user would re-authorize on the same client).
  */
 export const ABANDONED_GRANT_RETENTION_SECONDS = 97 * 24 * 60 * 60;
 

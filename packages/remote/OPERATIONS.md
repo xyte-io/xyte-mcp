@@ -112,14 +112,16 @@ progress when its client was deleted), connections with no token left 97 days af
 end](#the-90-day-end) has passed, plus a week), and registered clients with no connection 30
 days after registration. When it deletes anything it writes one line:
 `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended grant(s), <n>
-unused client(s)`. A failed run writes `OAuth store cleanup failed, retried within an hour:
-the <tokens|grants|clients> step failed: <code>`, and the next run tries again.
+unused client(s)`. A failed run writes `[xyte-mcp] error: OAuth store cleanup failed,
+retried within an hour: the <tokens|grants|clients> step failed: <code>`, and the next run
+tries again. `<code>` is the error code, as in `healthz: token store check failed: <code>`; a
+plain `Error` is usually a pg timeout (query or connect, 10 s).
 
 A returning user can hit this: when all connections of a client were revoked (a disconnect,
-or [the 90-day end](#the-90-day-end)) and deleted, and the client is more than 30 days old,
-the client is deleted too. The user's next sign-in from that client gets a `400`
-`invalid_client` ("Invalid client_id") answer from `/authorize`. The fix is to remove the
-connector in the client and add it again.
+or [the 90-day end](#the-90-day-end)) or abandoned (idle past 97 days) and deleted, and the
+client is more than 30 days old, the client is deleted too. The user's next sign-in from that
+client gets a `400` `invalid_client` ("Invalid client_id") answer from `/authorize`. The fix
+is to remove the connector in the client and add it again.
 
 ### The 90-day end
 

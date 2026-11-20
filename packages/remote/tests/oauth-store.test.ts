@@ -232,15 +232,29 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().getGrant(id)).toBeDefined();
     });
 
-    it('deletes a revoked grant without tokens once the retention has passed', async () => {
+    // No client saved: the orphan branch must not take a revoked grant before its retention.
+    it('keeps a revoked grant without tokens or client until the retention has passed', async () => {
       const id = await store().createGrant('c1', signIn());
       await store().revokeGrant(id);
       const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
 
       expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect((await store().sweepExpiredOAuthRows(due + 60)).grants).toBe(1);
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    it('deletes a revoked grant without tokens once the retention has passed, keeping its client', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+      expect(await store().getClient('c1')).toBeDefined();
     });
 
     it('keeps a revoked grant that still has a live token, and any unrevoked grant', async () => {
@@ -275,8 +289,10 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 
       expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect((await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).grants).toBe(1);
+      // The client, past its own retention, loses its last grant and goes in the same run.
+      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1 });
       expect(await store().getGrant(id)).toBeUndefined();
+      expect(await store().getClient('c1')).toBeUndefined();
     });
 
     it('deletes a client without grants once the retention has passed, never one with a grant', async () => {
@@ -337,6 +353,38 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
     });
+  });
+});
+
+// A failing cleanup step names itself and its code only (a pg message can name the host and
+// role), and the steps after it are not issued.
+describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
+  it('throws "the <step> step failed: <code>" with the cause, and issues no later step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
+    const issued: string[] = [];
+    const failure = Object.assign(new Error('canceling statement, host=secret-host role=secret'), {
+      code: '57014'
+    });
+    vi.spyOn(pool, 'query').mockImplementation(((sql: string, values?: unknown[]) => {
+      issued.push(sql);
+      return sql.includes('DELETE FROM oauth_grants') ? Promise.reject(failure) : query(sql, values);
+    }) as never);
+    try {
+      const error = await store.sweepExpiredOAuthRows(NOW()).then(
+        () => undefined,
+        (rejected: unknown) => rejected as Error
+      );
+      expect(error?.message).toBe('the grants step failed: 57014');
+      expect(error?.message).not.toContain('secret');
+      expect(error?.cause).toBe(failure);
+      expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true);
+      expect(issued.some((sql) => sql.includes('DELETE FROM oauth_clients'))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await store.close();
+    }
   });
 });
 

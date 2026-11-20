@@ -651,16 +651,50 @@ describe('oauth over http, in order', () => {
     const logged = stderr.length;
     await startServer();
 
-    await vi.waitFor(() =>
-      expect(stderr.slice(logged).join('')).toMatch(
-        /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\)/
-      )
+    await vi.waitFor(
+      () =>
+        expect(stderr.slice(logged).join('')).toMatch(
+          /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\)/
+        ),
+      { timeout: 10_000 }
     );
     const left = await admin!.query(
       `SELECT 1 FROM ${PG_SCHEMA}.oauth_clients WHERE client_id = 'unused-client'
        UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_tokens WHERE token_hash = 'expired-token'`
     );
     expect(left.rowCount).toBe(0);
+  });
+
+  // A failed run is caught and logged (step and code only), and the server keeps serving.
+  it.skipIf(!PG_URL)('logs a failed boot cleanup and keeps serving', async () => {
+    await admin!.query(
+      `CREATE FUNCTION ${PG_SCHEMA}.fail_cleanup() RETURNS trigger LANGUAGE plpgsql AS
+       $$ BEGIN RAISE EXCEPTION 'host=secret-host' USING ERRCODE = '57014'; END $$`
+    );
+    await admin!.query(
+      `CREATE TRIGGER fail_cleanup BEFORE DELETE ON ${PG_SCHEMA}.oauth_clients
+       FOR EACH STATEMENT EXECUTE FUNCTION ${PG_SCHEMA}.fail_cleanup()`
+    );
+    try {
+      const exited = new Promise((resolve) => child!.once('exit', resolve));
+      child!.kill('SIGTERM');
+      await exited;
+      const logged = stderr.length;
+      await startServer();
+
+      await vi.waitFor(
+        () =>
+          expect(stderr.slice(logged).join('')).toContain(
+            '[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: the clients step failed: 57014\n'
+          ),
+        { timeout: 10_000 }
+      );
+      expect(stderr.slice(logged).join('')).not.toContain('secret-host');
+      expect(child!.exitCode).toBeNull();
+      expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    } finally {
+      await admin!.query(`DROP FUNCTION ${PG_SCHEMA}.fail_cleanup() CASCADE`);
+    }
   });
 
   // The request that started the refresh is gone (client hung up), so only

@@ -677,9 +677,11 @@ export class PgOAuthStore implements OAuthStore {
    *
    * ponytail: unbatched deletes, and no index on oauth_tokens.expires_at nor
    * oauth_grants.client_id, so each step scans its table and the client step is
-   * one hash anti-join. Fine at pilot scale: the /register rate limit caps junk
-   * at about 720k clients per 30 days. Batched deletes plus those indexes (a
-   * migration) if a run ever gets slow.
+   * one hash anti-join. Fine at pilot scale, but not bounded: the /register
+   * rate limit (1000/h) is per IP per process and resets on restart, so junk
+   * clients grow with the number of source IPs; there is no global cap. Batched
+   * deletes plus those indexes and one on oauth_clients.created_at (a
+   * migration) if a run ever gets slow; a global registration cap is separate work.
    */
   async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
     const deleted = { tokens: 0, grants: 0, clients: 0 };

@@ -4,7 +4,13 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HubSignIn } from '../src/oauth/hub-oauth.js';
 import { PgOAuthStore } from '../src/oauth/pg-store.js';
-import { hashToken, MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import {
+  hashToken,
+  MemoryOAuthStore,
+  REVOKED_GRANT_RETENTION_SECONDS,
+  UNUSED_CLIENT_RETENTION_SECONDS,
+  type OAuthStore
+} from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
 
 /**
@@ -197,6 +203,114 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
     expect(await store().rotateHubTokens(id, 'xort_1', next)).toBe(false);
     expect((await store().getGrant(id))?.hub).toBeUndefined();
+  });
+
+  describe('sweepExpiredOAuthRows', () => {
+    const DAY = 24 * 60 * 60;
+    const client = (id: string) =>
+      ({ client_id: id, redirect_uris: ['https://a/cb'] }) as OAuthClientInformationFull;
+    const token = (grantId: string, kind: 'code' | 'access' | 'refresh', expiresAt: number) =>
+      store().saveToken({ token: `${grantId}-${kind}-${expiresAt}`, kind, grantId, expiresAt });
+    const hasToken = async (grantId: string, kind: 'code' | 'access' | 'refresh', expiresAt: number) =>
+      (await store().getToken(`${grantId}-${kind}-${expiresAt}`, kind)) !== undefined;
+
+    it('deletes expired codes, access and refresh tokens, and keeps live ones', async () => {
+      const id = await store().createGrant('c1', signIn());
+      const now = NOW();
+      for (const kind of ['code', 'access', 'refresh'] as const) {
+        await token(id, kind, now - 1);
+        await token(id, kind, now + 600);
+      }
+      await token(id, 'access', now); // expires at `now`: already unusable
+
+      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0 });
+      for (const kind of ['code', 'access', 'refresh'] as const) {
+        expect(await hasToken(id, kind, now - 1)).toBe(false);
+        expect(await hasToken(id, kind, now + 600)).toBe(true);
+      }
+      expect(await store().getGrant(id)).toBeDefined();
+    });
+
+    it('deletes a revoked grant without tokens once the retention has passed', async () => {
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect((await store().sweepExpiredOAuthRows(due + 60)).grants).toBe(1);
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    it('keeps a revoked grant that still has a live token, and any unrevoked grant', async () => {
+      const revoked = await store().createGrant('c1', signIn());
+      const unrevoked = await store().createGrant('c1', signIn());
+      await store().revokeGrant(revoked);
+      const later = NOW() + 365 * DAY;
+      await token(revoked, 'refresh', later + 600);
+
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(revoked)).toBeDefined();
+      expect(await store().getGrant(unrevoked)).toBeDefined();
+    });
+
+    it('deletes a client without grants once the retention has passed, never one with a grant', async () => {
+      await store().saveClient(client('unused'));
+      await store().saveClient(client('revoked'));
+      await store().saveClient(client('live'));
+      const revoked = await store().createGrant('revoked', signIn());
+      await store().revokeGrant(revoked);
+      await store().createGrant('live', signIn());
+      const due = NOW() + UNUSED_CLIENT_RETENTION_SECONDS;
+      // Keeps the revoked grant (and so its client) past both retentions.
+      await token(revoked, 'refresh', due + 600);
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getClient('unused')).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().getClient('unused')).toBeUndefined();
+      expect(await store().getClient('revoked')).toBeDefined();
+      expect(await store().getClient('live')).toBeDefined();
+    });
+
+    it('deletes a client in the same run that deletes its last grant', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await token(id, 'access', NOW() + 600);
+      await store().revokeGrant(id);
+
+      expect(await store().sweepExpiredOAuthRows(NOW() + 365 * DAY)).toEqual({
+        tokens: 1,
+        grants: 1,
+        clients: 1
+      });
+      expect(await store().getClient('c1')).toBeUndefined();
+    });
+
+    // A refresh exchange deletes the old refresh token before saving the new pair.
+    it('never deletes a live grant caught between a refresh delete and the save of the new pair', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      const expiresAt = NOW() + 600;
+      await token(id, 'refresh', expiresAt);
+      expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
+
+      await store().sweepExpiredOAuthRows(NOW() + 365 * DAY);
+      await token(id, 'refresh', expiresAt + 600);
+      expect((await store().getGrant(id))?.revoked).toBe(false);
+      expect(await store().getClient('c1')).toBeDefined();
+    });
+
+    it('returns zeros on a second run over the same rows', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c2', signIn());
+      await token(id, 'access', NOW() - 1);
+      await store().revokeGrant(id);
+      const later = NOW() + 365 * DAY;
+
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+    });
   });
 });
 

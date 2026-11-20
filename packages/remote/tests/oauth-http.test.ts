@@ -632,6 +632,37 @@ describe('oauth over http, in order', () => {
     ]);
   });
 
+  it.skipIf(!PG_URL)('deletes expired tokens and old unused clients at boot, logging the counts', async () => {
+    const grant = await admin!.query<{ id: string }>(
+      `SELECT id FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL LIMIT 1`
+    );
+    await admin!.query(
+      `INSERT INTO ${PG_SCHEMA}.oauth_clients (client_id, data, created_at)
+       VALUES ('unused-client', '{"client_id":"unused-client"}', now() - interval '31 days')`
+    );
+    await admin!.query(
+      `INSERT INTO ${PG_SCHEMA}.oauth_tokens (token_hash, kind, grant_id, expires_at)
+       VALUES ('expired-token', 'access', $1, now() - interval '1 hour')`,
+      [grant.rows[0]!.id]
+    );
+    const exited = new Promise((resolve) => child!.once('exit', resolve));
+    child!.kill('SIGTERM');
+    await exited;
+    const logged = stderr.length;
+    await startServer();
+
+    await vi.waitFor(() =>
+      expect(stderr.slice(logged).join('')).toMatch(
+        /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ revoked grant\(s\), 1 unused client\(s\)/
+      )
+    );
+    const left = await admin!.query(
+      `SELECT 1 FROM ${PG_SCHEMA}.oauth_clients WHERE client_id = 'unused-client'
+       UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_tokens WHERE token_hash = 'expired-token'`
+    );
+    expect(left.rowCount).toBe(0);
+  });
+
   // The request that started the refresh is gone (client hung up), so only
   // drain() stands between SIGTERM and an exit that loses the rotated pair.
   // Windows has no SIGTERM: kill() ends the child at once, so there is no shutdown to observe.

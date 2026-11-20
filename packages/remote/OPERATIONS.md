@@ -103,6 +103,21 @@ When the hub rejects a tool call's token and the token refresh that follows fail
 `tool_call` line has `outcome` `error` and no `status`. The reason is on the `hub_refresh` line
 of the same `connection` just before it.
 
+### Cleanup of old rows
+
+At boot and then every hour the server deletes expired tokens, revoked connections with no
+token left 7 days after the revoke, and registered clients with no connection 30 days after
+registration. When it deletes anything it writes one line:
+`[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> revoked grant(s), <n>
+unused client(s)`. A failed run writes `OAuth store cleanup failed, retried within an hour:
+the <tokens|grants|clients> step failed: <code>`, and the next run tries again.
+
+A returning user can hit this: when all connections of a client were revoked (a disconnect,
+or [the 90-day end](#the-90-day-end)) and deleted, and the client is more than 30 days old,
+the client is deleted too. The user's next sign-in from that client gets a `400`
+`invalid_client` ("Invalid client_id") answer from `/authorize`. The fix is to remove the
+connector in the client and add it again.
+
 ### The 90-day end
 
 Every connection ends 90 days after its sign-in, however often it is used: each hub refresh

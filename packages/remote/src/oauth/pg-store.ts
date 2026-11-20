@@ -1,16 +1,17 @@
-import pg from 'pg';
-import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { XyteError } from '@xyteai/mcp/http/errors.js';
-import { logError } from '@xyteai/mcp/log.js';
-import type { HubSignIn, HubTokens } from './hub-oauth.js';
+import { existsSync } from "node:fs";
+import pg from "pg";
+import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { XyteError } from "@xyteai/mcp/http/errors.js";
+import { logError } from "@xyteai/mcp/log.js";
+import type { HubSignIn, HubTokens } from "./hub-oauth.js";
 import {
   hashToken,
   type GrantRecord,
   type NewToken,
   type OAuthStore,
   type TokenKind,
-  type TokenRecord
-} from './store.js';
+  type TokenRecord,
+} from "./store.js";
 
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
@@ -73,45 +74,102 @@ const SCHEMA_LOCK_ID = 674_601;
  * database (the `host` param, which pg prefers over the URL host, or a unix
  * socket) gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
  * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
- * A DSN that URL can't parse but pg can (`postgres://u:p@/db?host=/socket`)
- * is left to pg too.
+ * The host is the one pg itself resolves (the `host` param over the URL host, a
+ * %2F-encoded socket path, PGHOST), so this decides TLS for the host pg reaches.
  */
 export function sslOption(databaseUrl: string): { ssl?: true } {
-  let host: string;
-  try {
-    const url = new URL(databaseUrl);
-    host = url.searchParams.get('host') ?? url.hostname;
-  } catch {
+  // ponytail: connectionParameters is pg's untyped internal; the pg-ssl specs pin its shape.
+  const client = new pg.Client({
+    connectionString: databaseUrl,
+  }) as unknown as PgClientInternals;
+  const host = client.connectionParameters.host;
+  if (LOCAL_HOSTS.has(host) || host.startsWith("/")) return {};
+  if (
+    process.env.PGSSLMODE === "no-verify" ||
+    process.env.PGSSLMODE === "disable"
+  )
     return {};
-  }
-  if (host === 'localhost' || host === '127.0.0.1' || host.startsWith('/')) return {};
-  if (process.env.PGSSLMODE === 'no-verify' || process.env.PGSSLMODE === 'disable') return {};
   return { ssl: true };
 }
 
+interface PgClientInternals {
+  connectionParameters: { host: string };
+}
+
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+// Unknown-issuer codes: the chain is fine, only its CA is missing from the trust store.
+const MISSING_CA_CODES = new Set([
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+]);
+
+const NO_VERIFY_HINT =
+  "PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk); if DATABASE_URL carries an sslmode, use sslmode=no-verify there instead.";
+
 /** What to try when the boot connection fails, by the kind of failure. */
 export function bootConnectionHints(error: unknown): string[] {
-  const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+  if (!(error instanceof Error)) return [];
+  const { code, syscall, path } = error as NodeJS.ErrnoException;
   // A trusted certificate for another name: no CA setting fixes that.
-  if (code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
-    return ["The DATABASE_URL host must match a name on the server's certificate."];
-  }
-  if (code === 'CERT_HAS_EXPIRED' || code === 'CERT_NOT_YET_VALID') {
+  if (code === "ERR_TLS_CERT_ALTNAME_INVALID") {
     return [
-      "The server certificate is expired or not yet valid — check the database's certificate, or this machine's clock."
+      "The DATABASE_URL host must match a name on the server's certificate.",
+      NO_VERIFY_HINT,
     ];
   }
-  // Node's verification codes: SELF_SIGNED_CERT_IN_CHAIN, UNABLE_TO_VERIFY_LEAF_SIGNATURE, …
+  if (code === "CERT_HAS_EXPIRED" || code === "CERT_NOT_YET_VALID") {
+    return [
+      "The server certificate is expired or not yet valid — check the database's certificate, or this machine's clock.",
+      NO_VERIFY_HINT,
+    ];
+  }
+  if (code && MISSING_CA_CODES.has(code)) {
+    const extraCa = process.env.NODE_EXTRA_CA_CERTS;
+    return [
+      `Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs; now ${extraCa ? `${extraCa}, ${existsSync(extraCa) ? "present" : "missing"}` : "unset"}), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.`,
+      NO_VERIFY_HINT,
+    ];
+  }
+  // Revoked, rejected or a bad signature: a sign of tampering, so no opt-out is offered.
   if (code && /CERT|SIGNATURE/.test(code)) {
     return [
-      "Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.",
-      'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk); if DATABASE_URL carries an sslmode, use sslmode=no-verify there instead.'
+      "The server's certificate was rejected (revoked or a bad signature) — check the database's certificate before trusting it.",
     ];
   }
-  if (error instanceof Error && /does not support SSL/.test(error.message)) {
-    return ['A database without TLS: add sslmode=disable to DATABASE_URL.'];
+  if ((code === "ENOENT" || code === "EACCES") && syscall === "open") {
+    return [
+      `Cannot read ${path ?? "a file"}: check the sslrootcert path in DATABASE_URL.`,
+    ];
+  }
+  if (/does not support SSL/.test(error.message)) {
+    return [
+      "A database without TLS: add sslmode=disable to DATABASE_URL, or set PGSSLMODE=disable.",
+    ];
   }
   return [];
+}
+
+/**
+ * The boot failure in one line. pg's own code and detail are kept, and a Node 22
+ * multi-address connect failure (an AggregateError with an empty message) shows
+ * its inner errors.
+ */
+export function bootFailureMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const inner =
+    error instanceof AggregateError
+      ? error.errors.map((e: unknown) =>
+          e instanceof Error ? e.message : String(e),
+        )
+      : [];
+  const { code, detail } = error as Error & { code?: string; detail?: string };
+  return [error.message || inner.join("; "), code && `[${code}]`, detail]
+    .filter(Boolean)
+    .join(" ");
 }
 
 interface TokenRow {
@@ -138,39 +196,44 @@ export class PgOAuthStore implements OAuthStore {
   private constructor(private readonly pool: pg.Pool) {}
 
   static async connect(databaseUrl: string): Promise<PgOAuthStore> {
-    const pool = new pg.Pool({
-      connectionString: databaseUrl,
-      ...sslOption(databaseUrl),
-      max: 5,
-      // Unbounded by default: an unreachable or hung database would hang boot
-      // past Heroku's R10 and every token check instead of failing with a 503.
-      connectionTimeoutMillis: 10_000,
-      query_timeout: 10_000
-    });
-    // An idle client dropped server-side (maintenance, failover) is emitted here;
-    // unhandled, it exits the process. The pool replaces the client on its own.
-    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
-    // One multi-statement query runs as one transaction, so the xact lock holds
-    // for all of it: two boots on an empty database (preboot, a one-off dyno)
-    // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
+    let pool: pg.Pool | undefined;
     try {
-      await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+      // Inside the try: parsing the DSN reads an sslrootcert file, which may be missing.
+      pool = new pg.Pool({
+        connectionString: databaseUrl,
+        ...sslOption(databaseUrl),
+        max: 5,
+        // Unbounded by default: an unreachable or hung database would hang boot
+        // past Heroku's R10 and every token check instead of failing with a 503.
+        connectionTimeoutMillis: 10_000,
+        query_timeout: 10_000,
+      });
+      // An idle client dropped server-side (maintenance, failover) is emitted here;
+      // unhandled, it exits the process. The pool replaces the client on its own.
+      pool.on("error", (error) => logError(`postgres pool: ${error.message}`));
+      // One multi-statement query runs as one transaction, so the xact lock holds
+      // for all of it: two boots on an empty database (preboot, a one-off dyno)
+      // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
+      await pool.query(
+        `SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`,
+      );
     } catch (error) {
-      await pool.end().catch(() => {});
-      const message = error instanceof Error ? error.message : String(error);
+      await pool?.end().catch(() => {});
       throw new XyteError(
-        'config',
-        `Postgres setup failed at boot: ${message}`,
-        bootConnectionHints(error)
+        "config",
+        `Postgres setup failed at boot: ${bootFailureMessage(error)}`,
+        bootConnectionHints(error),
       );
     }
     return new PgOAuthStore(pool);
   }
 
-  async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
+  async getClient(
+    clientId: string,
+  ): Promise<OAuthClientInformationFull | undefined> {
     const result = await this.pool.query<{ data: OAuthClientInformationFull }>(
-      'SELECT data FROM oauth_clients WHERE client_id = $1',
-      [clientId]
+      "SELECT data FROM oauth_clients WHERE client_id = $1",
+      [clientId],
     );
     return result.rows[0]?.data;
   }
@@ -179,7 +242,7 @@ export class PgOAuthStore implements OAuthStore {
     await this.pool.query(
       `INSERT INTO oauth_clients (client_id, data) VALUES ($1, $2)
        ON CONFLICT (client_id) DO UPDATE SET data = EXCLUDED.data`,
-      [client.client_id, JSON.stringify(client)]
+      [client.client_id, JSON.stringify(client)],
     );
   }
 
@@ -195,18 +258,19 @@ export class PgOAuthStore implements OAuthStore {
         hub.refreshToken,
         hub.expiresAt,
         hub.sub,
-        hub.email ?? null
-      ]
+        hub.email ?? null,
+      ],
     );
     const row = result.rows[0];
-    if (!row) throw new Error('grant insert returned no row');
+    if (!row) throw new Error("grant insert returned no row");
     return row.id;
   }
 
   async getGrant(grantId: string): Promise<GrantRecord | undefined> {
-    const result = await this.pool.query<GrantRow>('SELECT * FROM oauth_grants WHERE id = $1', [
-      grantId
-    ]);
+    const result = await this.pool.query<GrantRow>(
+      "SELECT * FROM oauth_grants WHERE id = $1",
+      [grantId],
+    );
     const row = result.rows[0];
     if (!row) return undefined;
     return {
@@ -220,11 +284,11 @@ export class PgOAuthStore implements OAuthStore {
               expiresAt: Math.floor(row.hub_expires_at.getTime() / 1000),
               sub: row.hub_sub,
               tenantId: row.hub_tenant,
-              ...(row.hub_email ? { email: row.hub_email } : {})
-            }
+              ...(row.hub_email ? { email: row.hub_email } : {}),
+            },
           }
         : {}),
-      revoked: row.revoked_at !== null
+      revoked: row.revoked_at !== null,
     };
   }
 
@@ -233,31 +297,41 @@ export class PgOAuthStore implements OAuthStore {
       `UPDATE oauth_grants
           SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
         WHERE id = $1 AND revoked_at IS NULL`,
-      [grantId]
+      [grantId],
     );
   }
 
   async rotateHubTokens(
     grantId: string,
     previousRefreshToken: string,
-    next: HubTokens
+    next: HubTokens,
   ): Promise<boolean> {
     const result = await this.pool.query(
       `UPDATE oauth_grants
           SET hub_access_token = $3, hub_refresh_token = $4, hub_expires_at = to_timestamp($5)
         WHERE id = $1 AND hub_refresh_token = $2`,
-      [grantId, previousRefreshToken, next.accessToken, next.refreshToken, next.expiresAt]
+      [
+        grantId,
+        previousRefreshToken,
+        next.accessToken,
+        next.refreshToken,
+        next.expiresAt,
+      ],
     );
     return result.rowCount === 1;
   }
 
-  async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
+  async hasLiveHubSibling(
+    sub: string,
+    tenantId: string,
+    exceptGrantId: string,
+  ): Promise<boolean> {
     const result = await this.pool.query(
       `SELECT 1 FROM oauth_grants g JOIN oauth_tokens t ON t.grant_id = g.id
         WHERE g.hub_sub = $1 AND g.hub_tenant = $2 AND g.id <> $3 AND g.revoked_at IS NULL
           AND t.kind IN ('access', 'refresh') AND t.expires_at > now()
         LIMIT 1`,
-      [sub, tenantId, exceptGrantId]
+      [sub, tenantId, exceptGrantId],
     );
     return (result.rowCount ?? 0) > 0;
   }
@@ -273,15 +347,18 @@ export class PgOAuthStore implements OAuthStore {
         token.codeChallenge ?? null,
         token.redirectUri ?? null,
         token.resource ?? null,
-        token.expiresAt
-      ]
+        token.expiresAt,
+      ],
     );
   }
 
-  async getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined> {
+  async getToken(
+    token: string,
+    kind: TokenKind,
+  ): Promise<TokenRecord | undefined> {
     const result = await this.pool.query<TokenRow>(
-      'SELECT * FROM oauth_tokens WHERE kind = $1 AND token_hash = $2',
-      [kind, hashToken(token)]
+      "SELECT * FROM oauth_tokens WHERE kind = $1 AND token_hash = $2",
+      [kind, hashToken(token)],
     );
     const row = result.rows[0];
     if (!row) return undefined;
@@ -291,14 +368,14 @@ export class PgOAuthStore implements OAuthStore {
       expiresAt: Math.floor(row.expires_at.getTime() / 1000),
       ...(row.code_challenge ? { codeChallenge: row.code_challenge } : {}),
       ...(row.redirect_uri ? { redirectUri: row.redirect_uri } : {}),
-      ...(row.resource ? { resource: row.resource } : {})
+      ...(row.resource ? { resource: row.resource } : {}),
     };
   }
 
   async deleteToken(token: string, kind: TokenKind): Promise<boolean> {
     const result = await this.pool.query(
-      'DELETE FROM oauth_tokens WHERE kind = $1 AND token_hash = $2 RETURNING 1',
-      [kind, hashToken(token)]
+      "DELETE FROM oauth_tokens WHERE kind = $1 AND token_hash = $2 RETURNING 1",
+      [kind, hashToken(token)],
     );
     return result.rowCount === 1;
   }

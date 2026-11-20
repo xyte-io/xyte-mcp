@@ -461,7 +461,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
   logs users out. At boot and then hourly the server deletes expired tokens, revoked grants
   with no token left after 7 days (the row shows who was signed out and when), sign-ins with
-  no token left after 97 days (hub's 90-day chain has ended, plus a week), sign-ins whose
+  no token left, 97 days after the sign-in (hub's 90-day chain has ended, plus a week), sign-ins whose
   client is gone, and registered clients with no grant after 30 days (registration is open,
   so junk registrations go; a client in use keeps its grant). A returning user whose client
   was deleted must re-add the connector; see "Cleanup of old rows" in

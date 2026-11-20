@@ -665,6 +665,38 @@ describe('oauth over http, in order', () => {
     expect(left.rowCount).toBe(0);
   });
 
+  // The run above deleted all that was due. A statement trigger marks the last step's end.
+  it.skipIf(!PG_URL)('writes no cleanup line for a boot run that deletes nothing', async () => {
+    await admin!.query(`CREATE TABLE ${PG_SCHEMA}.cleanup_done (at timestamptz)`);
+    await admin!.query(
+      `CREATE FUNCTION ${PG_SCHEMA}.mark_cleanup_done() RETURNS trigger LANGUAGE plpgsql AS
+       $$ BEGIN INSERT INTO ${PG_SCHEMA}.cleanup_done VALUES (now()); RETURN NULL; END $$`
+    );
+    await admin!.query(
+      `CREATE TRIGGER mark_cleanup_done AFTER DELETE ON ${PG_SCHEMA}.oauth_clients
+       FOR EACH STATEMENT EXECUTE FUNCTION ${PG_SCHEMA}.mark_cleanup_done()`
+    );
+    try {
+      const exited = new Promise((resolve) => child!.once('exit', resolve));
+      child!.kill('SIGTERM');
+      await exited;
+      const logged = stderr.length;
+      await startServer();
+
+      await vi.waitFor(
+        async () =>
+          expect((await admin!.query(`SELECT 1 FROM ${PG_SCHEMA}.cleanup_done`)).rowCount).toBe(1),
+        { timeout: 10_000 }
+      );
+      // The clients step has committed; give its answer time to reach the server.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(stderr.slice(logged).join('')).not.toContain('OAuth store cleanup');
+    } finally {
+      await admin!.query(`DROP FUNCTION ${PG_SCHEMA}.mark_cleanup_done() CASCADE`);
+      await admin!.query(`DROP TABLE ${PG_SCHEMA}.cleanup_done`);
+    }
+  });
+
   // A failed run is caught and logged (step and code only), and the server keeps serving.
   it.skipIf(!PG_URL)('logs a failed boot cleanup and keeps serving', async () => {
     await admin!.query(

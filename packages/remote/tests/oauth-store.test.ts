@@ -281,6 +281,19 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
+    // The real path to that orphan: the client is swept, then the hub callback creates the grant.
+    it('deletes the grant a callback created for a client swept during the sign-in, once its code expires', async () => {
+      await store().saveClient(client('c1'));
+      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      const id = await store().createGrant('c1', signIn());
+      const codeExpiresAt = NOW() + 600;
+      await token(id, 'code', codeExpiresAt);
+
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
     // A code never exchanged, or a user idle past the refresh lifetime: hub ended the chain.
     it('deletes an unrevoked grant without tokens whose client exists once the retention has passed', async () => {
       expect(ABANDONED_GRANT_RETENTION_SECONDS).toBe(97 * DAY);
@@ -336,8 +349,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await token(id, 'refresh', expiresAt);
       expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
 
-      // The latest run before ABANDONED_GRANT_RETENTION_SECONDS deletes a token-less grant.
-      await store().sweepExpiredOAuthRows(NOW() + 96 * DAY);
+      // A young grant, and the latest run before ABANDONED_GRANT_RETENTION_SECONDS: both keep it.
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
       await token(id, 'refresh', expiresAt + 600);
       expect((await store().getGrant(id))?.revoked).toBe(false);
       expect(await store().getClient('c1')).toBeDefined();
@@ -352,6 +366,29 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+    });
+
+    // A second save or revoke must not restart a retention, or a junk client or ended grant lives on.
+    it('counts the retentions from the first save of a client and the first revoke of a grant', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const first = NOW();
+      // Both clocks (this one, and Postgres now()) must move past `first + 1`.
+      await vi.waitFor(() => expect(NOW()).toBeGreaterThanOrEqual(first + 2), { timeout: 3000 });
+      await store().saveClient(client('c1'));
+      await store().revokeGrant(id);
+
+      expect(await store().sweepExpiredOAuthRows(first + 1 + REVOKED_GRANT_RETENTION_SECONDS)).toEqual({
+        tokens: 0,
+        grants: 1,
+        clients: 0
+      });
+      expect(await store().sweepExpiredOAuthRows(first + 1 + UNUSED_CLIENT_RETENTION_SECONDS)).toEqual({
+        tokens: 0,
+        grants: 0,
+        clients: 1
+      });
     });
   });
 });
@@ -384,6 +421,69 @@ describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
     } finally {
       vi.restoreAllMocks();
       await store.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
+  let admin: pg.Pool;
+  beforeAll(() => {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  });
+  beforeEach(async () => {
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+  });
+  afterAll(async () => {
+    await admin.end();
+  });
+
+  // Every dyno runs its own cleanup: a concurrent run deletes nothing the other one did.
+  it('two concurrent runs on two pools delete each row once between them', async () => {
+    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        await a.saveClient({ client_id: `c${i}`, redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
+        const id = await a.createGrant(`c${i}`, signIn());
+        await a.saveToken({ token: `t${i}`, kind: 'access', grantId: id, expiresAt: NOW() + 600 });
+        await a.revokeGrant(id);
+      }
+      const later = NOW() + 365 * 24 * 60 * 60;
+      const [fromA, fromB] = await Promise.all([a.sweepExpiredOAuthRows(later), b.sweepExpiredOAuthRows(later)]);
+      expect({
+        tokens: fromA.tokens + fromB.tokens,
+        grants: fromA.grants + fromB.grants,
+        clients: fromA.clients + fromB.clients
+      }).toEqual({ tokens: 3, grants: 3, clients: 3 });
+    } finally {
+      await Promise.all([a.close(), b.close()]);
+    }
+  });
+
+  // Else the next step would query an ended pool and the run would fail at shutdown.
+  it('close() during a run lets the step in flight finish and issues no later step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
+    const issued: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    vi.spyOn(pool, 'query').mockImplementation((async (sql: string, values?: unknown[]) => {
+      issued.push(sql);
+      const result = await query(sql, values);
+      if (sql.includes('DELETE FROM oauth_tokens')) await held;
+      return result;
+    }) as never);
+    try {
+      const run = store.sweepExpiredOAuthRows(NOW());
+      await vi.waitFor(() => expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true));
+      const closed = store.close();
+      release();
+      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0 });
+      await closed;
+      expect(issued.some((sql) => /DELETE FROM oauth_(grants|clients)/.test(sql))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
     }
   });
 });

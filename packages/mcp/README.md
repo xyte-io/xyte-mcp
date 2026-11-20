@@ -448,7 +448,11 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
   logged with its id, the key id and the reason, and revoked on first read: the client gets a
   `401` and its user connects again. Upgrading from a build that stored them unencrypted
-  signs every existing connection out once. The schema is versioned: at boot the server applies the migrations it
+  signs every existing connection out once. That clears the plain-text tokens only in this
+  database: a backup, fork or follower taken before still holds usable hub refresh tokens. So
+  after that upgrade, have the hub re-issue this server's OAuth client secret and set it as
+  `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` (a hub refresh needs it, so the old copies' tokens stop
+  working), and treat those copies as sensitive until then. The schema is versioned: at boot the server applies the migrations it
   has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
   so two booting dynos take turns. All of them run in one transaction, so a failed
   migration leaves the database unchanged and stops the boot with the migration's version
@@ -504,9 +508,11 @@ a public sign-in URL.
   changing a config var restarts the dyno). OAuth gives each user their own sign-in
   instead. See [Remote HTTP transport](#remote-http-transport) and [OAuth 2.1](#oauth-21).
 - `XYTE_MCP_TOKEN_KEY` protects every stored hub token: keep it only in the platform's
-  config, never next to a database backup. To rotate it, set the new key as
-  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS` in one config
-  change. A connection in use is rewritten under the new key at its next hub refresh
+  config, never next to a database backup. Rotate it in two config changes, since a dyno
+  running the old config keeps serving while the new one starts: first keep
+  `XYTE_MCP_TOKEN_KEY` and set the new key as `XYTE_MCP_TOKEN_KEY_PREVIOUS` (every dyno can
+  now read it; none writes with it yet); once that is fully rolled out, set the new key as
+  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS`. A connection in use is rewritten under the new key at its next hub refresh
   (hourly); an idle one when it is next used, and one idle for 30 days can no longer
   refresh anyway (our refresh tokens' lifetime). Count the live connections still on the old
   key, with its id from the boot log:
@@ -516,8 +522,19 @@ a public sign-in URL.
    WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
   ```
 
-  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0, or after 30 days. A wrong or missing
-  previous key signs those users out for good: they have to connect again.
+  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0. After 30 days, first revoke the ones
+  left (they can no longer refresh):
+
+  ```sql
+  UPDATE oauth_grants
+     SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+         hub_refresh_token_hash = NULL
+   WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
+  ```
+
+  The server refuses to boot while a live connection uses a key it has neither as
+  `XYTE_MCP_TOKEN_KEY` nor as `XYTE_MCP_TOKEN_KEY_PREVIOUS`, naming that key id, so a wrong
+  key stops the deploy instead of signing everyone out.
 
 ## License
 

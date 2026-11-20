@@ -274,12 +274,15 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   });
 
   it('reads rows under the previous key, rewrites them under the current one on rotation', async () => {
+    // All booted before any grant exists: a store booting with KEY_A grants live
+    // and no KEY_A refuses to start (tested below); one already running revokes.
     const underA = await open(KEY_A);
+    const rotating = await open(KEY_B, KEY_A);
+    const onlyB = await open(KEY_B);
     const first = signIn(); // once: signIn() reads the clock
     const idle = await underA.createGrant('c1', first);
     const active = await underA.createGrant('c1', first);
 
-    const rotating = await open(KEY_B, KEY_A);
     expect((await rotating.getGrant(idle))?.hub).toEqual(first);
     const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
     expect(await rotating.rotateHubTokens(active, 'xort_1', next)).toBe(true);
@@ -288,7 +291,6 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect((await row(active)).hub_refresh_token).toMatch(new RegExp(`^v1\\.${idB}\\.`));
 
     // PREVIOUS dropped: the row never rewritten is revoked, the rotated one is not.
-    const onlyB = await open(KEY_B);
     const storedIdle = await row(idle);
     const logText = captureLog();
     const lost = await onlyB.getGrant(idle);
@@ -301,6 +303,35 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(logText()).toContain('revoking the grant');
     expect(logText()).not.toContain(storedIdle.hub_access_token!);
     expect(logText()).not.toContain(storedIdle.hub_refresh_token!);
+  });
+
+  // A wrong key would otherwise revoke every grant on first read.
+  it('refuses to boot while live grants use a key it does not have, naming only the key id', async () => {
+    const KEY_C = randomBytes(32);
+    const store = await open(KEY_A);
+    await store.createGrant('c1', signIn());
+    const idA = new TokenCipher(KEY_A).currentKeyId;
+
+    const refused = open(KEY_B);
+    await expect(refused).rejects.toThrow(
+      new RegExp(`live grants use hub token key id\\(s\\) ${idA}, which .*XYTE_MCP_TOKEN_KEY_PREVIOUS`)
+    );
+    await expect(refused).rejects.not.toThrow(KEY_A.toString('base64'));
+    await expect(open(KEY_C, KEY_B)).rejects.toThrow(idA);
+
+    // The two-step rotation passes at each step: new key as PREVIOUS, then swapped.
+    await open(KEY_A, KEY_B);
+    await open(KEY_B, KEY_A);
+    // The grant revoked (its tokens dropped): nothing left to read.
+    await store.revokeGrant('1');
+    await open(KEY_C);
+  });
+
+  it('boots with a new key over revoked rows that still hold tokens', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query('UPDATE oauth_grants SET revoked_at = now() WHERE id = $1', [id]);
+    await open(KEY_B);
   });
 
   // Else it would count as a live sibling, and a disconnect of the user's next

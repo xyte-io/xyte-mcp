@@ -293,6 +293,21 @@ export class PgOAuthStore implements OAuthStore {
     migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
     try {
       await migrateOAuthSchema(migrationPool);
+      // A wrong key would revoke every live grant on its first read: refuse to
+      // boot instead. Revoked rows are never decrypted, so they don't count.
+      // ponytail: a full scan of the live grants; fine until they number in the millions.
+      const { rows } = await migrationPool.query<{ key_id: string }>(
+        `SELECT DISTINCT split_part(hub_refresh_token, '.', 2) AS key_id FROM oauth_grants
+          WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.%'`
+      );
+      const unknown = rows
+        .map((row) => row.key_id)
+        .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
+      if (unknown.length) {
+        throw new Error(
+          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
+        );
+      }
     } finally {
       await migrationPool.end();
     }

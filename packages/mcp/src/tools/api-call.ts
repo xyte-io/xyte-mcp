@@ -96,7 +96,12 @@ export const apiCallTool = defineTool({
         structured
       );
     } catch (error) {
-      return toErrorResult(error, endpoint.key, context.secrets);
+      return toErrorResult(
+        error,
+        endpoint.key,
+        context.secrets,
+        typeof context.credentials.organization === 'object'
+      );
     }
   }
 });
@@ -104,12 +109,16 @@ export const apiCallTool = defineTool({
 function toErrorResult(
   error: unknown,
   endpointKey: string,
-  secrets: readonly string[]
+  secrets: readonly string[],
+  signedIn: boolean
 ): ReturnType<typeof errorResult> {
   if (error instanceof XyteHttpError) {
     const body = redactValue(error.body, secrets);
     const hints: string[] = [];
-    if (error.status === 401 || error.status === 403) {
+    if (signedIn) {
+      const hint = signedInAccessHint(error);
+      if (hint) hints.push(hint);
+    } else if (error.status === 401 || error.status === 403) {
       hints.push('The API key may be invalid, revoked, or lack the required scope.');
     }
     if (error.status === 404) {
@@ -130,4 +139,28 @@ function toErrorResult(
 
   const message = error instanceof Error ? error.message : String(error);
   return errorResult(`${endpointKey} failed: ${redactValue(message, secrets) as string}`);
+}
+
+/** Hub applies the signed-in user's own access; match its error_code, never its text. */
+function signedInAccessHint(error: XyteHttpError): string | undefined {
+  const errorCode =
+    typeof error.body === 'object' && error.body !== null
+      ? (error.body as { error_code?: unknown }).error_code
+      : undefined;
+  if (error.status === 403) {
+    if (errorCode === 'organization_administrator_required') {
+      return 'Only an organization administrator can do this. Ask an administrator of your organization.';
+    }
+    if (errorCode === 'no_access_to_resource') {
+      return 'You have no access to this item. Ask an organization administrator for access.';
+    }
+    return undefined;
+  }
+  if (error.status === 401) {
+    if (/error="invalid_token"/.test(error.wwwAuthenticate ?? '')) {
+      return 'Your Xyte sign-in has ended. Reconnect the Xyte connector to sign in again.';
+    }
+    return 'Check the ids in the request — the item may not be in this organization.';
+  }
+  return undefined;
 }

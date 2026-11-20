@@ -251,6 +251,14 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(hub.calls).toHaveLength(0);
   });
 
+  it('says the app acts with the signed-in user\'s own access', async () => {
+    const { provider } = makeProvider();
+    const { out } = await openConsent(provider, await registeredClient(provider));
+
+    expect(out.html).toContain('your own access');
+    expect(out.html).not.toContain('full access');
+  });
+
   it('approve sets a __Host- cookie and redirects to hub with our own PKCE + scope', async () => {
     const { provider } = makeProvider();
     const client = await registeredClient(provider);

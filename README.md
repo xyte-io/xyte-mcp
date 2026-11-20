@@ -201,8 +201,8 @@ sign-in on the same URL:
 - **OAuth 2.1** (`XYTE_MCP_ISSUER_URL`): the product — see
   [OAuth 2.1](#oauth-21). Users add the URL as a custom connector (claude.ai web included),
   sign in at hub and pick an organization, and every call runs with a hub OAuth token for
-  that organization. The token carries the organization's full authority, like an org API
-  key; the signed-in user is recorded for attribution, not used to narrow access.
+  that organization. The hub applies the signed-in user's own access on every call, so a
+  user who is not an organization administrator can do only what the hub allows them.
 
 It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
@@ -434,12 +434,11 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   to the hub** — each request resolves its grant and calls the hub with the stored hub
   token (the classic confused-deputy guard). Lifetimes: authorization code 10 minutes,
   access token 1 hour, refresh token 30 days (single-use, rotated on every exchange).
-- **Organization authority.** Calls send `Authorization: Bearer xoat_…` and
-  `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The token carries the
-  organization's full authority, like an org API key; the user is attribution only.
-  Who may sign in is the organization's choice when its administrator connects the app
-  at hub; because every signed-in user gets the same authority, "only organization
-  administrators" is the recommended sign-in policy. Writes are off unless
+- **Your own access.** Calls send `Authorization: Bearer xoat_…` and
+  `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The hub applies the
+  signed-in user's own access on every call, so a user who is not an organization
+  administrator can do only what the hub allows them. Who may sign in is the
+  organization's choice when its administrator connects the app at hub. Writes are off unless
   `XYTE_MCP_ALLOW_WRITES=1` — that is the control for what the agent may do. A sign-in
   yields an organization token only, so partner endpoints are not available through it.
 - **Hub token lifecycle.** A hub access token lives an hour; within a minute of expiry, or

@@ -2,7 +2,17 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['**/dist/**', '**/node_modules/**', '**/coverage/**', '**/tests/fixtures/**'] },
+  {
+    // vitest.config.ts sits outside the tsconfig projects, and the old explicit
+    // folder list never linted it either.
+    ignores: [
+      '**/dist/**',
+      '**/node_modules/**',
+      '**/coverage/**',
+      '**/tests/fixtures/**',
+      '**/vitest.config.ts'
+    ]
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
 

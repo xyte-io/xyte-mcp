@@ -55,7 +55,7 @@ jobs:
       - run: npm ci --ignore-scripts
       # The remote package imports the shared modules from @xyteai/mcp's dist.
       - run: npm run build -w @xyteai/mcp
-      - run: npm run test:unit -w @xyteai/mcp-remote -- tests/oauth-store.test.ts
+      - run: npm run test:unit -w @xyteai/mcp-remote -- tests/oauth-store.test.ts tests/pg-migrations.test.ts
 
   catalog-shape:
     # The generator needs a hub checkout, which CI does not have, so validate the
@@ -68,6 +68,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      # GitHub shows the root copies, npm the package copies; keep them identical.
+      - name: Root README and LICENSE match the published package's copies
+        run: |
+          cmp README.md packages/mcp/README.md
+          cmp LICENSE packages/mcp/LICENSE
       - name: Validate committed catalog
         run: |
           node --input-type=module -e '

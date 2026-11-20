@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Packs @xyteai/mcp as `npm publish` would and fails if the remote server's dependencies
 // (pg, express), the remote package itself, or its code leaked into the public package.
-// `--ignore-scripts` does not stop npm 10 from running `prepare` on pack, so this builds dist
-// first; it only skips the other lifecycle scripts.
+// It packs with `--ignore-scripts`, so `prepare` does not run and nothing is built here: the
+// caller must build dist first (`npm run build -w @xyteai/mcp`), or the dist checks see stale
+// or missing output.
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

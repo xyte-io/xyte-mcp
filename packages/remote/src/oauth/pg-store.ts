@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
 import { log, logError } from '@xyteai/mcp/log.js';
 import { errorCodeOf } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
@@ -240,16 +242,98 @@ export async function migrateOAuthSchema(
 }
 
 /**
- * An `sslmode` in the DSN decides on its own (pg lets it override this option
- * anyway), so a compose or CI host can opt out with `sslmode=disable`. Without
- * one: none for a local database, and Heroku's TLS otherwise — it requires TLS
- * but presents a chain the dyno can't verify.
+ * TLS verifies the server certificate (chain and hostname) by default, against
+ * Node's CA bundle plus NODE_EXTRA_CA_CERTS (one PEM file). Heroku's Postgres
+ * plans present AWS RDS-issued certificates whose CAs are in the platform's
+ * system bundle, which the Procfile loads that way unless a config var of the
+ * same name replaces it. A DSN `sslmode` (e.g. `disable` for a
+ * compose or CI host) still wins: pg applies it over this option. A local
+ * database (the `host` param, which pg prefers over the URL host, or a unix
+ * socket) gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
+ * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
+ * The host is the one pg itself resolves (the `host` param over the URL host, a
+ * %2F-encoded socket path, PGHOST), so this decides TLS for the host pg reaches.
  */
-function sslOption(databaseUrl: string): { ssl?: { rejectUnauthorized: false } } {
-  const url = new URL(databaseUrl);
-  if (url.searchParams.has('sslmode')) return {};
-  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
-  return { ssl: { rejectUnauthorized: false } };
+export function sslOption(databaseUrl: string): { ssl?: true } {
+  // ponytail: connectionParameters is pg's untyped internal; the pg-ssl specs pin its shape.
+  const client = new pg.Client({
+    connectionString: databaseUrl
+  }) as unknown as PgClientInternals;
+  const host = client.connectionParameters.host;
+  if (LOCAL_HOSTS.has(host) || host.startsWith('/')) return {};
+  if (process.env.PGSSLMODE === 'no-verify' || process.env.PGSSLMODE === 'disable') return {};
+  return { ssl: true };
+}
+
+interface PgClientInternals {
+  connectionParameters: { host: string };
+}
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+// Unknown-issuer codes: the chain is fine, only its CA is missing from the trust store.
+const MISSING_CA_CODES = new Set([
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
+]);
+
+const NO_VERIFY_HINT =
+  'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk); if DATABASE_URL carries an sslmode, use sslmode=no-verify there instead.';
+
+/** What to try when the boot connection fails, by the kind of failure. */
+export function bootConnectionHints(error: unknown): string[] {
+  if (!(error instanceof Error)) return [];
+  const { code, syscall, path } = error as NodeJS.ErrnoException;
+  // A trusted certificate for another name: no CA setting fixes that.
+  if (code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+    return ["The DATABASE_URL host must match a name on the server's certificate.", NO_VERIFY_HINT];
+  }
+  if (code === 'CERT_HAS_EXPIRED' || code === 'CERT_NOT_YET_VALID') {
+    return [
+      "The server certificate is expired or not yet valid — check the database's certificate, or this machine's clock.",
+      NO_VERIFY_HINT
+    ];
+  }
+  if (code && MISSING_CA_CODES.has(code)) {
+    const extraCa = process.env.NODE_EXTRA_CA_CERTS;
+    return [
+      `Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs; now ${extraCa ? `${extraCa}, ${existsSync(extraCa) ? 'present' : 'missing'}` : 'unset'}), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.`,
+      NO_VERIFY_HINT
+    ];
+  }
+  // Revoked, rejected or a bad signature: a sign of tampering, so no opt-out is offered.
+  if (code && /CERT|SIGNATURE/.test(code)) {
+    return [
+      "The server's certificate was rejected (revoked or a bad signature) — check the database's certificate before trusting it."
+    ];
+  }
+  if ((code === 'ENOENT' || code === 'EACCES') && syscall === 'open') {
+    return [`Cannot read ${path ?? 'a file'}: check the sslrootcert path in DATABASE_URL.`];
+  }
+  if (/does not support SSL/.test(error.message)) {
+    return [
+      'A database without TLS: add sslmode=disable to DATABASE_URL, or set PGSSLMODE=disable.'
+    ];
+  }
+  return [];
+}
+
+/**
+ * The boot failure in one line. pg's own code and detail are kept, and a Node 22
+ * multi-address connect failure (an AggregateError with an empty message) shows
+ * its inner errors.
+ */
+export function bootFailureMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const inner =
+    error instanceof AggregateError
+      ? error.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
+      : [];
+  const { code, detail } = error as Error & { code?: string; detail?: string };
+  return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
 }
 
 interface TokenRow {
@@ -279,19 +363,22 @@ export class PgOAuthStore implements OAuthStore {
   ) {}
 
   static async connect(databaseUrl: string, cipher: TokenCipher): Promise<PgOAuthStore> {
-    const connection = {
-      connectionString: databaseUrl,
-      ...sslOption(databaseUrl),
-      // Unbounded by default: an unreachable or hung database would hang boot
-      // past Heroku's R10 and every token check instead of failing with a 503.
-      connectionTimeoutMillis: 10_000
-    };
-    // Migrations get their own connection without query_timeout: pg's timeout
-    // only abandons a statement client-side, so a migration statement over
-    // 10 s could never commit. lock_timeout bounds their waits instead.
-    const migrationPool = new pg.Pool({ ...connection, max: 1 });
-    migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
+    let migrationPool: pg.Pool | undefined;
+    let pool: pg.Pool | undefined;
     try {
+      // Inside the try: parsing the DSN reads an sslrootcert file, which may be missing.
+      const connection = {
+        connectionString: databaseUrl,
+        ...sslOption(databaseUrl),
+        // Unbounded by default: an unreachable or hung database would hang boot
+        // past Heroku's R10 and every token check instead of failing with a 503.
+        connectionTimeoutMillis: 10_000
+      };
+      // Migrations get their own connection without query_timeout: pg's timeout
+      // only abandons a statement client-side, so a migration statement over
+      // 10 s could never commit. lock_timeout bounds their waits instead.
+      migrationPool = new pg.Pool({ ...connection, max: 1 });
+      migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
       await migrateOAuthSchema(migrationPool);
       // A wrong key would revoke every live grant on its first read: refuse to
       // boot instead. Revoked rows are never decrypted, so they don't count.
@@ -304,17 +391,27 @@ export class PgOAuthStore implements OAuthStore {
         .map((row) => row.key_id)
         .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
       if (unknown.length) {
-        throw new Error(
+        // A key problem, not a connection one: thrown as is past the wrapper below.
+        throw new XyteError(
+          'config',
           `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
         );
       }
+      pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
+      // An idle client dropped server-side (maintenance, failover) is emitted here;
+      // unhandled, it exits the process. The pool replaces the client on its own.
+      pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
+    } catch (error) {
+      await pool?.end().catch(() => {});
+      if (error instanceof XyteError) throw error;
+      throw new XyteError(
+        'config',
+        `Postgres setup failed at boot: ${bootFailureMessage(error)}`,
+        bootConnectionHints(error)
+      );
     } finally {
-      await migrationPool.end();
+      await migrationPool?.end().catch(() => {});
     }
-    const pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
-    // An idle client dropped server-side (maintenance, failover) is emitted here;
-    // unhandled, it exits the process. The pool replaces the client on its own.
-    pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
     log(
       `OAuth store: hub token key id ${cipher.currentKeyId}` +
         (cipher.previousKeyId ? ` (previous: ${cipher.previousKeyId})` : '')

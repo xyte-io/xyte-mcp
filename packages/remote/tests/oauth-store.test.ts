@@ -314,7 +314,8 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
 
     const refused = open(KEY_B);
     await expect(refused).rejects.toThrow(
-      new RegExp(`live grants use hub token key id\\(s\\) ${idA}, which .*XYTE_MCP_TOKEN_KEY_PREVIOUS`)
+      // Not wrapped as a connection failure: the operator sees the key text first.
+      new RegExp(`^OAuth store: live grants use hub token key id\\(s\\) ${idA}, which .*XYTE_MCP_TOKEN_KEY_PREVIOUS`)
     );
     await expect(refused).rejects.not.toThrow(KEY_A.toString('base64'));
     await expect(open(KEY_C, KEY_B)).rejects.toThrow(idA);

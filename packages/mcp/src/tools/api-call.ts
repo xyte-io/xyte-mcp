@@ -160,7 +160,7 @@ function signedInAccessHint(error: XyteHttpError): string | undefined {
     if (/error="invalid_token"/.test(error.wwwAuthenticate ?? '')) {
       return 'Your Xyte sign-in has ended. Reconnect the Xyte connector to sign in again.';
     }
-    return 'Check the ids in the request — the item may not be in this organization.';
+    return 'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
   }
   return undefined;
 }

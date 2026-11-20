@@ -166,6 +166,8 @@ describe('xyte_api_call', () => {
         http: stubHttp(() => error),
         credentials: { organization: { accessToken: 'xoat_abcdef123456' } }
       });
+    const IDS_HINT =
+      'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
 
     it.each([
       [
@@ -186,12 +188,8 @@ describe('xyte_api_call', () => {
         'Bearer error="invalid_token", error_description="expired"',
         'Your Xyte sign-in has ended. Reconnect the Xyte connector to sign in again.'
       ],
-      [
-        401,
-        { error: 'x' },
-        undefined,
-        'Check the ids in the request — the item may not be in this organization.'
-      ]
+      [401, { error: 'x' }, undefined, IDS_HINT],
+      [401, { error: 'x' }, 'Bearer error="insufficient_scope"', IDS_HINT]
     ])('%i %j %s gives its own hint', async (status, body, wwwAuthenticate, hint) => {
       const error = new XyteHttpError(status, 'Denied', body, READ_KEY, wwwAuthenticate);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
@@ -206,6 +204,21 @@ describe('xyte_api_call', () => {
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
       expect(result.isError).toBe(true);
       expect(result.content[0]?.text).not.toContain('\n- ');
+    });
+
+    it.each(['Forbidden', null])('gives no hint on a 403 with body %j', async (body) => {
+      const error = new XyteHttpError(403, 'Forbidden', body, READ_KEY);
+      const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).not.toContain('\n- ');
+    });
+
+    it('keeps the path-parameter hint on 404', async () => {
+      const error = new XyteHttpError(404, 'Not Found', { error: 'x' }, READ_KEY);
+      const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
+      expect(result.content[0]?.text).toContain(
+        'Check the path parameter values — the resource may not exist.'
+      );
     });
   });
 

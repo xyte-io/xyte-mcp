@@ -631,6 +631,23 @@ describe('XyteOAuthProvider: our tokens', () => {
     );
   });
 
+  // The Postgres store returns a grant without its hub tokens when it cannot decrypt them.
+  it('refuses a refresh on a grant whose hub tokens are unreadable, like an access check', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { tokens } = await connected(provider, client);
+    const getGrant = store.getGrant.bind(store);
+    vi.spyOn(store, 'getGrant').mockImplementation(async (id) => {
+      const { hub: _unreadable, ...grant } = (await getGrant(id))!;
+      return grant;
+    });
+
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid or expired/);
+    await expect(provider.exchangeRefreshToken(client, tokens.refresh_token!)).rejects.toThrow(
+      /invalid or expired/
+    );
+  });
+
   it('expires access tokens', async () => {
     const { provider } = makeProvider();
     const client = await registeredClient(provider);

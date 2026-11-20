@@ -70,7 +70,9 @@ hub. To keep them out, cut off the organization (above).
 
 This cut-off writes no `revoke` event: only the server writes those. Record it, with the
 `connection` id, in the ticket or the runbook, so the next person searching the logs for why
-the connection ended finds the reason.
+the connection ended finds the reason. Record there too whatever you may need from its row
+later (user, organization): the cleanup deletes the row about a week after its last token
+expires (see "Cleanup of old rows").
 
 ## Log events
 
@@ -102,6 +104,30 @@ argument. A field without a value is left out.
 When the hub rejects a tool call's token and the token refresh that follows fails, the
 `tool_call` line has `outcome` `error` and no `status`. The reason is on the `hub_refresh` line
 of the same `connection` just before it.
+
+### Cleanup of old rows
+
+At boot and then every hour the server deletes expired tokens, revoked connections with no
+token left 7 days after the revoke, connections left without a client (a sign-in still in
+progress when its client was deleted), connections with no token left 97 days after the sign-in
+(a sign-in never completed, or a user idle past the refresh lifetime: [the 90-day
+end](#the-90-day-end) has passed, plus a week), and registered clients with no connection 30
+days after registration. When it deletes anything it writes one line:
+`[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended grant(s), <n>
+unused client(s)`. Every dyno runs the cleanup; a run at the same time as another deletes
+nothing more, so the counts are not doubled and a dyno may log nothing. A failed run writes
+`[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: the
+<tokens|grants|clients> step failed: <code>`, and the next run tries again. `<code>` is the error code, as in `healthz: token store check failed: <code>`; a
+plain `Error` is usually a pg timeout (query or connect, 10 s). A query timeout stops only
+the wait: the delete may still finish in Postgres, so the next run's counts are lower.
+
+A returning user can hit this: when all connections of a client were revoked (a disconnect,
+or [the 90-day end](#the-90-day-end)) or abandoned (no token left and signed in more than 97
+days ago) and deleted, and the client is more than 30 days old, the client is deleted too. The user's next sign-in from that
+client gets a `400` `invalid_client` ("Invalid client_id") answer from `/authorize`, and
+from `/token` and `/revoke` too (a client usually first retries its stored refresh token).
+The server logs nothing for it: the router's lines are the only trace. The fix is to remove
+the connector in the client and add it again.
 
 ### The 90-day end
 

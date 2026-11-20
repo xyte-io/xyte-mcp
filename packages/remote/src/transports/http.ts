@@ -86,6 +86,8 @@ const SHUTDOWN_DEADLINE_MS = 28_000;
 const REQUEST_GRACE_MS = 10_000;
 /** A health probe answer is reused this long after its database check ends. */
 const HEALTH_CHECK_REUSE_MS = 2_000;
+/** Expired OAuth rows are deleted at boot and then this often (see sweepExpiredOAuthRows). */
+const OAUTH_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const { staticToken, oauth, port } = resolveHttpConfig(env);
@@ -337,11 +339,43 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     logError(`http listener failed: ${error.message}`);
     process.exit(1);
   });
+  // OAuth mode: expired tokens, and grants and clients nothing uses any more,
+  // are deleted now and then hourly. One run at a time; the next tick retries
+  // a failed run.
+  let oauthCleanup: NodeJS.Timeout | undefined;
+  if (store) {
+    const cleanupStore = store;
+    let cleaning = false;
+    const cleanUp = async () => {
+      if (cleaning) return;
+      cleaning = true;
+      try {
+        const deleted = await cleanupStore.sweepExpiredOAuthRows(Math.floor(Date.now() / 1000));
+        if (deleted.tokens || deleted.grants || deleted.clients) {
+          log(
+            `OAuth store cleanup: deleted ${deleted.tokens} expired token(s), ` +
+              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s)`
+          );
+        }
+      } catch (error) {
+        // The Postgres store's message names the failed step and the error code only.
+        const reason = error instanceof Error ? error.message : errorCodeOf(error);
+        logError(`OAuth store cleanup failed, retried within an hour: ${reason}`);
+      } finally {
+        cleaning = false;
+      }
+    };
+    void cleanUp();
+    oauthCleanup = setInterval(() => void cleanUp(), OAUTH_CLEANUP_INTERVAL_MS).unref();
+  }
+
   // Drain before the pool goes: a rotated hub pair that never reaches the store
   // is replayed on the next refresh, and hub then ends the user's sign-in.
+  // store.close() waits for a cleanup statement in flight, not the whole run.
   let stopping: Promise<void> | undefined;
   const stop = () =>
     (stopping ??= (async () => {
+      clearInterval(oauthCleanup);
       await provider?.drain();
       await store?.close().catch(() => undefined);
     })());

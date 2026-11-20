@@ -7,6 +7,10 @@ import { errorCodeOf, logEvent } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
+  ABANDONED_GRANT_RETENTION_SECONDS,
+  REVOKED_GRANT_RETENTION_SECONDS,
+  UNUSED_CLIENT_RETENTION_SECONDS,
+  type DeletedOAuthRowCounts,
   type GrantRecord,
   type NewToken,
   type OAuthStore,
@@ -426,6 +430,9 @@ interface GrantRow {
 }
 
 export class PgOAuthStore implements OAuthStore {
+  /** Set by close(): a cleanup run stops before its next statement. */
+  private closing = false;
+
   private constructor(
     private readonly pool: pg.Pool,
     private readonly cipher: TokenCipher
@@ -654,7 +661,68 @@ export class PgOAuthStore implements OAuthStore {
     return result.rowCount === 1;
   }
 
+  /**
+   * Three autocommit DELETEs, in foreign-key order (a token references its
+   * grant, without cascade). Each locks only the rows it deletes, which no
+   * request uses any more, so requests keep being served.
+   *
+   * Token expiries come from this app's clock, created_at and revoked_at from
+   * Postgres now(); a skew between the two is harmless at day-scale retentions.
+   *
+   * The grants step also deletes an unrevoked grant with no token whose client
+   * is gone (see OAuthStore.sweepExpiredOAuthRows); no time cutoff, its code
+   * row lives 10 minutes, so it goes on the run after the code expires. And an
+   * unrevoked grant with no token created more than
+   * ABANDONED_GRANT_RETENTION_SECONDS ago, whose hub sign-in chain has ended.
+   *
+   * ponytail: unbatched deletes, and no index on oauth_tokens.expires_at nor
+   * oauth_grants.client_id, so each step scans its table and the client step is
+   * one hash anti-join. Fine at pilot scale, but not bounded: the /register
+   * rate limit (1000/h) is per IP per process and resets on restart, so junk
+   * clients grow with the number of source IPs; there is no global cap. Batched
+   * deletes plus those indexes and one on oauth_clients.created_at (a
+   * migration) if a run ever gets slow; a global registration cap is separate work.
+   */
+  async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
+    const deleted = { tokens: 0, grants: 0, clients: 0 };
+    const steps: Array<[keyof DeletedOAuthRowCounts, string, number[]]> = [
+      ['tokens', 'DELETE FROM oauth_tokens WHERE expires_at <= to_timestamp($1)', [now]],
+      [
+        'grants',
+        `DELETE FROM oauth_grants g
+          WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)
+            AND (g.revoked_at < to_timestamp($1)
+              -- An orphan: its sign-in was at the hub when its client was swept.
+              OR (g.revoked_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM oauth_clients c WHERE c.client_id = g.client_id))
+              -- Abandoned: hub has ended its sign-in chain.
+              OR (g.revoked_at IS NULL AND g.created_at < to_timestamp($2)))`,
+        [now - REVOKED_GRANT_RETENTION_SECONDS, now - ABANDONED_GRANT_RETENTION_SECONDS]
+      ],
+      [
+        'clients',
+        `DELETE FROM oauth_clients c
+          WHERE c.created_at < to_timestamp($1)
+            AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)`,
+        [now - UNUSED_CLIENT_RETENTION_SECONDS]
+      ]
+    ];
+    for (const [step, sql, cutoffs] of steps) {
+      // Shutdown waits for the statement in flight, not for the whole run.
+      if (this.closing) break;
+      try {
+        deleted[step] = (await this.pool.query(sql, cutoffs)).rowCount ?? 0;
+      } catch (error) {
+        // The code only: a pg message can name the database host and role.
+        throw new Error(`the ${step} step failed: ${errorCodeOf(error)}`, { cause: error });
+      }
+    }
+    return deleted;
+  }
+
   async close(): Promise<void> {
+    this.closing = true;
+    // Waits for statements in flight (a cleanup step included), then disconnects.
     await this.pool.end();
   }
 }

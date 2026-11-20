@@ -632,6 +632,103 @@ describe('oauth over http, in order', () => {
     ]);
   });
 
+  it.skipIf(!PG_URL)('deletes expired tokens and old unused clients at boot, logging the counts', async () => {
+    const grant = await admin!.query<{ id: string }>(
+      `SELECT id FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL LIMIT 1`
+    );
+    await admin!.query(
+      `INSERT INTO ${PG_SCHEMA}.oauth_clients (client_id, data, created_at)
+       VALUES ('unused-client', '{"client_id":"unused-client"}', now() - interval '31 days')`
+    );
+    await admin!.query(
+      `INSERT INTO ${PG_SCHEMA}.oauth_tokens (token_hash, kind, grant_id, expires_at)
+       VALUES ('expired-token', 'access', $1, now() - interval '1 hour')`,
+      [grant.rows[0]!.id]
+    );
+    const exited = new Promise((resolve) => child!.once('exit', resolve));
+    child!.kill('SIGTERM');
+    await exited;
+    const logged = stderr.length;
+    await startServer();
+
+    await vi.waitFor(
+      () =>
+        expect(stderr.slice(logged).join('')).toMatch(
+          /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\)/
+        ),
+      { timeout: 10_000 }
+    );
+    const left = await admin!.query(
+      `SELECT 1 FROM ${PG_SCHEMA}.oauth_clients WHERE client_id = 'unused-client'
+       UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_tokens WHERE token_hash = 'expired-token'`
+    );
+    expect(left.rowCount).toBe(0);
+  });
+
+  // The run above deleted all that was due. A statement trigger marks the last step's end.
+  it.skipIf(!PG_URL)('writes no cleanup line for a boot run that deletes nothing', async () => {
+    await admin!.query(`CREATE TABLE ${PG_SCHEMA}.cleanup_done (at timestamptz)`);
+    await admin!.query(
+      `CREATE FUNCTION ${PG_SCHEMA}.mark_cleanup_done() RETURNS trigger LANGUAGE plpgsql AS
+       $$ BEGIN INSERT INTO ${PG_SCHEMA}.cleanup_done VALUES (now()); RETURN NULL; END $$`
+    );
+    await admin!.query(
+      `CREATE TRIGGER mark_cleanup_done AFTER DELETE ON ${PG_SCHEMA}.oauth_clients
+       FOR EACH STATEMENT EXECUTE FUNCTION ${PG_SCHEMA}.mark_cleanup_done()`
+    );
+    try {
+      const exited = new Promise((resolve) => child!.once('exit', resolve));
+      child!.kill('SIGTERM');
+      await exited;
+      const logged = stderr.length;
+      await startServer();
+
+      await vi.waitFor(
+        async () =>
+          expect((await admin!.query(`SELECT 1 FROM ${PG_SCHEMA}.cleanup_done`)).rowCount).toBe(1),
+        { timeout: 10_000 }
+      );
+      // The clients step has committed; give its answer time to reach the server.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(stderr.slice(logged).join('')).not.toContain('OAuth store cleanup');
+    } finally {
+      await admin!.query(`DROP FUNCTION ${PG_SCHEMA}.mark_cleanup_done() CASCADE`);
+      await admin!.query(`DROP TABLE ${PG_SCHEMA}.cleanup_done`);
+    }
+  });
+
+  // A failed run is caught and logged (step and code only), and the server keeps serving.
+  it.skipIf(!PG_URL)('logs a failed boot cleanup and keeps serving', async () => {
+    await admin!.query(
+      `CREATE FUNCTION ${PG_SCHEMA}.fail_cleanup() RETURNS trigger LANGUAGE plpgsql AS
+       $$ BEGIN RAISE EXCEPTION 'host=secret-host' USING ERRCODE = '57014'; END $$`
+    );
+    await admin!.query(
+      `CREATE TRIGGER fail_cleanup BEFORE DELETE ON ${PG_SCHEMA}.oauth_clients
+       FOR EACH STATEMENT EXECUTE FUNCTION ${PG_SCHEMA}.fail_cleanup()`
+    );
+    try {
+      const exited = new Promise((resolve) => child!.once('exit', resolve));
+      child!.kill('SIGTERM');
+      await exited;
+      const logged = stderr.length;
+      await startServer();
+
+      await vi.waitFor(
+        () =>
+          expect(stderr.slice(logged).join('')).toContain(
+            '[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: the clients step failed: 57014\n'
+          ),
+        { timeout: 10_000 }
+      );
+      expect(stderr.slice(logged).join('')).not.toContain('secret-host');
+      expect(child!.exitCode).toBeNull();
+      expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    } finally {
+      await admin!.query(`DROP FUNCTION ${PG_SCHEMA}.fail_cleanup() CASCADE`);
+    }
+  });
+
   // The request that started the refresh is gone (client hung up), so only
   // drain() stands between SIGTERM and an exit that loses the rotated pair.
   // Windows has no SIGTERM: kill() ends the child at once, so there is no shutdown to observe.

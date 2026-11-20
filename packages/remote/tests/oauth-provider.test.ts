@@ -1294,6 +1294,24 @@ describe('XyteOAuthProvider: revocation', () => {
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_1']);
   });
 
+  // A disconnect with an expired token: still a revoke until a cleanup run deletes the token.
+  it('revoking with an expired token revokes its grant before a cleanup run, and nothing after one', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const before = await connected(provider, client);
+    const after = await connected(provider, client);
+    const now = Math.floor(Date.now() / 1000);
+    await store.saveToken({ token: 'expired-before', kind: 'refresh', grantId: before.grantId, expiresAt: now - 1 });
+    await store.saveToken({ token: 'expired-after', kind: 'refresh', grantId: after.grantId, expiresAt: now - 1 });
+
+    await provider.revokeToken(client, { token: 'expired-before' });
+    expect((await store.getGrant(before.grantId))?.revoked).toBe(true);
+
+    await store.sweepExpiredOAuthRows(now);
+    await provider.revokeToken(client, { token: 'expired-after' });
+    expect((await store.getGrant(after.grantId))?.revoked).toBe(false);
+  });
+
   it("revoking another client's token is a silent no-op", async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);

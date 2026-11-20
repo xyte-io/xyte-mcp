@@ -4,7 +4,14 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HubSignIn } from '../src/oauth/hub-oauth.js';
 import { PgOAuthStore } from '../src/oauth/pg-store.js';
-import { hashToken, MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import {
+  hashToken,
+  MemoryOAuthStore,
+  ABANDONED_GRANT_RETENTION_SECONDS,
+  REVOKED_GRANT_RETENTION_SECONDS,
+  UNUSED_CLIENT_RETENTION_SECONDS,
+  type OAuthStore
+} from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
 
 /**
@@ -197,6 +204,287 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
     expect(await store().rotateHubTokens(id, 'xort_1', next)).toBe(false);
     expect((await store().getGrant(id))?.hub).toBeUndefined();
+  });
+
+  describe('sweepExpiredOAuthRows', () => {
+    const DAY = 24 * 60 * 60;
+    const client = (id: string) =>
+      ({ client_id: id, redirect_uris: ['https://a/cb'] }) as OAuthClientInformationFull;
+    const token = (grantId: string, kind: 'code' | 'access' | 'refresh', expiresAt: number) =>
+      store().saveToken({ token: `${grantId}-${kind}-${expiresAt}`, kind, grantId, expiresAt });
+    const hasToken = async (grantId: string, kind: 'code' | 'access' | 'refresh', expiresAt: number) =>
+      (await store().getToken(`${grantId}-${kind}-${expiresAt}`, kind)) !== undefined;
+
+    it('deletes expired codes, access and refresh tokens, and keeps live ones', async () => {
+      const id = await store().createGrant('c1', signIn());
+      const now = NOW();
+      for (const kind of ['code', 'access', 'refresh'] as const) {
+        await token(id, kind, now - 1);
+        await token(id, kind, now + 600);
+      }
+      await token(id, 'access', now); // expires at `now`: already unusable
+
+      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0 });
+      for (const kind of ['code', 'access', 'refresh'] as const) {
+        expect(await hasToken(id, kind, now - 1)).toBe(false);
+        expect(await hasToken(id, kind, now + 600)).toBe(true);
+      }
+      expect(await store().getGrant(id)).toBeDefined();
+    });
+
+    // No client saved: the orphan branch must not take a revoked grant before its retention.
+    it('keeps a revoked grant without tokens or client until the retention has passed', async () => {
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    it('deletes a revoked grant without tokens once the retention has passed, keeping its client', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+      expect(await store().getClient('c1')).toBeDefined();
+    });
+
+    it('keeps a revoked grant that still has a live token, and any unrevoked grant', async () => {
+      await store().saveClient(client('c1'));
+      const revoked = await store().createGrant('c1', signIn());
+      const unrevoked = await store().createGrant('c1', signIn());
+      await store().revokeGrant(revoked);
+      const later = NOW() + 96 * DAY; // below ABANDONED_GRANT_RETENTION_SECONDS
+      await token(revoked, 'refresh', later + 600);
+
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(revoked)).toBeDefined();
+      expect(await store().getGrant(unrevoked)).toBeDefined();
+    });
+
+    // A sign-in whose client the sweep deleted while it was at the hub.
+    it('deletes an unrevoked grant without tokens whose client is gone', async () => {
+      const id = await store().createGrant('gone', signIn());
+      await token(id, 'code', NOW() + 600);
+
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    // The real path to that orphan: the client is swept, then the hub callback creates the grant.
+    it('deletes the grant a callback created for a client swept during the sign-in, once its code expires', async () => {
+      await store().saveClient(client('c1'));
+      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      const id = await store().createGrant('c1', signIn());
+      const codeExpiresAt = NOW() + 600;
+      await token(id, 'code', codeExpiresAt);
+
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    // A code never exchanged, or a user idle past the refresh lifetime: hub ended the chain.
+    it('deletes an unrevoked grant without tokens whose client exists once the retention has passed', async () => {
+      expect(ABANDONED_GRANT_RETENTION_SECONDS).toBe(97 * DAY);
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      // The client, past its own retention, loses its last grant and goes in the same run.
+      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1 });
+      expect(await store().getGrant(id)).toBeUndefined();
+      expect(await store().getClient('c1')).toBeUndefined();
+    });
+
+    it('deletes a client without grants once the retention has passed, never one with a grant', async () => {
+      await store().saveClient(client('unused'));
+      await store().saveClient(client('revoked'));
+      await store().saveClient(client('live'));
+      const revoked = await store().createGrant('revoked', signIn());
+      await store().revokeGrant(revoked);
+      await store().createGrant('live', signIn());
+      const due = NOW() + UNUSED_CLIENT_RETENTION_SECONDS;
+      // Keeps the revoked grant (and so its client) past both retentions.
+      await token(revoked, 'refresh', due + 600);
+
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getClient('unused')).toBeDefined();
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().getClient('unused')).toBeUndefined();
+      expect(await store().getClient('revoked')).toBeDefined();
+      expect(await store().getClient('live')).toBeDefined();
+    });
+
+    it('deletes a client in the same run that deletes its last grant', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await token(id, 'access', NOW() + 600);
+      await store().revokeGrant(id);
+
+      expect(await store().sweepExpiredOAuthRows(NOW() + 365 * DAY)).toEqual({
+        tokens: 1,
+        grants: 1,
+        clients: 1
+      });
+      expect(await store().getClient('c1')).toBeUndefined();
+    });
+
+    // A refresh exchange deletes the old refresh token before saving the new pair.
+    it('never deletes a live grant caught between a refresh delete and the save of the new pair', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      const expiresAt = NOW() + 600;
+      await token(id, 'refresh', expiresAt);
+      expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
+
+      // A young grant, and the latest run before ABANDONED_GRANT_RETENTION_SECONDS: both keep it.
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      await token(id, 'refresh', expiresAt + 600);
+      expect((await store().getGrant(id))?.revoked).toBe(false);
+      expect(await store().getClient('c1')).toBeDefined();
+    });
+
+    it('returns zeros on a second run over the same rows', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c2', signIn());
+      await token(id, 'access', NOW() - 1);
+      await store().revokeGrant(id);
+      const later = NOW() + 365 * DAY;
+
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+    });
+
+    // A second save or revoke must not restart a retention, or a junk client or ended grant lives on.
+    it('counts the retentions from the first save of a client and the first revoke of a grant', async () => {
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+      await store().revokeGrant(id);
+      const first = NOW();
+      // Both clocks (this one, and Postgres now()) must move past `first + 1`.
+      await vi.waitFor(() => expect(NOW()).toBeGreaterThanOrEqual(first + 2), { timeout: 3000 });
+      await store().saveClient(client('c1'));
+      await store().revokeGrant(id);
+
+      expect(await store().sweepExpiredOAuthRows(first + 1 + REVOKED_GRANT_RETENTION_SECONDS)).toEqual({
+        tokens: 0,
+        grants: 1,
+        clients: 0
+      });
+      expect(await store().sweepExpiredOAuthRows(first + 1 + UNUSED_CLIENT_RETENTION_SECONDS)).toEqual({
+        tokens: 0,
+        grants: 0,
+        clients: 1
+      });
+    });
+  });
+});
+
+// A failing cleanup step names itself and its code only (a pg message can name the host and
+// role), and the steps after it are not issued.
+describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
+  it('throws "the <step> step failed: <code>" with the cause, and issues no later step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
+    const issued: string[] = [];
+    const failure = Object.assign(new Error('canceling statement, host=secret-host role=secret'), {
+      code: '57014'
+    });
+    vi.spyOn(pool, 'query').mockImplementation(((sql: string, values?: unknown[]) => {
+      issued.push(sql);
+      return sql.includes('DELETE FROM oauth_grants') ? Promise.reject(failure) : query(sql, values);
+    }) as never);
+    try {
+      const error = await store.sweepExpiredOAuthRows(NOW()).then(
+        () => undefined,
+        (rejected: unknown) => rejected as Error
+      );
+      expect(error?.message).toBe('the grants step failed: 57014');
+      expect(error?.message).not.toContain('secret');
+      expect(error?.cause).toBe(failure);
+      expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true);
+      expect(issued.some((sql) => sql.includes('DELETE FROM oauth_clients'))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await store.close();
+    }
+  });
+});
+
+describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
+  let admin: pg.Pool;
+  beforeAll(() => {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  });
+  beforeEach(async () => {
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+  });
+  afterAll(async () => {
+    await admin.end();
+  });
+
+  // Every dyno runs its own cleanup: a concurrent run deletes nothing the other one did.
+  it('two concurrent runs on two pools delete each row once between them', async () => {
+    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        await a.saveClient({ client_id: `c${i}`, redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
+        const id = await a.createGrant(`c${i}`, signIn());
+        await a.saveToken({ token: `t${i}`, kind: 'access', grantId: id, expiresAt: NOW() + 600 });
+        await a.revokeGrant(id);
+      }
+      const later = NOW() + 365 * 24 * 60 * 60;
+      const [fromA, fromB] = await Promise.all([a.sweepExpiredOAuthRows(later), b.sweepExpiredOAuthRows(later)]);
+      expect({
+        tokens: fromA.tokens + fromB.tokens,
+        grants: fromA.grants + fromB.grants,
+        clients: fromA.clients + fromB.clients
+      }).toEqual({ tokens: 3, grants: 3, clients: 3 });
+    } finally {
+      await Promise.all([a.close(), b.close()]);
+    }
+  });
+
+  // Else the next step would query an ended pool and the run would fail at shutdown.
+  it('close() during a run lets the step in flight finish and issues no later step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
+    const issued: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    vi.spyOn(pool, 'query').mockImplementation((async (sql: string, values?: unknown[]) => {
+      issued.push(sql);
+      const result = await query(sql, values);
+      if (sql.includes('DELETE FROM oauth_tokens')) await held;
+      return result;
+    }) as never);
+    try {
+      const run = store.sweepExpiredOAuthRows(NOW());
+      await vi.waitFor(() => expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true));
+      const closed = store.close();
+      release();
+      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0 });
+      await closed;
+      expect(issued.some((sql) => /DELETE FROM oauth_(grants|clients)/.test(sql))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 

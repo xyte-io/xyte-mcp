@@ -42,6 +42,43 @@ export interface NewToken extends TokenRecord {
   token: string;
 }
 
+/**
+ * How long a revoked grant is kept once it has no tokens left: a week, so the
+ * row still shows who (subject, tenant, email) and when it was revoked; the
+ * reason is on the `revoke` log line, read with it. Its hub tokens are already
+ * gone at revoke, so it holds nothing usable. A revoked grant keeps its token
+ * rows until they expire, so the real retention is at least this.
+ */
+export const REVOKED_GRANT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * How long an unrevoked grant with no token left is kept: a sign-in whose code
+ * was never exchanged, or a user idle past the refresh lifetime. Hub ends the
+ * sign-in chain 90 days after the first sign-in (README "OAuth 2.1"), so such a
+ * grant can never reach hub again; plus a week's margin, like the revoked-grant
+ * retention. A refresh exchange that loses the race with this delete answers
+ * 500; if that was the client's last grant and the client is past
+ * UNUSED_CLIENT_RETENTION_SECONDS, the same run deletes the client too, so the
+ * next attempt gets invalid_client and the connector must be re-added (without
+ * the race the user would re-authorize on the same client).
+ */
+export const ABANDONED_GRANT_RETENTION_SECONDS = 97 * 24 * 60 * 60;
+
+/**
+ * How long a registered client with no grant is kept. Registration is open
+ * (dynamic client registration), so junk registrations must go; this is far
+ * above the 10-minute pending sign-in window, and a client in use keeps its
+ * unrevoked grant, so it is never deleted.
+ */
+export const UNUSED_CLIENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
+
+/** Rows one cleanup run deleted, per table. */
+export interface DeletedOAuthRowCounts {
+  tokens: number;
+  grants: number;
+  clients: number;
+}
+
 export interface OAuthStore {
   getClient(clientId: string): Promise<OAuthClientInformationFull | undefined>;
   saveClient(client: OAuthClientInformationFull): Promise<void>;
@@ -73,6 +110,23 @@ export interface OAuthStore {
    */
   deleteToken(token: string, kind: TokenKind): Promise<boolean>;
 
+  /**
+   * Deletes, as of `now` (seconds since epoch): expired tokens; grants with no
+   * token left that were revoked more than REVOKED_GRANT_RETENTION_SECONDS ago,
+   * or are unrevoked but whose client is gone (a sign-in still at the hub when
+   * a sweep deleted its client: nothing can use it, /token needs the client),
+   * or are unrevoked and created more than ABANDONED_GRANT_RETENTION_SECONDS
+   * ago; clients with no grant, registered more than
+   * UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger unrevoked grant whose
+   * client exists: a refresh exchange deletes the old refresh token before it
+   * saves the new pair, so a live grant can briefly have none (and a client
+   * with a grant is never deleted).
+   * An orphan's hub tokens are not revoked at hub: nobody holds them once the
+   * row is gone, and hub ends the chain by itself.
+   * Safe while requests are served; a second run deletes nothing more.
+   */
+  sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts>;
+
   close(): Promise<void>;
 }
 
@@ -86,7 +140,13 @@ export function hashToken(token: string): string {
  */
 export class MemoryOAuthStore implements OAuthStore {
   private readonly clients = new Map<string, OAuthClientInformationFull>();
+  /** Seconds since epoch of each client's first save; kept out of the client record. */
+  private readonly clientCreatedAt = new Map<string, number>();
   private readonly grants = new Map<string, GrantRecord>();
+  /** Seconds since epoch of each grant's creation; kept out of GrantRecord. */
+  private readonly grantCreatedAt = new Map<string, number>();
+  /** Seconds since epoch of each grant's first revoke; kept out of GrantRecord. */
+  private readonly grantRevokedAt = new Map<string, number>();
   private readonly tokens = new Map<string, TokenRecord>();
   private nextGrantId = 1;
 
@@ -95,12 +155,16 @@ export class MemoryOAuthStore implements OAuthStore {
   }
 
   async saveClient(client: OAuthClientInformationFull): Promise<void> {
+    if (!this.clients.has(client.client_id)) {
+      this.clientCreatedAt.set(client.client_id, Math.floor(Date.now() / 1000));
+    }
     this.clients.set(client.client_id, client);
   }
 
   async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
     const id = String(this.nextGrantId++);
     this.grants.set(id, { id, clientId, hub, revoked: false });
+    this.grantCreatedAt.set(id, Math.floor(Date.now() / 1000));
     return id;
   }
 
@@ -112,7 +176,8 @@ export class MemoryOAuthStore implements OAuthStore {
 
   async revokeGrant(grantId: string): Promise<void> {
     const grant = this.grants.get(grantId);
-    if (grant) {
+    if (grant && !grant.revoked) {
+      this.grantRevokedAt.set(grantId, Math.floor(Date.now() / 1000));
       grant.revoked = true;
       delete grant.hub;
     }
@@ -156,6 +221,38 @@ export class MemoryOAuthStore implements OAuthStore {
 
   async deleteToken(token: string, kind: TokenKind): Promise<boolean> {
     return this.tokens.delete(`${kind}:${hashToken(token)}`);
+  }
+
+  async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
+    const deleted = { tokens: 0, grants: 0, clients: 0 };
+    for (const [key, token] of this.tokens) {
+      if (token.expiresAt <= now && this.tokens.delete(key)) deleted.tokens += 1;
+    }
+    const grantsWithTokens = new Set([...this.tokens.values()].map((token) => token.grantId));
+    for (const [id, grant] of this.grants) {
+      if (grantsWithTokens.has(id)) continue;
+      const revokedAt = this.grantRevokedAt.get(id);
+      const ended =
+        revokedAt === undefined
+          ? !this.clients.has(grant.clientId) ||
+            this.grantCreatedAt.get(id)! < now - ABANDONED_GRANT_RETENTION_SECONDS
+          : revokedAt < now - REVOKED_GRANT_RETENTION_SECONDS;
+      if (ended) {
+        this.grants.delete(id);
+        this.grantRevokedAt.delete(id);
+        this.grantCreatedAt.delete(id);
+        deleted.grants += 1;
+      }
+    }
+    const clientsWithGrants = new Set([...this.grants.values()].map((grant) => grant.clientId));
+    for (const [clientId, createdAt] of this.clientCreatedAt) {
+      if (createdAt < now - UNUSED_CLIENT_RETENTION_SECONDS && !clientsWithGrants.has(clientId)) {
+        this.clients.delete(clientId);
+        this.clientCreatedAt.delete(clientId);
+        deleted.clients += 1;
+      }
+    }
+    return deleted;
   }
 
   async close(): Promise<void> {

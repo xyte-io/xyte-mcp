@@ -1,9 +1,11 @@
+import { randomBytes } from 'node:crypto';
 import pg from 'pg';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HubSignIn } from '../src/oauth/hub-oauth.js';
 import { PgOAuthStore } from '../src/oauth/pg-store.js';
-import { MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import { hashToken, MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
 
 /**
  * The store guarantees the provider relies on, run against both stores: always
@@ -12,6 +14,8 @@ import { MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
  */
 
 const PG_URL = process.env.TEST_DATABASE_URL;
+const KEY_A = randomBytes(32);
+const KEY_B = randomBytes(32);
 const NOW = () => Math.floor(Date.now() / 1000);
 
 function signIn(overrides: Partial<HubSignIn> = {}): HubSignIn {
@@ -51,7 +55,7 @@ if (PG_URL) {
   harnesses.push([
     'postgres',
     async () => {
-      const store = await PgOAuthStore.connect(PG_URL);
+      const store = await PgOAuthStore.connect(PG_URL, new TokenCipher(KEY_A));
       const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
       return {
         store,
@@ -185,5 +189,129 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 
     await store().revokeGrant(sibling);
     expect(await store().hasLiveHubSibling('user-1', 'org-1', self)).toBe(false);
+  });
+});
+
+/** What only the Postgres store does: the hub tokens are encrypted at rest. */
+describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
+  let admin: pg.Pool;
+  const stores: PgOAuthStore[] = [];
+  const open = async (current: Buffer, previous?: Buffer) => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(current, previous));
+    stores.push(store);
+    return store;
+  };
+  const row = async (id: string) =>
+    (
+      await admin.query<{
+        hub_access_token: string | null;
+        hub_refresh_token: string | null;
+        hub_refresh_token_hash: string | null;
+      }>(
+        'SELECT hub_access_token, hub_refresh_token, hub_refresh_token_hash FROM oauth_grants WHERE id = $1',
+        [id]
+      )
+    ).rows[0]!;
+  /** Silences log() and returns a reader for what it wrote since. */
+  const captureLog = (): (() => string) => {
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    return () => write.mock.calls.map((call) => String(call[0])).join('');
+  };
+
+  beforeAll(() => {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  });
+  beforeEach(async () => {
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+  });
+  afterAll(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(stores.map((store) => store.close()));
+    await admin.end();
+  });
+
+  it('logs the key ids at boot, and never a key', async () => {
+    const logText = captureLog();
+    await open(KEY_B, KEY_A);
+    vi.restoreAllMocks();
+    const ids = [new TokenCipher(KEY_B).currentKeyId, new TokenCipher(KEY_A).currentKeyId];
+    expect(logText()).toContain(`hub token key id ${ids[0]} (previous: ${ids[1]})`);
+    expect(logText()).not.toContain(KEY_A.toString('base64'));
+    expect(logText()).not.toContain(KEY_B.toString('base64'));
+  });
+
+  it('stores no plaintext hub token, and the refresh token hash for compare-and-swap', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    const stored = await row(id);
+    expect(stored.hub_access_token).toMatch(/^v1\./);
+    expect(stored.hub_refresh_token).toMatch(/^v1\./);
+    expect(JSON.stringify(stored)).not.toContain('xoat_1');
+    expect(JSON.stringify(stored)).not.toContain('xort_1');
+    expect(stored.hub_refresh_token_hash).toBe(hashToken('xort_1'));
+
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    expect(await store.rotateHubTokens(id, 'xort_1', next)).toBe(true);
+    const rotated = await row(id);
+    expect(rotated.hub_access_token).toMatch(/^v1\./);
+    expect(JSON.stringify(rotated)).not.toContain('xoat_2');
+    expect(rotated.hub_refresh_token_hash).toBe(hashToken('xort_2'));
+
+    await store.revokeGrant(id);
+    expect(await row(id)).toEqual({
+      hub_access_token: null,
+      hub_refresh_token: null,
+      hub_refresh_token_hash: null
+    });
+  });
+
+  it('refuses a rotation on a revoked grant even while its tokens are still on the row', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query('UPDATE oauth_grants SET revoked_at = now() WHERE id = $1', [id]);
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    expect(await store.rotateHubTokens(id, 'xort_1', next)).toBe(false);
+  });
+
+  it('reads rows under the previous key, rewrites them under the current one on rotation', async () => {
+    const underA = await open(KEY_A);
+    const idle = await underA.createGrant('c1', signIn());
+    const active = await underA.createGrant('c1', signIn());
+
+    const rotating = await open(KEY_B, KEY_A);
+    expect((await rotating.getGrant(idle))?.hub).toEqual(signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    expect(await rotating.rotateHubTokens(active, 'xort_1', next)).toBe(true);
+    const idB = new TokenCipher(KEY_B).currentKeyId;
+    expect((await row(active)).hub_access_token).toMatch(new RegExp(`^v1\\.${idB}\\.`));
+    expect((await row(active)).hub_refresh_token).toMatch(new RegExp(`^v1\\.${idB}\\.`));
+
+    // PREVIOUS dropped: the row never rewritten is signed out, the rotated one is not.
+    const onlyB = await open(KEY_B);
+    const logText = captureLog();
+    const lost = await onlyB.getGrant(idle);
+    vi.restoreAllMocks();
+    expect(lost).toEqual({ id: idle, clientId: 'c1', revoked: false });
+    expect((await onlyB.getGrant(active))?.hub).toEqual(signIn(next));
+    const idA = new TokenCipher(KEY_A).currentKeyId;
+    expect(logText()).toContain(`grant ${idle}`);
+    expect(logText()).toContain(`unknown key id (key id ${idA})`);
+    expect(logText()).not.toContain((await row(idle)).hub_access_token!);
+  });
+
+  // An old dyno still serving during the deploy writes plain text.
+  it('reads a plaintext row as signed out, without logging the token', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    expect(await store.getGrant(id)).toEqual({ id, clientId: 'c1', revoked: false });
+    vi.restoreAllMocks();
+    expect(logText()).toContain('not encrypted');
+    expect(logText()).not.toContain('xoat_plain');
+    expect(logText()).not.toContain('xort_plain');
   });
 });

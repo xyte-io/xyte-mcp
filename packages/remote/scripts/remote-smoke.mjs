@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Acceptance check for a deployed `--http` server. A deployment runs one of two
+ * Acceptance check for a deployed hosted server. A deployment runs one of two
  * modes, and the script smokes whichever it is given:
  *
  *   npm run smoke:remote -- https://<app>.herokuapp.com              (OAuth, no token)

@@ -2,7 +2,9 @@
 /**
  * Generate the endpoint catalog from hub's Bruno collection.
  *
- *   node scripts/generate-catalog.mjs --hub-path ../hub [--out <path>] [--check]
+ *   node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub [--out <path>] [--check]
+ *
+ * (from the repo root; `--hub-path` resolves against the current directory)
  *
  * The Bruno collection under `hub/docs/api/Xyte Public/` is the upstream source
  * the public API reference is built from, so it — not any other tool's catalog —
@@ -218,7 +220,7 @@ function main() {
   } catch {
     throw new Error(
       `Bruno collection not found at ${collectionRoot}\n` +
-        `Pass --hub-path pointing at a hub checkout (e.g. --hub-path ../hub).`
+        `Pass --hub-path pointing at a hub checkout; it resolves against the current directory (${process.cwd()}).`
     );
   }
 
@@ -272,7 +274,7 @@ function main() {
     if (current !== serialized) {
       console.error(
         'FAIL committed catalog is stale.\n' +
-          'Run: npm run catalog:generate -- --hub-path <hub> and commit the result.'
+          'Run: node packages/mcp/scripts/generate-catalog.mjs --hub-path <hub> and commit the result.'
       );
       process.exit(1);
     }

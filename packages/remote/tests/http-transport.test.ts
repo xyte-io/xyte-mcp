@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -8,12 +8,18 @@ import { MemoryOAuthStore } from '../src/oauth/store.js';
 import { startHttpServer } from '../src/transports/http.js';
 
 /**
- * Drives a real `--http` server process over the network, so this covers the
+ * Drives a real HTTP server process over the network, so this covers the
  * transport selection, the auth boundary and the JSON-RPC framing together —
  * the same reasoning as `protocol-smoke.test.ts` does for stdio.
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
+// The hosted server reports @xyteai/mcp's version.
+const MCP_PACKAGE_VERSION = (
+  JSON.parse(
+    readFileSync(path.resolve(import.meta.dirname, '..', '..', 'mcp', 'package.json'), 'utf8')
+  ) as { version: string }
+).version;
 const TOKEN = 'xmcp_test_token_0123456789abcdef';
 const ORG_KEY = 'org-key-abcdef123456';
 const MCP_HEADERS = {
@@ -45,7 +51,7 @@ class HttpHarness {
 
   static async start(env: Record<string, string> = {}): Promise<HttpHarness> {
     const port = await freePort();
-    const child = spawn(process.execPath, [DIST_ENTRY, '--http'], {
+    const child = spawn(process.execPath, [DIST_ENTRY], {
       env: {
         ...process.env,
         PORT: String(port),
@@ -375,7 +381,7 @@ describe('http transport', () => {
   });
 
   it('refuses to start with both the static token and OAuth configured', async () => {
-    const { code, stderr } = await runToExit(['--http'], {
+    const { code, stderr } = await runToExit([], {
       PORT: String(await freePort()),
       XYTE_ORG_API_KEY: ORG_KEY,
       XYTE_MCP_HTTP_TOKEN: TOKEN,
@@ -386,10 +392,11 @@ describe('http transport', () => {
 
     expect(code).toBe(1);
     expect(stderr).toContain('are both set');
+    expect(stderr).toContain('  - Unset XYTE_MCP_HTTP_TOKEN for OAuth');
   });
 
   it('refuses to start without a bearer token, naming the variable', async () => {
-    const { code, stderr } = await runToExit(['--http'], {
+    const { code, stderr } = await runToExit([], {
       PORT: String(await freePort()),
       XYTE_ORG_API_KEY: ORG_KEY,
       XYTE_MCP_HTTP_TOKEN: ''
@@ -474,10 +481,24 @@ describe('cli', () => {
     expect(stderr).toContain('unknown argument');
   });
 
-  it('prints the version and exits for --http --version, without listening', async () => {
-    const { code, stderr } = await runToExit(['--http', '--version'], {});
+  it('has no --help: it is an unknown argument, exit code 2', async () => {
+    const { code, stderr } = await runToExit(['--help'], {});
+
+    expect(code).toBe(2);
+    expect(stderr).toContain('unknown argument(s): --help');
+  });
+
+  it('prints the version and exits for --version, without listening', async () => {
+    const { code, stderr } = await runToExit(['--version'], {});
 
     expect(code).toBe(0);
-    expect(stderr).toMatch(/^\d+\.\d+\.\d+/);
+    expect(stderr.trim()).toBe(MCP_PACKAGE_VERSION);
+  });
+
+  it('prints the version even next to an unknown argument, as --version wins', async () => {
+    const { code, stderr } = await runToExit(['--version', '-x'], {});
+
+    expect(code).toBe(0);
+    expect(stderr.trim()).toBe(MCP_PACKAGE_VERSION);
   });
 });

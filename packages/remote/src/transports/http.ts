@@ -4,22 +4,22 @@ import express, { type Request, type Response } from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
-import { endpointCount } from '../catalog/catalog.js';
+import { endpointCount } from '@xyteai/mcp/catalog/catalog.js';
 import {
   DEFAULT_HUB_URL,
   resolveConfig,
   resolveHttpConfig,
   type ServerConfig
-} from '../config.js';
-import { createToolContext, type ToolContext } from '../context.js';
-import { createHttpClient } from '../http/client.js';
+} from '@xyteai/mcp/config.js';
+import { createToolContext, type ToolContext } from '@xyteai/mcp/context.js';
+import { createHttpClient } from '@xyteai/mcp/http/client.js';
 import { createHubOAuth } from '../oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
 import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
-import { redactText } from '../redact.js';
-import { createServer } from '../server.js';
-import { log, logError } from '../log.js';
+import { redactText } from '@xyteai/mcp/redact.js';
+import { createServer } from '@xyteai/mcp/server.js';
+import { log, logError } from '@xyteai/mcp/log.js';
 
 /**
  * Remote Streamable HTTP transport.

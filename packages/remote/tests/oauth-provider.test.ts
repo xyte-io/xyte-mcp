@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { HttpClient, HttpRequest, HttpResponse } from '../src/http/client.js';
-import { XyteError, XyteHttpError } from '../src/http/errors.js';
+import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
+import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
-import { stubHttp } from './support/context.js';
+import { stubHttp } from '../../mcp/tests/support/context.js';
 import { hubAcceptsPkce } from './support/pkce.js';
 
 const ISSUER = 'https://mcp.test';

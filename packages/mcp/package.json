@@ -82,7 +82,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && vitest run",
     "test:unit": "vitest run",
-    "lint": "npm --prefix ../.. run lint",
+    "lint": "eslint src tests scripts",
     "catalog:generate": "node scripts/generate-catalog.mjs --hub-path ../../../hub",
     "smoke:live": "npm run build && node scripts/live-smoke.mjs",
     "smoke:pack-install": "node scripts/pack-install-smoke.mjs",

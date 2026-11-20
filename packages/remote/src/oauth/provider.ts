@@ -42,8 +42,8 @@ import type { OAuthStore, TokenRecord } from './store.js';
  * hub — each request looks up the grant and uses the stored hub token — so a
  * token stolen from a client is useless against the hub directly.
  *
- * A hub token is bound to one organization, and the hub applies the signed-in
- * user's own access in it on each call.
+ * A hub token is bound to one organization. When the app's hub setting is on,
+ * the hub applies the signed-in user's own access in it on each call.
  */
 
 const CODE_TTL_SECONDS = 10 * 60;

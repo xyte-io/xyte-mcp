@@ -153,6 +153,15 @@ describe('xyte_api_call', () => {
   });
 
   const API_KEY_HINT = 'The API key may be invalid, revoked, or lack the required scope.';
+  const IDS_HINT =
+    'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
+  const ADMIN_HINT =
+    'Only an organization administrator can do this. Ask an administrator of your organization.';
+  const NO_ACCESS_HINT =
+    'You have no access to this item. Ask an organization administrator for access.';
+  const SIGN_IN_HINT =
+    'The Xyte sign-in behind this connection has ended. Reconnect the Xyte connector to sign in again.';
+  const SIGNED_IN_HINTS = [IDS_HINT, ADMIN_HINT, NO_ACCESS_HINT, SIGN_IN_HINT];
 
   it.each([401, 403])('keeps the API-key hint on %i in API-key mode', async (status) => {
     const http = stubHttp(() => new XyteHttpError(status, 'Denied', { error: 'nope' }, READ_KEY));
@@ -160,36 +169,45 @@ describe('xyte_api_call', () => {
     expect(result.content[0]?.text).toContain(API_KEY_HINT);
   });
 
+  it.each([
+    [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined],
+    [401, { error: 'x' }, 'Bearer error="invalid_token"']
+  ])(
+    'gives only the API-key hint on %i %j %s in API-key mode',
+    async (status, body, wwwAuthenticate) => {
+      const http = stubHttp(
+        () => new XyteHttpError(status, 'Denied', body, READ_KEY, wwwAuthenticate)
+      );
+      const result = await apiCallTool.handler({ key: READ_KEY }, testContext({ http }));
+      const text = result.content[0]?.text;
+      expect(text).toContain(API_KEY_HINT);
+      for (const hint of SIGNED_IN_HINTS) expect(text).not.toContain(hint);
+    }
+  );
+
   describe('signed in with Xyte', () => {
     const signedIn = (error: XyteHttpError) =>
       testContext({
         http: stubHttp(() => error),
         credentials: { organization: { accessToken: 'xoat_abcdef123456' } }
       });
-    const IDS_HINT =
-      'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
+    const expectNoHint = (text: string | undefined) => {
+      expect(text).not.toContain('\n- ');
+      for (const hint of [API_KEY_HINT, ...SIGNED_IN_HINTS]) expect(text).not.toContain(hint);
+    };
 
     it.each([
-      [
-        403,
-        { error_code: 'organization_administrator_required', error: 'x' },
-        undefined,
-        'Only an organization administrator can do this. Ask an administrator of your organization.'
-      ],
-      [
-        403,
-        { error_code: 'no_access_to_resource', error: 'x' },
-        undefined,
-        'You have no access to this item. Ask an organization administrator for access.'
-      ],
+      [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined, ADMIN_HINT],
+      [403, { error_code: 'no_access_to_resource', error: 'x' }, undefined, NO_ACCESS_HINT],
       [
         401,
         { error: 'x' },
         'Bearer error="invalid_token", error_description="expired"',
-        'Your Xyte sign-in has ended. Reconnect the Xyte connector to sign in again.'
+        SIGN_IN_HINT
       ],
+      [401, { error: 'x' }, 'Bearer realm="xyte", error="invalid_token"', SIGN_IN_HINT],
       [401, { error: 'x' }, undefined, IDS_HINT],
-      [401, { error: 'x' }, 'Bearer error="insufficient_scope"', IDS_HINT]
+      [401, { error: 'x' }, '', IDS_HINT]
     ])('%i %j %s gives its own hint', async (status, body, wwwAuthenticate, hint) => {
       const error = new XyteHttpError(status, 'Denied', body, READ_KEY, wwwAuthenticate);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
@@ -199,18 +217,39 @@ describe('xyte_api_call', () => {
       expect(text).not.toContain(API_KEY_HINT);
     });
 
+    it('gives no hint on a 401 with another challenge', async () => {
+      const error = new XyteHttpError(
+        401,
+        'Unauthorized',
+        { error: 'x' },
+        READ_KEY,
+        'Bearer error="insufficient_scope"'
+      );
+      const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
+      expect(result.isError).toBe(true);
+      expectNoHint(result.content[0]?.text);
+    });
+
     it('gives no hint on another 403', async () => {
       const error = new XyteHttpError(403, 'Forbidden', { error_code: 'other' }, READ_KEY);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
       expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).not.toContain('\n- ');
+      expectNoHint(result.content[0]?.text);
     });
 
     it.each(['Forbidden', null])('gives no hint on a 403 with body %j', async (body) => {
       const error = new XyteHttpError(403, 'Forbidden', body, READ_KEY);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
       expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).not.toContain('\n- ');
+      expectNoHint(result.content[0]?.text);
+    });
+
+    it('keeps the endpoint-describe hint on 422', async () => {
+      const error = new XyteHttpError(422, 'Unprocessable', { error: 'x' }, READ_KEY);
+      const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
+      const text = result.content[0]?.text;
+      expect(text).toContain(`Run xyte_endpoint_describe on ${READ_KEY} to check the expected body.`);
+      expect(text).not.toContain(API_KEY_HINT);
     });
 
     it('keeps the path-parameter hint on 404', async () => {

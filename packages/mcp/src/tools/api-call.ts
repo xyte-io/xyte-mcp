@@ -141,7 +141,10 @@ function toErrorResult(
   return errorResult(`${endpointKey} failed: ${redactValue(message, secrets) as string}`);
 }
 
-/** Hub applies the signed-in user's own access; match its error_code, never its text. */
+/**
+ * Hub applies the signed-in user's own access when the app's hub setting is on;
+ * match its error_code, never its text.
+ */
 function signedInAccessHint(error: XyteHttpError): string | undefined {
   const errorCode =
     typeof error.body === 'object' && error.body !== null
@@ -158,9 +161,12 @@ function signedInAccessHint(error: XyteHttpError): string | undefined {
   }
   if (error.status === 401) {
     if (/error="invalid_token"/.test(error.wwwAuthenticate ?? '')) {
-      return 'Your Xyte sign-in has ended. Reconnect the Xyte connector to sign in again.';
+      return 'The Xyte sign-in behind this connection has ended. Reconnect the Xyte connector to sign in again.';
     }
-    return 'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
+    if (!error.wwwAuthenticate) {
+      return 'This is not a sign-in problem: check the ids in the request — the item may not be in this organization.';
+    }
+    return undefined;
   }
   return undefined;
 }

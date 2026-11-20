@@ -449,7 +449,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       throw signInGone();
     }
     logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
-    await this.saveHubTokens(grantId, stored, next);
+    await this.saveHubTokens(grantId, hub, stored, next);
     return next.accessToken;
   }
 
@@ -457,16 +457,20 @@ export class XyteOAuthProvider implements OAuthServerProvider {
    * Hub has already burned the old refresh token, so losing `next` would leave
    * a replay-on-next-refresh that hub answers by ending the user's sign-in.
    * The DB write is retried; if it still fails, the pair lives in memory for
-   * this process (a restart before the next successful save loses it).
+   * this process (a restart before the next successful save loses it). A grant
+   * revoked meanwhile throws signInGone, after revoking `next` at hub: nothing
+   * would ever use or revoke that pair otherwise.
    */
-  private async saveHubTokens(grantId: string, stored: string, next: HubTokens): Promise<void> {
+  private async saveHubTokens(
+    grantId: string,
+    signIn: HubSignIn,
+    stored: string,
+    next: HubTokens
+  ): Promise<void> {
     for (let attempt = 1; ; attempt += 1) {
+      let rotated: boolean;
       try {
-        if (!(await this.store.rotateHubTokens(grantId, stored, next))) {
-          logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
-        }
-        this.unsaved.delete(grantId);
-        return;
+        rotated = await this.store.rotateHubTokens(grantId, stored, next);
       } catch (error) {
         if (attempt < HUB_SAVE_ATTEMPTS) {
           await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
@@ -481,6 +485,24 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         );
         return;
       }
+      this.unsaved.delete(grantId);
+      if (rotated) return;
+      if (await this.liveHub(grantId)) {
+        logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
+        return;
+      }
+      // Same rule as a disconnect: hub's revoke ends the sign-in for every client.
+      const sibling = await this.store.hasLiveHubSibling(signIn.sub, signIn.tenantId, grantId);
+      logError(
+        `grant ${grantId}: revoked during the hub refresh; ` +
+          (sibling ? 'a live sibling shares the hub sign-in, so the new hub pair is kept' : 'revoking the new hub pair')
+      );
+      if (!sibling) {
+        await this.hub
+          .revoke(next.refreshToken)
+          .catch(() => logError(`grant ${grantId}: hub revoke failed`));
+      }
+      throw signInGone();
     }
   }
 
@@ -497,7 +519,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       try {
         const live = await this.liveHub(grantId);
         const next = this.unsaved.get(grantId);
-        if (live && next) await this.saveHubTokens(grantId, live.stored, next);
+        if (live && next) await this.saveHubTokens(grantId, live.hub, live.stored, next);
       } catch {
         // The grant read failed; the pair is still unsaved.
       }

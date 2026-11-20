@@ -873,6 +873,58 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     expect(upstream.calls[0]!.headers.Authorization).toBe('Bearer xoat_2');
   });
 
+  // Revoked between the refresh and its save (another process, the operator's SQL):
+  // the pair hub just minted belongs to nothing, so it is revoked at hub.
+  it('revokes the new hub pair at hub when the grant was revoked during the refresh, and fails as signed out', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const rotate = store.rotateHubTokens.bind(store);
+    vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
+      await store.revokeGrant(id);
+      return rotate(id, previous, next);
+    });
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider
+          .hubHttp(grantId, upstream)
+          .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
+    expect(upstream.calls).toHaveLength(0);
+    expect(stderr).toContain(`grant ${grantId}: revoked during the hub refresh`);
+    expect(stderr).not.toContain('xort_2');
+    expect(stderr).not.toContain('xoat_2');
+  });
+
+  it('keeps a new hub pair a live sibling still rides on: no hub revoke, still signed out', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    await connected(provider, client); // a second connection on the same hub sign-in
+    hub.expiresIn = 3600;
+    const rotate = store.rotateHubTokens.bind(store);
+    vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
+      await store.revokeGrant(id);
+      return rotate(id, previous, next);
+    });
+
+    await captureStderr(() =>
+      expect(
+        provider
+          .hubHttp(grantId, upstreamOk())
+          .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toMatchObject({ kind: 'auth' })
+    );
+    expect(hub.revokes()).toEqual([]);
+  });
+
   it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;

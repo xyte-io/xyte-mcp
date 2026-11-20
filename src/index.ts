@@ -17,14 +17,27 @@ Usage:
 Environment:
   ${ENV.orgKey}        Organization-scoped API key.
   ${ENV.partnerKey}    Partner-scoped API key. Set either or both.
-  ${ENV.readOnly}     Set to 1 to refuse all mutating endpoints. Writes are on by default.
+  ${ENV.readOnly}      Set to 1 to refuse all mutating endpoints. Writes are on
+                          by default over stdio, off over --http.
   ${ENV.hubUrl}            Override the hub base URL (default https://hub.xyte.io).
   ${ENV.entryUrl}          Override the entry base URL.
   ${ENV.timeoutMs}     Per-request timeout in ms (default 15000).
 
-Environment, --http only:
-  ${ENV.httpToken}   Static bearer token every request must present. Required.
-  ${ENV.httpPort}                     Port to listen on (default 3000).
+Environment, --http only (a static token or OAuth, never both):
+  ${ENV.httpToken}     Static bearer token, fronting the process API key
+                          (dev/CI). At least 24 characters after any xmcp_ prefix.
+  ${ENV.issuerUrl}     Public https URL of this deployment; enables OAuth 2.1
+                          (metadata, dynamic registration, authorize/token with
+                          PKCE, sign-in via hub OAuth).
+  ${ENV.hubOAuthClientId}
+  ${ENV.hubOAuthClientSecret}
+                          This server's client credentials at hub's OAuth
+                          server; both required with OAuth.
+  ${ENV.databaseUrl}            Postgres DSN for the OAuth token store. Without it,
+                          tokens are in-memory and die with the process.
+  ${ENV.allowWrites}   Set to 1 to permit mutating endpoints; read-only
+                          otherwise. XYTE_MCP_READ_ONLY=1 still wins.
+  ${ENV.httpPort}                    Port to listen on (default 3000).
 
 Example MCP host configuration:
   {

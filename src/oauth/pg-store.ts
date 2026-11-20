@@ -1,0 +1,260 @@
+import pg from 'pg';
+import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { logError } from '../log.js';
+import type { HubSignIn, HubTokens } from './hub-oauth.js';
+import {
+  hashToken,
+  type GrantRecord,
+  type NewToken,
+  type OAuthStore,
+  type TokenKind,
+  type TokenRecord
+} from './store.js';
+
+/**
+ * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
+ *
+ * Three tables, created at boot with IF NOT EXISTS instead of a migration
+ * framework: this service owns its whole schema and the schema is additive —
+ * columns are only ever added (nullable), never dropped, so from this release
+ * on, rolling back to an older build still boots against a newer database
+ * (a pre-release database needs its tables dropped once — see the README).
+ * Client metadata is one jsonb blob because the server never queries inside
+ * it — it goes back to the SDK exactly as registered.
+ */
+
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id  text PRIMARY KEY,
+    data       jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+  );
+  CREATE TABLE IF NOT EXISTS oauth_grants (
+    id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    client_id         text NOT NULL,
+    hub_sub           text NOT NULL,
+    hub_tenant        text NOT NULL,
+    hub_email         text,
+    -- NULL only once revoked: revocation drops the hub tokens.
+    hub_access_token  text,
+    hub_refresh_token text,
+    hub_expires_at    timestamptz NOT NULL,
+    revoked_at        timestamptz,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    CHECK (revoked_at IS NOT NULL OR (hub_access_token IS NOT NULL AND hub_refresh_token IS NOT NULL))
+  );
+  CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash     text NOT NULL,
+    kind           text NOT NULL CHECK (kind IN ('code', 'access', 'refresh')),
+    grant_id       bigint NOT NULL REFERENCES oauth_grants(id),
+    code_challenge text,
+    redirect_uri   text,
+    resource       text,
+    expires_at     timestamptz NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, token_hash)
+  );
+  -- The sibling check on revoke (hasLiveHubSibling) joins on both.
+  CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
+  CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
+`;
+
+/** Arbitrary, constant: the advisory lock serializing schema creation. */
+const SCHEMA_LOCK_ID = 674_601;
+
+/**
+ * An `sslmode` in the DSN decides on its own (pg lets it override this option
+ * anyway), so a compose or CI host can opt out with `sslmode=disable`. Without
+ * one: none for a local database, and Heroku's TLS otherwise — it requires TLS
+ * but presents a chain the dyno can't verify.
+ */
+function sslOption(databaseUrl: string): { ssl?: { rejectUnauthorized: false } } {
+  const url = new URL(databaseUrl);
+  if (url.searchParams.has('sslmode')) return {};
+  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
+  return { ssl: { rejectUnauthorized: false } };
+}
+
+interface TokenRow {
+  grant_id: string;
+  code_challenge: string | null;
+  redirect_uri: string | null;
+  resource: string | null;
+  expires_at: Date;
+}
+
+interface GrantRow {
+  id: string;
+  client_id: string;
+  hub_access_token: string | null;
+  hub_refresh_token: string | null;
+  hub_expires_at: Date;
+  hub_sub: string;
+  hub_tenant: string;
+  hub_email: string | null;
+  revoked_at: Date | null;
+}
+
+export class PgOAuthStore implements OAuthStore {
+  private constructor(private readonly pool: pg.Pool) {}
+
+  static async connect(databaseUrl: string): Promise<PgOAuthStore> {
+    const pool = new pg.Pool({
+      connectionString: databaseUrl,
+      ...sslOption(databaseUrl),
+      max: 5,
+      // Unbounded by default: an unreachable or hung database would hang boot
+      // past Heroku's R10 and every token check instead of failing with a 503.
+      connectionTimeoutMillis: 10_000,
+      query_timeout: 10_000
+    });
+    // An idle client dropped server-side (maintenance, failover) is emitted here;
+    // unhandled, it exits the process. The pool replaces the client on its own.
+    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
+    // One multi-statement query runs as one transaction, so the xact lock holds
+    // for all of it: two boots on an empty database (preboot, a one-off dyno)
+    // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
+    await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+    return new PgOAuthStore(pool);
+  }
+
+  async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
+    const result = await this.pool.query<{ data: OAuthClientInformationFull }>(
+      'SELECT data FROM oauth_clients WHERE client_id = $1',
+      [clientId]
+    );
+    return result.rows[0]?.data;
+  }
+
+  async saveClient(client: OAuthClientInformationFull): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO oauth_clients (client_id, data) VALUES ($1, $2)
+       ON CONFLICT (client_id) DO UPDATE SET data = EXCLUDED.data`,
+      [client.client_id, JSON.stringify(client)]
+    );
+  }
+
+  async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
+    const result = await this.pool.query<{ id: string }>(
+      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_tenant,
+                                 hub_refresh_token, hub_expires_at, hub_sub, hub_email)
+       VALUES ($1, $2, $3, $4, to_timestamp($5), $6, $7) RETURNING id`,
+      [
+        clientId,
+        hub.accessToken,
+        hub.tenantId,
+        hub.refreshToken,
+        hub.expiresAt,
+        hub.sub,
+        hub.email ?? null
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error('grant insert returned no row');
+    return row.id;
+  }
+
+  async getGrant(grantId: string): Promise<GrantRecord | undefined> {
+    const result = await this.pool.query<GrantRow>('SELECT * FROM oauth_grants WHERE id = $1', [
+      grantId
+    ]);
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      clientId: row.client_id,
+      ...(row.hub_access_token !== null && row.hub_refresh_token !== null
+        ? {
+            hub: {
+              accessToken: row.hub_access_token,
+              refreshToken: row.hub_refresh_token,
+              expiresAt: Math.floor(row.hub_expires_at.getTime() / 1000),
+              sub: row.hub_sub,
+              tenantId: row.hub_tenant,
+              ...(row.hub_email ? { email: row.hub_email } : {})
+            }
+          }
+        : {}),
+      revoked: row.revoked_at !== null
+    };
+  }
+
+  async revokeGrant(grantId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE oauth_grants
+          SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
+        WHERE id = $1 AND revoked_at IS NULL`,
+      [grantId]
+    );
+  }
+
+  async rotateHubTokens(
+    grantId: string,
+    previousRefreshToken: string,
+    next: HubTokens
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE oauth_grants
+          SET hub_access_token = $3, hub_refresh_token = $4, hub_expires_at = to_timestamp($5)
+        WHERE id = $1 AND hub_refresh_token = $2`,
+      [grantId, previousRefreshToken, next.accessToken, next.refreshToken, next.expiresAt]
+    );
+    return result.rowCount === 1;
+  }
+
+  async hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `SELECT 1 FROM oauth_grants g JOIN oauth_tokens t ON t.grant_id = g.id
+        WHERE g.hub_sub = $1 AND g.hub_tenant = $2 AND g.id <> $3 AND g.revoked_at IS NULL
+          AND t.kind IN ('access', 'refresh') AND t.expires_at > now()
+        LIMIT 1`,
+      [sub, tenantId, exceptGrantId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async saveToken(token: NewToken): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO oauth_tokens (token_hash, kind, grant_id, code_challenge, redirect_uri, resource, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))`,
+      [
+        hashToken(token.token),
+        token.kind,
+        token.grantId,
+        token.codeChallenge ?? null,
+        token.redirectUri ?? null,
+        token.resource ?? null,
+        token.expiresAt
+      ]
+    );
+  }
+
+  async getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined> {
+    const result = await this.pool.query<TokenRow>(
+      'SELECT * FROM oauth_tokens WHERE kind = $1 AND token_hash = $2',
+      [kind, hashToken(token)]
+    );
+    const row = result.rows[0];
+    if (!row) return undefined;
+    return {
+      kind,
+      grantId: row.grant_id,
+      expiresAt: Math.floor(row.expires_at.getTime() / 1000),
+      ...(row.code_challenge ? { codeChallenge: row.code_challenge } : {}),
+      ...(row.redirect_uri ? { redirectUri: row.redirect_uri } : {}),
+      ...(row.resource ? { resource: row.resource } : {})
+    };
+  }
+
+  async deleteToken(token: string, kind: TokenKind): Promise<boolean> {
+    const result = await this.pool.query(
+      'DELETE FROM oauth_tokens WHERE kind = $1 AND token_hash = $2 RETURNING 1',
+      [kind, hashToken(token)]
+    );
+    return result.rowCount === 1;
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+}

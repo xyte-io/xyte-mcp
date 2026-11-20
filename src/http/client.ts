@@ -115,7 +115,13 @@ async function attemptOnce(
   const data = await parseBody(response);
 
   if (!response.ok) {
-    throw new XyteHttpError(response.status, response.statusText, data, request.endpointKey);
+    throw new XyteHttpError(
+      response.status,
+      response.statusText,
+      data,
+      request.endpointKey,
+      response.headers.get('www-authenticate') ?? undefined
+    );
   }
 
   return { status: response.status, statusText: response.statusText, data };

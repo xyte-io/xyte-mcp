@@ -49,11 +49,15 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "pg": "^8.23.0",
     "zod": "^4.1.13"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.2",
+    "@types/pg": "^8.23.1",
     "@usebruno/lang": "^0.38.0",
     "eslint": "^9.17.0",
     "typescript": "^5.7.2",

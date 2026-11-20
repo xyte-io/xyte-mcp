@@ -20,7 +20,7 @@ import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
 import { redactText } from '@xyteai/mcp/redact.js';
 import { createServer } from '@xyteai/mcp/server.js';
 import { log, logError } from '@xyteai/mcp/log.js';
-import { logEvent } from '../log-event.js';
+import { errorCodeOf, logEvent } from '../log-event.js';
 
 /**
  * Remote Streamable HTTP transport.
@@ -65,6 +65,8 @@ const MAX_LOGGED_PATH = 64;
 const SHUTDOWN_DEADLINE_MS = 28_000;
 /** In-flight requests get this long before the provider drain starts regardless. */
 const REQUEST_GRACE_MS = 10_000;
+/** A health probe answer is reused this long after its database check ends. */
+const HEALTH_CHECK_REUSE_MS = 2_000;
 
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const { staticToken, oauth, port } = resolveHttpConfig(env);
@@ -91,19 +93,37 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // Before the auth check: a platform health probe carries no credentials, and
   // it reveals nothing a port scan would not. In OAuth mode every request needs
   // the token store, so a dead database fails the probe (and the uptime alert).
+  // ponytail: probes share one check while it runs and reuse its answer for 2 s,
+  // so an unauthenticated flood costs at most one query per interval.
+  const checkStore = async (): Promise<boolean> => {
+    try {
+      // ponytail: a primary-key lookup through the existing interface stands in
+      // for a ping(); add one to OAuthStore if this lookup ever stops being cheap.
+      await store?.getClient('healthz');
+      return true;
+    } catch (error) {
+      logError(`healthz: token store check failed: ${errorCodeOf(error)}`);
+      return false;
+    }
+  };
+  let storeCheck: { answers: Promise<boolean>; reuseUntil: number } | undefined;
+  const storeAnswers = (): Promise<boolean> => {
+    if (!storeCheck || Date.now() >= storeCheck.reuseUntil) {
+      const check = { answers: checkStore(), reuseUntil: Infinity };
+      void check.answers.then(() => {
+        check.reuseUntil = Date.now() + HEALTH_CHECK_REUSE_MS;
+      });
+      storeCheck = check;
+    }
+    return storeCheck.answers;
+  };
   app.get(HEALTH_PATH, (_req, res) => {
-    void (async () => {
-      try {
-        // ponytail: a primary-key lookup through the existing interface stands in
-        // for a ping(); add one to OAuthStore if this lookup ever stops being cheap.
-        await store?.getClient('healthz');
-        res.type('text/plain').send('ok');
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        logError(`healthz: token store check failed: ${detail}`);
-        res.status(503).type('text/plain').send('unavailable');
-      }
-    })();
+    void storeAnswers()
+      .then((up) => {
+        if (up) res.type('text/plain').send('ok');
+        else res.status(503).type('text/plain').send('unavailable');
+      })
+      .catch((error: unknown) => logError(`healthz: ${errorCodeOf(error)}`));
   });
   if (oauth) {
     if (oauth.databaseUrl) {
@@ -331,7 +351,7 @@ async function authenticate(
   try {
     caller = await resolveIdentity(req, auth);
   } catch (error) {
-    logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
+    logError(`token check failed: ${errorCodeOf(error)}`);
     respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
     return undefined;
   }
@@ -383,6 +403,7 @@ function withSecret(context: ToolContext, secret: string): ToolContext {
 /** An unexpected throw in the consent/callback flow; the message never reaches the browser. */
 function failFlow(res: Response, error: unknown): void {
   logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
+  logEvent('sign_in', { outcome: 'failed', reason: 'error' });
   if (res.headersSent) return;
   res.status(500).type('html').send('<p>Sign-in failed. Restart the connection.</p>');
 }

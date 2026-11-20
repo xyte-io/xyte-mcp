@@ -12,3 +12,16 @@ export function logEvent(
 ): void {
   process.stderr.write(`${JSON.stringify({ event, ...fields })}\n`);
 }
+
+/**
+ * What a log line says about a database or network error: its code
+ * (`ECONNREFUSED`, a Postgres SQLSTATE such as `28P01`), else its class name.
+ * Never the message, which can name the database host and role.
+ */
+export function errorCodeOf(error: unknown): string {
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' && code.length > 0 ? code : error.name;
+  }
+  return 'unknown error';
+}

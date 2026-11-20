@@ -96,6 +96,11 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
         res.end();
         return;
       }
+      if (req.url?.endsWith('/devices/missing')) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ devices: [] }));
     });
@@ -418,7 +423,29 @@ describe('oauth over http, in order', () => {
       duration_ms: expect.any(Number)
     });
     expect(events('tool_call')[0]!.connection).toBe(events('sign_in').at(-1)!.connection);
-    expect(stderr.join('')).not.toContain('xoat_1');
+  });
+
+  it('logs a call the hub answers with a 4xx as an error, with the hub status', async () => {
+    const response = await mcp(accessToken, {
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'tools/call',
+      params: {
+        name: 'xyte_api_call',
+        arguments: { key: 'organization.devices.getDevice', path: { device_id: 'missing' } }
+      }
+    });
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as { result?: { isError?: boolean } };
+    expect(result.result?.isError).toBe(true);
+
+    await vi.waitFor(() => expect(events('tool_call')).toHaveLength(2));
+    expect(events('tool_call')[1]).toMatchObject({
+      tool: 'xyte_api_call',
+      endpoint: 'organization.devices.getDevice',
+      status: 404,
+      outcome: 'error'
+    });
   });
 
   it('401s a bearer that is no token of ours, with the challenge', async () => {
@@ -459,6 +486,14 @@ describe('oauth over http, in order', () => {
       body: form({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId })
     });
     expect(refresh.status).toBe(400);
+  });
+
+  it('never logs a hub token, one of our tokens or the email', () => {
+    const all = stderr.join('');
+    expect(all).not.toContain('xoat_');
+    expect(all).not.toContain('xort_');
+    expect(all).not.toContain('xmcp_');
+    expect(all).not.toContain('user@example.com');
   });
 
   it('warned at boot that the token store is in-memory', () => {

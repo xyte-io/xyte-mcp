@@ -1,6 +1,7 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { logError } from '@xyteai/mcp/log.js';
+import { errorCodeOf } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -110,7 +111,7 @@ export class PgOAuthStore implements OAuthStore {
     });
     // An idle client dropped server-side (maintenance, failover) is emitted here;
     // unhandled, it exits the process. The pool replaces the client on its own.
-    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
+    pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
     // One multi-statement query runs as one transaction, so the xact lock holds
     // for all of it: two boots on an empty database (preboot, a one-off dyno)
     // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.

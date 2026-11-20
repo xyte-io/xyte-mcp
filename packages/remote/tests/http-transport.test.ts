@@ -419,7 +419,8 @@ describe('http transport: token store outage', () => {
     const port = await freePort();
     const getToken = vi
       .spyOn(MemoryOAuthStore.prototype, 'getToken')
-      .mockRejectedValue(new Error('db down'));
+      .mockRejectedValue(Object.assign(new Error('db down at db.internal'), { code: '57P01' }));
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     const listener = await startHttpServer({
       PORT: String(port),
       XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
@@ -436,8 +437,12 @@ describe('http transport: token store outage', () => {
         expect(response.status, method).toBe(503);
         expect(response.headers.get('www-authenticate'), method).toBeNull();
       }
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('token check failed: 57P01');
+      expect(logged).not.toContain('db.internal');
     } finally {
       getToken.mockRestore();
+      stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
     }
   });
@@ -453,17 +458,55 @@ describe('http transport: token store outage', () => {
       XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
     });
     const getClient = vi.spyOn(MemoryOAuthStore.prototype, 'getClient');
+    // Only Date is faked: the probe answer is kept for a couple of seconds.
+    vi.useFakeTimers({ toFake: ['Date'] });
     try {
       const healthy = await fetch(`http://127.0.0.1:${port}/healthz`);
       expect(healthy.status).toBe(200);
       expect(await healthy.text()).toBe('ok');
-      expect(getClient).toHaveBeenCalled();
+      expect(getClient).toHaveBeenCalledTimes(1);
 
-      getClient.mockRejectedValue(new Error('connect ECONNREFUSED db.internal:5432'));
+      vi.setSystemTime(Date.now() + 3_000);
+      getClient.mockRejectedValue(
+        Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+      );
       const down = await fetch(`http://127.0.0.1:${port}/healthz`);
       expect(down.status).toBe(503);
       expect(await down.text()).toBe('unavailable');
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('healthz: token store check failed: ECONNREFUSED');
+      expect(logged).not.toContain('db.internal');
     } finally {
+      vi.useRealTimers();
+      getClient.mockRestore();
+      stderr.mockRestore();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  // An unauthenticated flood of probes must not turn into a flood of database queries.
+  it('runs at most one database check per couple of seconds on /healthz, however many probes', async () => {
+    const port = await freePort();
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret'
+    });
+    const getClient = vi.spyOn(MemoryOAuthStore.prototype, 'getClient');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const probe = () => fetch(`http://127.0.0.1:${port}/healthz`).then((response) => response.status);
+      expect(await Promise.all([probe(), probe(), probe()])).toEqual([200, 200, 200]);
+      expect(await probe()).toBe(200);
+      expect(getClient).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(Date.now() + 3_000);
+      expect(await probe()).toBe(200);
+      expect(getClient).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
       getClient.mockRestore();
       stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
@@ -492,6 +535,8 @@ describe('http transport: token store outage', () => {
       const html = await response.text();
       expect(html).toContain('Sign-in failed');
       expect(html).not.toContain('secret-ish');
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('{"event":"sign_in","outcome":"failed","reason":"error"}');
     } finally {
       consent.mockRestore();
       stderr.mockRestore();

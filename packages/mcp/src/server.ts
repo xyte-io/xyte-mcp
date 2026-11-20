@@ -93,15 +93,21 @@ export function createServer(context: ToolContext, hooks: ServerHooks = {}): Mcp
             }
           }
         };
-        const result = await tool.handler(args, { ...context, http });
-        onToolCall({
-          tool: tool.name,
-          endpoint,
-          status,
-          isError: result.isError === true,
-          durationMs: Math.round(performance.now() - startedAt)
-        });
-        return result;
+        // A throwing handler is logged too (as an error); the SDK turns the throw into an error result.
+        let isError = true;
+        try {
+          const result = await tool.handler(args, { ...context, http });
+          isError = result.isError === true;
+          return result;
+        } finally {
+          onToolCall({
+            tool: tool.name,
+            endpoint,
+            status,
+            isError,
+            durationMs: Math.round(performance.now() - startedAt)
+          });
+        }
       }
     );
   }

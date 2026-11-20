@@ -1314,10 +1314,43 @@ describe('XyteOAuthProvider: log events', () => {
       await callback(provider, { state: failed.pending, code: 'hub-code' }, failed.cookie);
     });
     expect(eventsIn(stderr)).toEqual([
-      { event: 'sign_in', outcome: 'denied' },
-      { event: 'sign_in', outcome: 'failed' },
-      { event: 'sign_in', outcome: 'denied' },
-      { event: 'sign_in', outcome: 'failed' }
+      { event: 'sign_in', outcome: 'denied', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'hub_error', client: 'client-1' },
+      { event: 'sign_in', outcome: 'denied', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'exchange', client: 'client-1' }
+    ]);
+  });
+
+  it('logs sign_in failed for a sign-in that ends on the expired page', async () => {
+    const { provider } = makeProvider();
+    const client = await registeredClient(provider);
+    const stderr = await captureStderr(async () => {
+      // Consent: unknown pending id, wrong CSRF token, wrong browser cookie.
+      await provider.consent(fakeReq({ body: { pending: 'gone', csrf: 'x', decision: 'approve' } }), fakeRes().res);
+      const badCsrf = await openConsent(provider, client);
+      await provider.consent(
+        fakeReq({ body: { pending: badCsrf.pending, csrf: 'wrong', decision: 'approve' }, cookie: badCsrf.cookie }),
+        fakeRes().res
+      );
+      await provider.consent(
+        fakeReq({ body: { pending: badCsrf.pending, csrf: badCsrf.csrf, decision: 'approve' } }),
+        fakeRes().res
+      );
+
+      // Callback: unknown state, wrong browser cookie, never approved.
+      await callback(provider, { state: 'gone', code: 'hub-code' });
+      const approved = await approve(provider, client);
+      await callback(provider, { state: approved.pending, code: 'hub-code' });
+      const unapproved = await openConsent(provider, client);
+      await callback(provider, { state: unapproved.pending, code: 'hub-code' }, unapproved.cookie);
+    });
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'failed', reason: 'expired' },
+      { event: 'sign_in', outcome: 'failed', reason: 'csrf', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'cookie', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'expired' },
+      { event: 'sign_in', outcome: 'failed', reason: 'cookie', client: 'client-1' },
+      { event: 'sign_in', outcome: 'failed', reason: 'not_approved', client: 'client-1' }
     ]);
   });
 
@@ -1330,7 +1363,7 @@ describe('XyteOAuthProvider: log events', () => {
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'ok' }
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'ok' }
     ]);
   });
 
@@ -1346,7 +1379,7 @@ describe('XyteOAuthProvider: log events', () => {
       })
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'rate_limited', hub_status: 429 }
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'rate_limited', hub_status: 429 }
     ]);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
@@ -1361,7 +1394,7 @@ describe('XyteOAuthProvider: log events', () => {
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'rejected', hub_status: 401 }
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'rejected', hub_status: 401 }
     ]);
   });
 
@@ -1375,7 +1408,7 @@ describe('XyteOAuthProvider: log events', () => {
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'invalid_grant', hub_status: 400 },
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 },
       { event: 'revoke', connection: grantId, reason: 'invalid_grant', organization: 'org-1', user: 'user-1' }
     ]);
   });
@@ -1397,7 +1430,7 @@ describe('XyteOAuthProvider: log events', () => {
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'already_rotated', hub_status: 400 }
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'already_rotated', hub_status: 400 }
     ]);
   });
 
@@ -1411,7 +1444,7 @@ describe('XyteOAuthProvider: log events', () => {
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
     );
     expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, outcome: 'unknown', hub_status: 503 },
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'unknown', hub_status: 503 },
       { event: 'revoke', connection: grantId, reason: 'refresh_unknown', organization: 'org-1', user: 'user-1' }
     ]);
   });
@@ -1425,7 +1458,28 @@ describe('XyteOAuthProvider: log events', () => {
     const stderr = await captureStderr(() =>
       provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
     );
-    expect(eventsIn(stderr)[0]).toEqual({ event: 'hub_refresh', connection: grantId, outcome: 'unknown' });
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'unknown' },
+      { event: 'revoke', connection: grantId, reason: 'refresh_unknown', organization: 'org-1', user: 'user-1' }
+    ]);
+  });
+
+  it('invalid_grant on a grant already ended meanwhile logs hub_refresh, but no second revoke', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    // The operator's SQL cut-off lands while the refresh is at the hub.
+    hub.onRefresh = async () => {
+      await store.revokeGrant(grantId);
+      return json(400, { error: 'invalid_grant' });
+    };
+    const stderr = await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
+    );
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 }
+    ]);
   });
 
   it('a client revoke logs revoke client with the organization and user', async () => {
@@ -1438,5 +1492,18 @@ describe('XyteOAuthProvider: log events', () => {
     expect(eventsIn(stderr)).toEqual([
       { event: 'revoke', connection: grantId, reason: 'client', organization: 'org-1', user: 'user-1' }
     ]);
+  });
+
+  it('a client revoke of a grant whose hub sign-in is already gone logs only the connection and reason', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    // The grant passes the revoke's own check, then its hub sign-in is gone by the time it is read.
+    const getGrant = store.getGrant.bind(store);
+    vi.spyOn(store, 'getGrant').mockImplementationOnce(getGrant).mockResolvedValueOnce(undefined);
+    const stderr = await captureStderr(() =>
+      provider.revokeToken(client, { token: tokens.access_token })
+    );
+    expect(eventsIn(stderr)).toEqual([{ event: 'revoke', connection: grantId, reason: 'client' }]);
   });
 });

@@ -39,8 +39,8 @@ const TOKEN_MARKER = 'xmcp_';
 
 /**
  * A hub OAuth access token (`xoat_…`), bound to the one organization picked on
- * hub's consent screen. It carries that organization's full authority, like an
- * org API key; the user who signed in for it is attribution only.
+ * hub's consent screen. When the app's hub setting is on, the hub applies the
+ * signed-in user's own access in that organization on each call.
  */
 export interface HubOAuthCredential {
   accessToken: string;

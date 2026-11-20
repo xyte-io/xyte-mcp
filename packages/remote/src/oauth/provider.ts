@@ -42,8 +42,8 @@ import type { OAuthStore, TokenRecord } from './store.js';
  * hub — each request looks up the grant and uses the stored hub token — so a
  * token stolen from a client is useless against the hub directly.
  *
- * A hub token carries its organization's full authority, like an org API key;
- * the user who signed in is attribution only, not a role the hub enforces.
+ * A hub token is bound to one organization. When the app's hub setting is on,
+ * the hub applies the signed-in user's own access in it on each call.
  */
 
 const CODE_TTL_SECONDS = 10 * 60;
@@ -852,7 +852,7 @@ function consentPage(options: {
 <body>
   <form method="post" action="/oauth/consent">
     <h1>Connect to Xyte</h1>
-    <p>${name} wants to use the Xyte API on your behalf, with the full access of the
+    <p>${name} wants to use the Xyte API on your behalf, with your own access in the
       organization you pick next.</p>
     <p>After you sign in, you will be sent back to
       <strong>${escapeHtml(options.redirectTarget)}</strong>.</p>

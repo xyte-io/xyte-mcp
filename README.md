@@ -201,8 +201,10 @@ sign-in on the same URL:
 - **OAuth 2.1** (`XYTE_MCP_ISSUER_URL`): the product — see
   [OAuth 2.1](#oauth-21). Users add the URL as a custom connector (claude.ai web included),
   sign in at hub and pick an organization, and every call runs with a hub OAuth token for
-  that organization. The token carries the organization's full authority, like an org API
-  key; the signed-in user is recorded for attribution, not used to narrow access.
+  that organization. With the hub setting named under [OAuth 2.1](#oauth-21) on, the hub
+  applies the signed-in user's own access on every call, so a user who is not an
+  organization administrator can do only what the hub allows them. The setting is off by
+  default, and without it every signed-in user gets the organization's full access.
 
 It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
@@ -434,13 +436,13 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   to the hub** — each request resolves its grant and calls the hub with the stored hub
   token (the classic confused-deputy guard). Lifetimes: authorization code 10 minutes,
   access token 1 hour, refresh token 30 days (single-use, rotated on every exchange).
-- **Organization authority.** Calls send `Authorization: Bearer xoat_…` and
-  `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. The token carries the
-  organization's full authority, like an org API key; the user is attribution only.
-  Who may sign in is the organization's choice when its administrator connects the app
-  at hub; because every signed-in user gets the same authority, "only organization
-  administrators" is the recommended sign-in policy. Writes are off unless
-  `XYTE_MCP_ALLOW_WRITES=1` — that is the control for what the agent may do. A sign-in
+- **Your own access.** Calls send `Authorization: Bearer xoat_…` and
+  `X-Xyte-Client: xyte-mcp/<version>` to `/core/v1/organization`. With the hub setting
+  below on, the hub applies the signed-in user's own access on every call, so a user who is
+  not an organization administrator can do only what the hub allows them. Who may sign in is the
+  organization's choice when its administrator connects the app at hub. Writes are off unless
+  `XYTE_MCP_ALLOW_WRITES=1` — that flag decides whether the agent may write at all, and the
+  with that setting on, the signed-in user's own access limits what it may read or change. A sign-in
   yields an organization token only, so partner endpoints are not available through it.
 - **Hub token lifecycle.** A hub access token lives an hour; within a minute of expiry, or
   after hub rejects it (`401` with `WWW-Authenticate: Bearer error="invalid_token"`; a plain
@@ -531,6 +533,17 @@ It prints the client id and secret for `XYTE_MCP_HUB_OAUTH_CLIENT_ID` /
 that organization has to connect (approve) the app on hub's consent screen first — until
 then hub denies with `error_reason=org_not_approved`.
 
+The app must also have the hub setting "acts with the signed-in user's access" turned on;
+the command above leaves it off. To turn it on, run this in the same hub console:
+
+```ruby
+Oauth::Application.find_by!(client_id: '<client id>').update!(acts_with_signed_in_user_access: true)
+```
+
+Without it every signed-in user gets the organization's
+full access and the consent page text is not true, so do not open sign-in to
+non-administrators until it is on.
+
 The static-bearer mode is the alternative, not an addition: unset the issuer to use it.
 Setting both refuses to start — a shared bearer mapping to the process keys has no place on
 a public sign-in URL.
@@ -541,8 +554,10 @@ a public sign-in URL.
   influence, and that data enters the model's context. Treat it as untrusted input — see
   [Write policy](#write-policy) for what the server does about it and where `XYTE_MCP_READ_ONLY`
   is the right call.
-- The API key sets the blast radius, and it is the one control the model cannot talk its way
-  around. Scope it to what the agent needs.
+- In API-key mode the API key sets the blast radius, and it is the one control the model
+  cannot talk its way around. Scope it to what the agent needs.
+- In sign-in mode, with the hub setting on, the signed-in user's own access sets the blast
+  radius; without it, the whole organization does.
 - Prefer passing keys through your host's secret handling rather than committing them into a
   shared `.mcp.json`.
 - The hosted server is reachable from the network. Its static bearer is one shared identity — every

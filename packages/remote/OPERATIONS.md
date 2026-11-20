@@ -107,8 +107,10 @@ of the same `connection` just before it.
 
 At boot and then every hour the server deletes expired tokens, revoked connections with no
 token left 7 days after the revoke, connections left without a client (a sign-in still in
-progress when its client was deleted), and registered clients with no connection 30 days after
-registration. When it deletes anything it writes one line:
+progress when its client was deleted), connections with no token left 97 days after the sign-in
+(a sign-in never completed, or a user idle past the refresh lifetime: [the 90-day
+end](#the-90-day-end) has passed, plus a week), and registered clients with no connection 30
+days after registration. When it deletes anything it writes one line:
 `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended grant(s), <n>
 unused client(s)`. A failed run writes `OAuth store cleanup failed, retried within an hour:
 the <tokens|grants|clients> step failed: <code>`, and the next run tries again.

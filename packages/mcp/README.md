@@ -460,7 +460,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
   logs users out. At boot and then hourly the server deletes expired tokens, revoked grants
-  with no token left after 7 days (kept to answer "why was I signed out"), and registered
+  with no token left after 7 days (kept to answer "why was I signed out"), sign-ins with no
+  token left after 97 days (hub's 90-day chain has ended, plus a week), and registered
   clients with no grant after 30 days (registration is open, so junk registrations go; a
   client in use keeps its grant). The hub tokens in each grant are encrypted with AES-256-GCM under
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the

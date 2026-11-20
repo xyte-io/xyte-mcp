@@ -7,6 +7,7 @@ import { PgOAuthStore } from '../src/oauth/pg-store.js';
 import {
   hashToken,
   MemoryOAuthStore,
+  ABANDONED_GRANT_RETENTION_SECONDS,
   REVOKED_GRANT_RETENTION_SECONDS,
   UNUSED_CLIENT_RETENTION_SECONDS,
   type OAuthStore
@@ -247,7 +248,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       const revoked = await store().createGrant('c1', signIn());
       const unrevoked = await store().createGrant('c1', signIn());
       await store().revokeGrant(revoked);
-      const later = NOW() + 365 * DAY;
+      const later = NOW() + 96 * DAY; // below ABANDONED_GRANT_RETENTION_SECONDS
       await token(revoked, 'refresh', later + 600);
 
       expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
@@ -263,6 +264,18 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
       expect(await store().getGrant(id)).toBeDefined();
       expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().getGrant(id)).toBeUndefined();
+    });
+
+    // A code never exchanged, or a user idle past the refresh lifetime: hub ended the chain.
+    it('deletes an unrevoked grant without tokens whose client exists once the retention has passed', async () => {
+      expect(ABANDONED_GRANT_RETENTION_SECONDS).toBe(97 * DAY);
+      await store().saveClient(client('c1'));
+      const id = await store().createGrant('c1', signIn());
+
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().getGrant(id)).toBeDefined();
+      expect((await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).grants).toBe(1);
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
@@ -307,7 +320,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await token(id, 'refresh', expiresAt);
       expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
 
-      await store().sweepExpiredOAuthRows(NOW() + 365 * DAY);
+      // The latest run before ABANDONED_GRANT_RETENTION_SECONDS deletes a token-less grant.
+      await store().sweepExpiredOAuthRows(NOW() + 96 * DAY);
       await token(id, 'refresh', expiresAt + 600);
       expect((await store().getGrant(id))?.revoked).toBe(false);
       expect(await store().getClient('c1')).toBeDefined();

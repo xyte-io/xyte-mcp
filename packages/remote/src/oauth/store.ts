@@ -51,6 +51,16 @@ export interface NewToken extends TokenRecord {
 export const REVOKED_GRANT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
 
 /**
+ * How long an unrevoked grant with no token left is kept: a sign-in whose code
+ * was never exchanged, or a user idle past the refresh lifetime. Hub ends the
+ * sign-in chain 90 days after the first sign-in (README "OAuth 2.1"), so such a
+ * grant can never reach hub again; plus a week's margin, like the revoked-grant
+ * retention. A refresh exchange that loses the race with this delete answers
+ * 500 where the user would get invalid_grant anyway.
+ */
+export const ABANDONED_GRANT_RETENTION_SECONDS = 97 * 24 * 60 * 60;
+
+/**
  * How long a registered client with no grant is kept. Registration is open
  * (dynamic client registration), so junk registrations must go; this is far
  * above the 10-minute pending sign-in window, and a client in use keeps its
@@ -100,11 +110,13 @@ export interface OAuthStore {
    * Deletes, as of `now` (seconds since epoch): expired tokens; grants with no
    * token left that were revoked more than REVOKED_GRANT_RETENTION_SECONDS ago,
    * or are unrevoked but whose client is gone (a sign-in still at the hub when
-   * a sweep deleted its client: nothing can use it, /token needs the client);
-   * clients with no grant, registered more than UNUSED_CLIENT_RETENTION_SECONDS
-   * ago. Never an unrevoked grant whose client exists: a refresh exchange
-   * deletes the old refresh token before it saves the new pair, so a live grant
-   * can briefly have none (and a client with a grant is never deleted).
+   * a sweep deleted its client: nothing can use it, /token needs the client),
+   * or are unrevoked and created more than ABANDONED_GRANT_RETENTION_SECONDS
+   * ago; clients with no grant, registered more than
+   * UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger unrevoked grant whose
+   * client exists: a refresh exchange deletes the old refresh token before it
+   * saves the new pair, so a live grant can briefly have none (and a client
+   * with a grant is never deleted).
    * An orphan's hub tokens are not revoked at hub: nobody holds them once the
    * row is gone, and hub ends the chain by itself.
    * Safe while requests are served; a second run deletes nothing more.
@@ -127,6 +139,8 @@ export class MemoryOAuthStore implements OAuthStore {
   /** Seconds since epoch of each client's first save; kept out of the client record. */
   private readonly clientCreatedAt = new Map<string, number>();
   private readonly grants = new Map<string, GrantRecord>();
+  /** Seconds since epoch of each grant's creation; kept out of GrantRecord. */
+  private readonly grantCreatedAt = new Map<string, number>();
   /** Seconds since epoch of each grant's first revoke; kept out of GrantRecord. */
   private readonly grantRevokedAt = new Map<string, number>();
   private readonly tokens = new Map<string, TokenRecord>();
@@ -146,6 +160,7 @@ export class MemoryOAuthStore implements OAuthStore {
   async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
     const id = String(this.nextGrantId++);
     this.grants.set(id, { id, clientId, hub, revoked: false });
+    this.grantCreatedAt.set(id, Math.floor(Date.now() / 1000));
     return id;
   }
 
@@ -215,11 +230,13 @@ export class MemoryOAuthStore implements OAuthStore {
       const revokedAt = this.grantRevokedAt.get(id);
       const ended =
         revokedAt === undefined
-          ? !this.clients.has(grant.clientId)
+          ? !this.clients.has(grant.clientId) ||
+            this.grantCreatedAt.get(id)! < now - ABANDONED_GRANT_RETENTION_SECONDS
           : revokedAt < now - REVOKED_GRANT_RETENTION_SECONDS;
       if (ended) {
         this.grants.delete(id);
         this.grantRevokedAt.delete(id);
+        this.grantCreatedAt.delete(id);
         deleted.grants += 1;
       }
     }

@@ -13,7 +13,7 @@ import {
   type TokenKind,
   type TokenRecord
 } from './store.js';
-import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
+import { KEY_ID_PATTERN, TokenDecryptError, type TokenCipher } from './token-cipher.js';
 
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
@@ -382,20 +382,38 @@ export class PgOAuthStore implements OAuthStore {
       await migrateOAuthSchema(migrationPool);
       // A wrong key would revoke every live grant on its first read: refuse to
       // boot instead. Revoked rows are never decrypted, so they don't count.
-      // ponytail: a full scan of the live grants; fine until they number in the millions.
-      const { rows } = await migrationPool.query<{ key_id: string }>(
-        `SELECT DISTINCT split_part(hub_refresh_token, '.', 2) AS key_id FROM oauth_grants
-          WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.%'`
+      // ponytail: a sequential scan of every grants row, revoked ones included
+      // (nothing indexes revoked_at); a partial index on live grants if it ever matters.
+      const { rows } = await migrationPool.query<{ key_id: string; grants: string }>(
+        `SELECT split_part(hub_refresh_token, '.', 2) AS key_id, count(*) AS grants FROM oauth_grants
+          WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.%' GROUP BY 1`
       );
+      // Only an 8-hex id is echoed: a malformed value could hold a token. Those are
+      // no key problem (revoked on first read), so they alone don't stop the boot.
       const unknown = rows
         .map((row) => row.key_id)
+        .filter((keyId) => KEY_ID_PATTERN.test(keyId))
         .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
+      const malformed = rows
+        .filter((row) => !KEY_ID_PATTERN.test(row.key_id))
+        .reduce((sum, row) => sum + Number(row.grants), 0);
       if (unknown.length) {
         // A key problem, not a connection one: thrown as is past the wrapper below.
         throw new XyteError(
           'config',
-          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
+          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}${malformed ? ` (and ${malformed} malformed)` : ''}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
         );
+      }
+      // An older build still serving during the rollout writes plain text: revoke
+      // it now (same columns as revokeGrant) rather than leave it at rest.
+      const plaintext = await migrationPool.query(
+        `UPDATE oauth_grants
+            SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+                hub_refresh_token_hash = NULL
+          WHERE revoked_at IS NULL AND hub_refresh_token NOT LIKE 'v1.%'`
+      );
+      if (plaintext.rowCount) {
+        log(`OAuth store: revoked ${plaintext.rowCount} live grant(s) holding unencrypted hub tokens`);
       }
       pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
       // An idle client dropped server-side (maintenance, failover) is emitted here;

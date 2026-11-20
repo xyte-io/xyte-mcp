@@ -190,6 +190,14 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     await store().revokeGrant(sibling);
     expect(await store().hasLiveHubSibling('user-1', 'org-1', self)).toBe(false);
   });
+
+  it('refuses a rotation on a revoked grant', async () => {
+    const id = await store().createGrant('c1', signIn());
+    await store().revokeGrant(id);
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    expect(await store().rotateHubTokens(id, 'xort_1', next)).toBe(false);
+    expect((await store().getGrant(id))?.hub).toBeUndefined();
+  });
 });
 
 /** What only the Postgres store does: the hub tokens are encrypted at rest. */
@@ -265,6 +273,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     });
   });
 
+  // The contract checks revokeGrant; here revoked_at is set while the tokens stay on the row.
   it('refuses a rotation on a revoked grant even while its tokens are still on the row', async () => {
     const store = await open(KEY_A);
     const id = await store.createGrant('c1', signIn());
@@ -384,5 +393,59 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(logText()).toContain('not encrypted');
     expect(logText()).not.toContain('xoat_plain');
     expect(logText()).not.toContain('xort_plain');
+  });
+
+  // Only a TokenDecryptError means "unreadable": any other failure is a bug, not a reason to sign out.
+  it('rejects, and revokes nothing, when decrypting fails with a plain error', async () => {
+    const cipher = new TokenCipher(KEY_A);
+    const store = await PgOAuthStore.connect(PG_URL!, cipher);
+    stores.push(store);
+    const id = await store.createGrant('c1', signIn());
+    vi.spyOn(cipher, 'decrypt').mockImplementation(() => {
+      throw new Error('boom');
+    });
+    await expect(store.getGrant(id)).rejects.toThrow('boom');
+    vi.restoreAllMocks();
+    expect(
+      (await admin.query('SELECT 1 FROM oauth_grants WHERE id = $1 AND revoked_at IS NULL', [id])).rowCount
+    ).toBe(1);
+  });
+
+  // An old dyno still serving during the deploy writes plain text; the next boot clears it.
+  it('revokes live plaintext grants at boot, logging only their count, and still boots', async () => {
+    const store = await open(KEY_A);
+    const plain = await store.createGrant('c1', signIn());
+    const kept = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [plain]
+    );
+    const logText = captureLog();
+    await open(KEY_A);
+    vi.restoreAllMocks();
+    expect(await row(plain)).toEqual({
+      hub_access_token: null,
+      hub_refresh_token: null,
+      hub_refresh_token_hash: null
+    });
+    expect((await store.getGrant(plain))?.revoked).toBe(true);
+    expect((await store.getGrant(kept))?.revoked).toBe(false);
+    expect(logText()).toContain('revoked 1 live grant(s) holding unencrypted hub tokens');
+    expect(logText()).not.toContain('xort_plain');
+  });
+
+  it('names only well-formed key ids in the boot refusal, and counts the rest', async () => {
+    const store = await open(KEY_A);
+    const ids = [await store.createGrant('c1', signIn()), await store.createGrant('c1', signIn())];
+    await admin.query(`UPDATE oauth_grants SET hub_refresh_token = 'v1.xort_secret.AAAA' WHERE id = $1`, [
+      ids[0]
+    ]);
+    const idA = new TokenCipher(KEY_A).currentKeyId;
+    const refused = open(KEY_B);
+    await expect(refused).rejects.toThrow(new RegExp(`key id\\(s\\) ${idA} \\(and 1 malformed\\)`));
+    await expect(refused).rejects.not.toThrow('xort_secret');
+    // Malformed alone is no key problem: it boots, and that grant is revoked on first read.
+    await store.revokeGrant(ids[1]!);
+    await open(KEY_B);
   });
 });

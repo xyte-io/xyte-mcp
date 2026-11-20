@@ -72,4 +72,46 @@ describe('TokenCipher', () => {
     expect(decryptFailure(cipher, `v1.${cipher.currentKeyId}.AAAA`).reason).toBe('malformed');
     expect(decryptFailure(cipher, `v1.${cipher.currentKeyId}`).reason).toBe('malformed');
   });
+
+  // Only v1.<8 lowercase hex>.<base64url> is read; anything else is malformed, and a
+  // key id is echoed only in that exact shape (a stray value could hold a token).
+  it('refuses any other shape as malformed, echoing no key id that is not 8 hex', () => {
+    const cipher = new TokenCipher(KEY_A);
+    const stored = cipher.encrypt('xoat_1', 'hub_access_token');
+    const [, keyId, payload] = stored.split('.') as [string, string, string];
+    for (const bad of [
+      `${stored}.extra`, // a fourth segment
+      `v1..${payload}`, // empty key id
+      `v1.ABCDEF12.${payload}`, // not lowercase (a random key id may have no letters to raise)
+      `v1.xoat_secret.${payload}`, // not hex, and could be anything
+      `v1.${keyId}0.${payload}`, // 9 hex
+      `v1.${keyId}.${payload}+`, // standard base64, not base64url
+      `v1.${keyId}.${payload.slice(0, 20)}=`, // padding
+      `v1.${keyId}.${payload.slice(0, 20)}!${payload.slice(20)}` // a character Buffer.from would skip
+    ]) {
+      const failure = decryptFailure(cipher, bad);
+      expect(failure.reason, bad).toBe('malformed');
+      expect(failure.message).not.toContain('xoat_secret');
+      if (failure.keyId !== undefined) expect(failure.keyId).toMatch(/^[0-9a-f]{8}$/);
+    }
+    expect(decryptFailure(cipher, `v1.xoat_secret.${payload}`).keyId).toBeUndefined();
+  });
+
+  it('refuses a tampered IV or tag, and a key id swapped to the other key it holds', () => {
+    const cipher = new TokenCipher(KEY_B, KEY_A);
+    const stored = cipher.encrypt('xoat_1', 'hub_access_token');
+    const [, , payload] = stored.split('.') as [string, string, string];
+    const flipped = (index: number) => {
+      const bytes = Buffer.from(payload, 'base64url');
+      bytes[index]! ^= 1;
+      return `v1.${cipher.currentKeyId}.${bytes.toString('base64url')}`;
+    };
+    expect(decryptFailure(cipher, flipped(0)).reason).toBe('authentication failed'); // IV byte 0
+    expect(decryptFailure(cipher, flipped(12)).reason).toBe('authentication failed'); // tag byte 0
+    const swapped = `v1.${cipher.previousKeyId}.${payload}`;
+    expect(decryptFailure(cipher, swapped)).toMatchObject({
+      reason: 'authentication failed',
+      keyId: cipher.previousKeyId
+    });
+  });
 });

@@ -86,7 +86,7 @@ Everything below is about running the server itself.
 | `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
 | `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
-| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Base64 of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`. |
+| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
 | `XYTE_MCP_TOKEN_KEY_PREVIOUS` | **Hosted server + OAuth + `DATABASE_URL`, optional.** The key being rotated out, same format: only decrypts. See [Security notes](#security-notes) for rotation. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
@@ -260,6 +260,11 @@ git push heroku HEAD:main       # HEAD, so a branch can be deployed without merg
 
 `config:edit` rather than `config:set`: the latter puts the API key in your shell history
 and in `ps` while it runs.
+
+Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
+`XYTE_MCP_TOKEN_KEY` before deploying this version; every connection then signs in once; then
+rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
+(schema version 2) cannot be rolled back: an older build refuses to boot against it.
 
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
@@ -453,12 +458,16 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   key id (the first 8 hex characters of the key's SHA-256) is logged at boot, the key never.
   A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
   logged with its id, the key id and the reason, and revoked on first read: the client gets a
-  `401` and its user connects again. Upgrading from a build that stored them unencrypted
+  `401` and its user connects again. A live grant with plain-text tokens (written by an older
+  build still serving during a deploy) is revoked at the next boot, which logs their count.
+  Upgrading from a build that stored them unencrypted
   signs every existing connection out once. That clears the plain-text tokens only in this
-  database: a backup, fork or follower taken before still holds usable hub refresh tokens. So
-  after that upgrade, have the hub re-issue this server's OAuth client secret and set it as
-  `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` (a hub refresh needs it, so the old copies' tokens stop
-  working), and treat those copies as sensitive until then. The schema is versioned: at boot
+  database: a backup, fork or follower taken before still holds hub refresh tokens. They are
+  usable only by someone who also has the current hub OAuth client secret (a hub refresh needs
+  it, and it lives in config, not in the database), which is why rotating it works: after that
+  upgrade, have the hub re-issue this server's OAuth client secret and set it as
+  `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` right away — hub refreshes fail from the moment the hub
+  re-issues the secret until the new value is set. Treat those copies as sensitive until then. The schema is versioned: at boot
   the server applies the migrations it has not yet recorded in `oauth_schema_migrations`, in
   order and once each, under a lock so two booting dynos take turns. All of them run in one
   transaction, so a failed migration leaves the database unchanged and stops the boot with
@@ -523,15 +532,18 @@ a public sign-in URL.
   setting a new value and restarting the server (it is read only at boot; on Heroku,
   changing a config var restarts the dyno). OAuth gives each user their own sign-in
   instead. See [Remote HTTP transport](#remote-http-transport) and [OAuth 2.1](#oauth-21).
-- `XYTE_MCP_TOKEN_KEY` protects every stored hub token: keep it only in the platform's
-  config, never next to a database backup. Rotate it in two config changes, since a dyno
+- `XYTE_MCP_TOKEN_KEY` protects every stored hub token: keep it in the platform's config and
+  a copy in a secret store, never next to a database backup. Rotate it in two config changes, since a dyno
   running the old config keeps serving while the new one starts: first keep
   `XYTE_MCP_TOKEN_KEY` and set the new key as `XYTE_MCP_TOKEN_KEY_PREVIOUS` (every dyno can
-  now read it; none writes with it yet); once that is fully rolled out, set the new key as
-  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS`. A grant is rewritten
+  now read it; none writes with it yet); once that is fully rolled out, change both in one
+  config change: the new key as `XYTE_MCP_TOKEN_KEY` and the old one as
+  `XYTE_MCP_TOKEN_KEY_PREVIOUS` together (setting only `XYTE_MCP_TOKEN_KEY` to the new key
+  makes the server refuse to boot). A grant is rewritten
   under the new key only at its next hub refresh, which a tool call triggers once the hub
   access token has expired (hourly); refreshing this server's own tokens does not reach the
-  hub. Count the live connections still on the old key, with its id from the boot log:
+  hub. Count the live connections still on the old key; its id is the one the boot line shows
+  as "previous" after the second change (or as "key id" before the rotation began):
 
   ```sql
   SELECT count(*) FROM oauth_grants
@@ -551,7 +563,8 @@ a public sign-in URL.
   The server refuses to boot while a live connection uses a key it has neither as
   `XYTE_MCP_TOKEN_KEY` nor as `XYTE_MCP_TOKEN_KEY_PREVIOUS`, naming that key id, so a wrong
   key keeps the server from starting (the app is down until the key is fixed) instead of
-  signing everyone out.
+  signing everyone out. If the key is lost, run the revoke `UPDATE` above with the key id from
+  that boot error; those users connect again once.
 
 ## License
 

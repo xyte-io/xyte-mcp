@@ -26,6 +26,9 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
  * In-memory token store by default; with TEST_DATABASE_URL, the Postgres one
  * (in a schema of its own, dropped after) with an encryption key, plus a
  * restart that must keep the connection.
+ *
+ * It spawns the built dist, so test:unit alone runs stale code: run
+ * `npm run build -w @xyteai/mcp-remote` first (or use npm test, which builds).
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
@@ -570,7 +573,7 @@ describe('oauth over http, in order', () => {
     }
   });
 
-  it.skipIf(!PG_URL)('keeps a connection across a restart: hub gets the decrypted token, and a forced refresh rotates it', async () => {
+  it.skipIf(!PG_URL)('keeps a connection across a restart mid key rotation: hub gets the decrypted token, and a forced refresh rotates it under the new key', async () => {
     const token = await connectAgain();
     const live = await admin!.query<{ hub_access_token: string; hub_refresh_token: string }>(
       `SELECT hub_access_token, hub_refresh_token FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL`
@@ -579,10 +582,21 @@ describe('oauth over http, in order', () => {
     expect(live.rows[0]!.hub_access_token).toMatch(/^v1\./);
     expect(live.rows[0]!.hub_refresh_token).toMatch(/^v1\./);
 
+    // Restart as step 2 of a key rotation: the grant was written under the old key,
+    // which only XYTE_MCP_TOKEN_KEY_PREVIOUS still holds.
+    const keyIdOf = (key: string) =>
+      createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex').slice(0, 8);
+    const oldKey = serverEnv.XYTE_MCP_TOKEN_KEY!;
+    const newKey = randomBytes(32).toString('base64');
+    expect(live.rows[0]!.hub_refresh_token).toMatch(new RegExp(`^v1\\.${keyIdOf(oldKey)}\\.`));
     const exited = new Promise((resolve) => child!.once('exit', resolve));
     child!.kill('SIGTERM');
     await exited;
+    serverEnv = { ...serverEnv, XYTE_MCP_TOKEN_KEY: newKey, XYTE_MCP_TOKEN_KEY_PREVIOUS: oldKey };
     await startServer();
+    expect(stderr.join('')).toContain(
+      `hub token key id ${keyIdOf(newKey)} (previous: ${keyIdOf(oldKey)})`
+    );
 
     const listDevices = () =>
       mcp(token, {
@@ -597,17 +611,24 @@ describe('oauth over http, in order', () => {
     hubPairNumber = 2;
     rejectNextHubCall = true;
     const before = hub.requests.length;
-    expect((await listDevices()).status).toBe(200);
-    hubPairNumber = 1;
+    try {
+      expect((await listDevices()).status).toBe(200);
+    } finally {
+      hubPairNumber = 1;
+      rejectNextHubCall = false;
+    }
     const [rejected, refresh, retried] = hub.requests.slice(before);
     expect((rejected!.headers as Record<string, string>).authorization).toBe('Bearer xoat_1');
     expect(new URLSearchParams(refresh!.body as string).get('refresh_token')).toBe('xort_1');
     expect((retried!.headers as Record<string, string>).authorization).toBe('Bearer xoat_2');
-    const rotated = await admin!.query(
-      `SELECT hub_refresh_token_hash FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL`
+    const rotated = await admin!.query<{ hub_refresh_token: string; hub_refresh_token_hash: string }>(
+      `SELECT hub_refresh_token, hub_refresh_token_hash FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL`
     );
     expect(rotated.rows).toEqual([
-      { hub_refresh_token_hash: createHash('sha256').update('xort_2').digest('hex') }
+      {
+        hub_refresh_token: expect.stringMatching(new RegExp(`^v1\\.${keyIdOf(newKey)}\\.`)),
+        hub_refresh_token_hash: createHash('sha256').update('xort_2').digest('hex')
+      }
     ]);
   });
 

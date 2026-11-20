@@ -202,6 +202,12 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
       databaseUrl && trimmed(env[ENV.previousTokenKey])
         ? parseTokenKey(env, ENV.previousTokenKey)
         : undefined;
+    if (tokenKey && previousTokenKey?.equals(tokenKey)) {
+      throw new XyteError(
+        'config',
+        `${ENV.previousTokenKey} must differ from ${ENV.tokenKey}: during a rotation ${ENV.tokenKey} is the new key and ${ENV.previousTokenKey} the old one.`
+      );
+    }
     oauth = {
       // The origin, as the SDK normalizes it (lowercase host, no default port),
       // so the RFC 8707 resource compares equal to what clients send back.
@@ -250,13 +256,19 @@ function validateIssuerUrl(value: string): void {
 
 /**
  * Exactly 32 bytes of standard base64. Buffer.from skips characters that are
- * not base64, so the decoded key must re-encode to the same text. The value is
- * a secret: it never goes into the error.
+ * not base64, so the decoded key must re-encode to the same text. One byte
+ * value repeated (all zeros, say) is a placeholder, not a random key. The
+ * value is a secret: it never goes into the error.
  */
 function parseTokenKey(env: NodeJS.ProcessEnv, name: string): Buffer {
   const value = trimmed(env[name]);
   const key = value ? Buffer.from(value, 'base64') : undefined;
-  if (!key || key.length !== 32 || key.toString('base64') !== value) {
+  if (
+    !key ||
+    key.length !== 32 ||
+    key.toString('base64') !== value ||
+    key.every((byte) => byte === key[0])
+  ) {
     throw new XyteError(
       'config',
       `${name} must be the base64 of exactly 32 random bytes: with ${ENV.databaseUrl} set, the stored hub tokens are encrypted under it.`,

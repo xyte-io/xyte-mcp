@@ -14,6 +14,9 @@ export type TokenColumn = 'hub_access_token' | 'hub_refresh_token';
 const VERSION = 'v1';
 const IV_BYTES = 12;
 const TAG_BYTES = 16;
+/** The only key id shape ever read or echoed: anything else may be a token, not an id. */
+export const KEY_ID_PATTERN = /^[0-9a-f]{8}$/;
+const PAYLOAD_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 /** A stored value this cipher cannot read; the reason and key id are safe to log, the value is not. */
 export class TokenDecryptError extends Error {
@@ -57,8 +60,10 @@ export class TokenCipher {
   /** Throws TokenDecryptError for anything it cannot authenticate. */
   decrypt(stored: string, column: TokenColumn): string {
     if (!stored.startsWith(`${VERSION}.`)) throw new TokenDecryptError('not encrypted');
-    const [, keyId, payload] = stored.split('.');
-    if (!keyId || payload === undefined) throw new TokenDecryptError('malformed');
+    const segments = stored.split('.');
+    const [, keyId = '', payload = ''] = segments;
+    if (segments.length !== 3 || !KEY_ID_PATTERN.test(keyId)) throw new TokenDecryptError('malformed');
+    if (!PAYLOAD_PATTERN.test(payload)) throw new TokenDecryptError('malformed', keyId);
     const key = this.keys.get(keyId);
     if (!key) throw new TokenDecryptError('unknown key id', keyId);
     const bytes = Buffer.from(payload, 'base64url');

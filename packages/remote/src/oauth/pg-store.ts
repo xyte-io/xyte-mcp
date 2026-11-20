@@ -1,6 +1,9 @@
+import { existsSync } from 'node:fs';
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { logError } from '@xyteai/mcp/log.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
+import { log, logError } from '@xyteai/mcp/log.js';
+import { errorCodeOf } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -14,16 +17,55 @@ import {
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * Three tables, created at boot with IF NOT EXISTS instead of a migration
- * framework: this service owns its whole schema and the schema is additive —
- * columns are only ever added (nullable), never dropped, so from this release
- * on, rolling back to an older build still boots against a newer database
- * (a pre-release database needs its tables dropped once — see the README).
- * Client metadata is one jsonb blob because the server never queries inside
- * it — it goes back to the SDK exactly as registered.
+ * This service owns its whole schema: three tables built at boot by the
+ * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
+ * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
+ * server never queries inside it — it goes back to the SDK exactly as
+ * registered.
  */
 
-const SCHEMA = `
+/**
+ * One schema change. `version` must equal its place in MIGRATIONS (checked at
+ * boot), and `name` is recorded with it: a database whose version N came from
+ * another build's migration N (two branches each adding one) refuses to boot
+ * instead of skipping this build's N.
+ */
+export interface Migration {
+  version: number;
+  name: string;
+  sql: string;
+  breaksRollback: boolean;
+}
+
+/**
+ * The schema history, oldest first. Append only — never edit, renumber or
+ * reorder a shipped entry.
+ *
+ * Each entry says whether it is rollback-safe, i.e. whether an older build
+ * still boots against the schema it leaves: adding a table, a nullable column
+ * or an index is safe (`breaksRollback: false`); dropping, renaming or
+ * tightening anything an older build reads is not (`true`), and an older build
+ * then refuses to boot instead of running against a schema it does not know.
+ *
+ * The flag guards a later boot of an older build, not the rollout itself:
+ * during a deploy the old dyno keeps serving against the new schema until it
+ * stops. So a breaking migration may only drop or rewrite what the previous
+ * release already stopped reading — ship the reader change one release ahead.
+ *
+ * All pending migrations run in one transaction, so a statement that cannot
+ * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
+ * Postgres) is not allowed here. Statements have no time limit, but they run
+ * before the server listens, so a long data rewrite still counts against the
+ * platform's boot timeout — keep those out of the boot path.
+ */
+export const MIGRATIONS: ReadonlyArray<Migration> = [
+  // IF NOT EXISTS, so a database created before versioning is adopted as
+  // version 1 untouched.
+  {
+    version: 1,
+    name: 'baseline',
+    breaksRollback: false,
+    sql: `
   CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id  text PRIMARY KEY,
     data       jsonb NOT NULL,
@@ -57,22 +99,225 @@ const SCHEMA = `
   -- The sibling check on revoke (hasLiveHubSibling) joins on both.
   CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
   CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
-`;
+`
+  }
+];
 
-/** Arbitrary, constant: the advisory lock serializing schema creation. */
+/** Arbitrary, constant: the advisory lock serializing schema migrations. */
 const SCHEMA_LOCK_ID = 674_601;
 
+/** The error a failed schema step throws, with the pg fields that locate it. */
+function schemaError(step: string, error: unknown): Error {
+  const pgError = error as Partial<pg.DatabaseError>;
+  const details = [
+    pgError.code && `code ${pgError.code}`,
+    pgError.detail,
+    pgError.hint,
+    pgError.position && `at character ${pgError.position}`
+  ]
+    .filter(Boolean)
+    .join('; ');
+  const message = error instanceof Error ? error.message : String(error);
+  return new Error(`OAuth store schema ${step} failed: ${message}${details ? ` (${details})` : ''}`, {
+    cause: error
+  });
+}
+
 /**
- * An `sslmode` in the DSN decides on its own (pg lets it override this option
- * anyway), so a compose or CI host can opt out with `sslmode=disable`. Without
- * one: none for a local database, and Heroku's TLS otherwise — it requires TLS
- * but presents a chain the dyno can't verify.
+ * Brings the schema up to the newest migration this build knows, once per
+ * version, under a transaction-scoped advisory lock: two boots on one database
+ * (preboot, a one-off dyno) take turns, and the second finds nothing left to
+ * apply. Everything runs in one transaction, so a failure leaves the database
+ * exactly as it was and throws, which stops the boot.
  */
-function sslOption(databaseUrl: string): { ssl?: { rejectUnauthorized: false } } {
-  const url = new URL(databaseUrl);
-  if (url.searchParams.has('sslmode')) return {};
-  if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return {};
-  return { ssl: { rejectUnauthorized: false } };
+export async function migrateOAuthSchema(
+  pool: pg.Pool,
+  migrations: ReadonlyArray<Migration> = MIGRATIONS
+): Promise<void> {
+  const misplaced = migrations.findIndex((migration, index) => migration.version !== index + 1);
+  if (misplaced !== -1) {
+    throw new Error(
+      `OAuth store migration at position ${misplaced + 1} says version ${migrations[misplaced]!.version}; versions must run 1, 2, 3 in order`
+    );
+  }
+  const client = await pool.connect();
+  let failed = false;
+  try {
+    await client.query('BEGIN');
+    try {
+      let applied: Array<{ version: number; name: string; breaks_rollback: boolean }>;
+      let adopting: boolean;
+      try {
+        // Server-side, unlike pg's client-side query_timeout: waiting longer
+        // than this for another boot's lock, or for a table a running query
+        // holds, fails the boot instead of hanging it.
+        await client.query(`SET LOCAL lock_timeout = '10s'`);
+        await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
+        await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
+          version         integer PRIMARY KEY,
+          name            text NOT NULL,
+          breaks_rollback boolean NOT NULL DEFAULT false,
+          applied_at      timestamptz NOT NULL DEFAULT now()
+        )`);
+        applied = (
+          await client.query<{ version: number; name: string; breaks_rollback: boolean }>(
+            'SELECT version, name, breaks_rollback FROM oauth_schema_migrations ORDER BY version'
+          )
+        ).rows;
+        adopting =
+          !applied.length &&
+          (await client.query<{ found: boolean }>(`SELECT to_regclass('oauth_grants') IS NOT NULL AS found`))
+            .rows[0]!.found;
+      } catch (error) {
+        throw schemaError('lock/version check', error);
+      }
+      const renamed = applied.find(
+        (row) => row.version <= migrations.length && row.name !== migrations[row.version - 1]!.name
+      );
+      if (renamed) {
+        throw new Error(
+          `OAuth store schema version ${renamed.version} in the database is "${renamed.name}", but this build's version ${renamed.version} is "${migrations[renamed.version - 1]!.name}"; two builds added different migrations under one version — renumber the newer one`
+        );
+      }
+      const newer = applied.filter((row) => row.version > migrations.length);
+      const blocking = newer.find((row) => row.breaks_rollback);
+      if (blocking) {
+        throw new Error(
+          `OAuth store schema is at version ${blocking.version}, which this build (up to version ${migrations.length}) does not know and which breaks rollback; release a build at version ${blocking.version} or later instead of rolling back`
+        );
+      }
+      if (newer.length) {
+        log(
+          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, booting`
+        );
+      }
+      const appliedVersions = new Set(applied.map((row) => row.version));
+      for (const migration of migrations) {
+        if (appliedVersions.has(migration.version)) continue;
+        const label = `${migration.version} (${migration.name})`;
+        try {
+          await client.query(migration.sql);
+          await client.query(
+            'INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES ($1, $2, $3)',
+            [migration.version, migration.name, migration.breaksRollback]
+          );
+        } catch (error) {
+          throw schemaError(`migration ${label}`, error);
+        }
+        log(
+          adopting && migration.version === 1
+            ? `OAuth store adopted the existing schema as version ${label}`
+            : `OAuth store schema migrated to version ${label}`
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      failed = true;
+      // A failed ROLLBACK (connection gone) must not hide the migration error;
+      // the server rolls the transaction back on disconnect anyway.
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  } finally {
+    // After a failure the connection may still hold an open transaction:
+    // destroy it rather than hand it back to the pool.
+    client.release(failed);
+  }
+}
+
+/**
+ * TLS verifies the server certificate (chain and hostname) by default, against
+ * Node's CA bundle plus NODE_EXTRA_CA_CERTS (one PEM file). Heroku's Postgres
+ * plans present AWS RDS-issued certificates whose CAs are in the platform's
+ * system bundle, which the Procfile loads that way unless a config var of the
+ * same name replaces it. A DSN `sslmode` (e.g. `disable` for a
+ * compose or CI host) still wins: pg applies it over this option. A local
+ * database (the `host` param, which pg prefers over the URL host, or a unix
+ * socket) gets no TLS, and an explicit PGSSLMODE=no-verify|disable is left to
+ * pg — no-verify is TLS without a certificate check, an accepted MITM risk.
+ * The host is the one pg itself resolves (the `host` param over the URL host, a
+ * %2F-encoded socket path, PGHOST), so this decides TLS for the host pg reaches.
+ */
+export function sslOption(databaseUrl: string): { ssl?: true } {
+  // ponytail: connectionParameters is pg's untyped internal; the pg-ssl specs pin its shape.
+  const client = new pg.Client({
+    connectionString: databaseUrl
+  }) as unknown as PgClientInternals;
+  const host = client.connectionParameters.host;
+  if (LOCAL_HOSTS.has(host) || host.startsWith('/')) return {};
+  if (process.env.PGSSLMODE === 'no-verify' || process.env.PGSSLMODE === 'disable') return {};
+  return { ssl: true };
+}
+
+interface PgClientInternals {
+  connectionParameters: { host: string };
+}
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+// Unknown-issuer codes: the chain is fine, only its CA is missing from the trust store.
+const MISSING_CA_CODES = new Set([
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
+]);
+
+const NO_VERIFY_HINT =
+  'PGSSLMODE=no-verify skips the check (TLS without certificate verification — an accepted MITM risk); if DATABASE_URL carries an sslmode, use sslmode=no-verify there instead.';
+
+/** What to try when the boot connection fails, by the kind of failure. */
+export function bootConnectionHints(error: unknown): string[] {
+  if (!(error instanceof Error)) return [];
+  const { code, syscall, path } = error as NodeJS.ErrnoException;
+  // A trusted certificate for another name: no CA setting fixes that.
+  if (code === 'ERR_TLS_CERT_ALTNAME_INVALID') {
+    return ["The DATABASE_URL host must match a name on the server's certificate.", NO_VERIFY_HINT];
+  }
+  if (code === 'CERT_HAS_EXPIRED' || code === 'CERT_NOT_YET_VALID') {
+    return [
+      "The server certificate is expired or not yet valid — check the database's certificate, or this machine's clock.",
+      NO_VERIFY_HINT
+    ];
+  }
+  if (code && MISSING_CA_CODES.has(code)) {
+    const extraCa = process.env.NODE_EXTRA_CA_CERTS;
+    return [
+      `Give the server's CA: NODE_EXTRA_CA_CERTS=<pem path> (one PEM file, added to Node's built-in CAs; now ${extraCa ? `${extraCa}, ${existsSync(extraCa) ? 'present' : 'missing'}` : 'unset'}), or add sslmode=verify-full&sslrootcert=<pem path> to DATABASE_URL.`,
+      NO_VERIFY_HINT
+    ];
+  }
+  // Revoked, rejected or a bad signature: a sign of tampering, so no opt-out is offered.
+  if (code && /CERT|SIGNATURE/.test(code)) {
+    return [
+      "The server's certificate was rejected (revoked or a bad signature) — check the database's certificate before trusting it."
+    ];
+  }
+  if ((code === 'ENOENT' || code === 'EACCES') && syscall === 'open') {
+    return [`Cannot read ${path ?? 'a file'}: check the sslrootcert path in DATABASE_URL.`];
+  }
+  if (/does not support SSL/.test(error.message)) {
+    return [
+      'A database without TLS: add sslmode=disable to DATABASE_URL, or set PGSSLMODE=disable.'
+    ];
+  }
+  return [];
+}
+
+/**
+ * The boot failure in one line. pg's own code and detail are kept, and a Node 22
+ * multi-address connect failure (an AggregateError with an empty message) shows
+ * its inner errors.
+ */
+export function bootFailureMessage(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const inner =
+    error instanceof AggregateError
+      ? error.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
+      : [];
+  const { code, detail } = error as Error & { code?: string; detail?: string };
+  return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
 }
 
 interface TokenRow {
@@ -99,22 +344,37 @@ export class PgOAuthStore implements OAuthStore {
   private constructor(private readonly pool: pg.Pool) {}
 
   static async connect(databaseUrl: string): Promise<PgOAuthStore> {
-    const pool = new pg.Pool({
-      connectionString: databaseUrl,
-      ...sslOption(databaseUrl),
-      max: 5,
-      // Unbounded by default: an unreachable or hung database would hang boot
-      // past Heroku's R10 and every token check instead of failing with a 503.
-      connectionTimeoutMillis: 10_000,
-      query_timeout: 10_000
-    });
-    // An idle client dropped server-side (maintenance, failover) is emitted here;
-    // unhandled, it exits the process. The pool replaces the client on its own.
-    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
-    // One multi-statement query runs as one transaction, so the xact lock holds
-    // for all of it: two boots on an empty database (preboot, a one-off dyno)
-    // would otherwise race CREATE TABLE IF NOT EXISTS into a unique violation.
-    await pool.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID});${SCHEMA}`);
+    let migrationPool: pg.Pool | undefined;
+    let pool: pg.Pool | undefined;
+    try {
+      // Inside the try: parsing the DSN reads an sslrootcert file, which may be missing.
+      const connection = {
+        connectionString: databaseUrl,
+        ...sslOption(databaseUrl),
+        // Unbounded by default: an unreachable or hung database would hang boot
+        // past Heroku's R10 and every token check instead of failing with a 503.
+        connectionTimeoutMillis: 10_000
+      };
+      // Migrations get their own connection without query_timeout: pg's timeout
+      // only abandons a statement client-side, so a migration statement over
+      // 10 s could never commit. lock_timeout bounds their waits instead.
+      migrationPool = new pg.Pool({ ...connection, max: 1 });
+      migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
+      await migrateOAuthSchema(migrationPool);
+      pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
+      // An idle client dropped server-side (maintenance, failover) is emitted here;
+      // unhandled, it exits the process. The pool replaces the client on its own.
+      pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
+    } catch (error) {
+      await pool?.end().catch(() => {});
+      throw new XyteError(
+        'config',
+        `Postgres setup failed at boot: ${bootFailureMessage(error)}`,
+        bootConnectionHints(error)
+      );
+    } finally {
+      await migrationPool?.end().catch(() => {});
+    }
     return new PgOAuthStore(pool);
   }
 

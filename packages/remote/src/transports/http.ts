@@ -22,6 +22,7 @@ import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
 import { redactText } from '@xyteai/mcp/redact.js';
 import { createServer } from '@xyteai/mcp/server.js';
 import { log, logError } from '@xyteai/mcp/log.js';
+import { errorCodeOf, logEvent } from '../log-event.js';
 
 /**
  * Remote Streamable HTTP transport.
@@ -82,6 +83,8 @@ const HEADERS_TIMEOUT_MS = 20_000;
 const SHUTDOWN_DEADLINE_MS = 28_000;
 /** In-flight requests get this long before the provider drain starts regardless. */
 const REQUEST_GRACE_MS = 10_000;
+/** A health probe answer is reused this long after its database check ends. */
+const HEALTH_CHECK_REUSE_MS = 2_000;
 
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
   const { staticToken, oauth, port } = resolveHttpConfig(env);
@@ -102,14 +105,44 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // SDK's auth router refuses the X-Forwarded-For it sees on every request.
   app.set('trust proxy', 1);
 
-  // Before the auth check: a platform health probe carries no credentials, and
-  // it reveals nothing a port scan would not.
-  app.get(HEALTH_PATH, (_req, res) => {
-    res.type('text/plain').send('ok');
-  });
-
   let store: OAuthStore | undefined;
   let provider: XyteOAuthProvider | undefined;
+
+  // Before the auth check: a platform health probe carries no credentials, and
+  // it reveals nothing a port scan would not. In OAuth mode every request needs
+  // the token store, so a dead database fails the probe (and the uptime alert).
+  // ponytail: probes share one check while it runs and reuse its answer for 2 s,
+  // so an unauthenticated flood costs at most one query per interval.
+  const checkStore = async (): Promise<boolean> => {
+    try {
+      // ponytail: a primary-key lookup through the existing interface stands in
+      // for a ping(); add one to OAuthStore if this lookup ever stops being cheap.
+      await store?.getClient('healthz');
+      return true;
+    } catch (error) {
+      logError(`healthz: token store check failed: ${errorCodeOf(error)}`);
+      return false;
+    }
+  };
+  let storeCheck: { answers: Promise<boolean>; reuseUntil: number } | undefined;
+  const storeAnswers = (): Promise<boolean> => {
+    if (!storeCheck || Date.now() >= storeCheck.reuseUntil) {
+      const check = { answers: checkStore(), reuseUntil: Infinity };
+      void check.answers.then(() => {
+        check.reuseUntil = Date.now() + HEALTH_CHECK_REUSE_MS;
+      });
+      storeCheck = check;
+    }
+    return storeCheck.answers;
+  };
+  app.get(HEALTH_PATH, (_req, res) => {
+    void storeAnswers()
+      .then((up) => {
+        if (up) res.type('text/plain').send('ok');
+        else res.status(503).type('text/plain').send('unavailable');
+      })
+      .catch((error: unknown) => logError(`healthz: ${errorCodeOf(error)}`));
+  });
   if (oauth) {
     if (oauth.databaseUrl) {
       store = await PgOAuthStore.connect(oauth.databaseUrl);
@@ -183,12 +216,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       (error: unknown) => {
         // Only a bad token is a 401: a store outage is a retryable 503, or every
         // connected client would drop its tokens and restart the OAuth flow.
-        logError(`token check failed: ${error instanceof Error ? error.message : String(error)}`);
+        logError(`token check failed: ${errorCodeOf(error)}`);
         respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
       }
     );
   };
-  const identityOf = (res: Response) => res.locals.identity as McpIdentity | undefined;
+  const identityOf = (res: Response) => res.locals.identity as Caller | undefined;
   const mcpRateLimit = rateLimit({
     windowMs: RATE_LIMIT_WINDOW_MS,
     limit: (_req, res) =>
@@ -197,12 +230,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         : MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE,
     keyGenerator: (req, res) => {
       const identity = identityOf(res);
-      return identity ? `grant:${identity.grantId}` : ipKeyGenerator(req.ip ?? '');
+      return identity ? `grant:${identity.who.connection}` : ipKeyGenerator(req.ip ?? '');
     },
     // The static bearer is one shared dev/CI identity, so it is not limited.
     skip: (_req, res) => {
       const identity = identityOf(res);
-      return identity !== undefined && identity.grantId === undefined;
+      return identity !== undefined && identity.who.connection === undefined;
     },
     standardHeaders: 'draft-8',
     legacyHeaders: false,
@@ -211,7 +244,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       const { used, limit, resetTime } = (req as Request & { rateLimit: RateLimitInfo }).rateLimit;
       // Only the first refusal per key per window: a flood would otherwise log every call.
       if (used === limit + 1) {
-        const grantId = identityOf(res)?.grantId;
+        const grantId = identityOf(res)?.who.connection;
         logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
       }
       // Clients surface the message, not Retry-After, so the wait goes in the text too.
@@ -261,7 +294,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         const message = 'Invalid Request: JSON-RPC batching is not supported, send one message per request';
         return respondJsonRpcError(res, 400, -32600, message);
       }
-      void handleMcp(req, res, identity.context, req.body);
+      void handleMcp(req, res, identity, req.body);
     });
   });
 
@@ -360,19 +393,24 @@ interface McpAuth {
   oauth?: { issuerUrl: string };
 }
 
-/** A verified caller; `grantId` is absent for the shared static bearer. */
-interface McpIdentity {
-  context: ToolContext;
-  grantId?: string;
-}
-
 async function handleMcp(
   req: Request,
   res: Response,
-  context: ToolContext,
+  caller: Caller,
   parsedBody: unknown
 ): Promise<void> {
-  const server = createServer(context);
+  const { context, who } = caller;
+  const server = createServer(context, {
+    onToolCall: (call) =>
+      logEvent('tool_call', {
+        ...who,
+        tool: call.tool,
+        endpoint: call.endpoint,
+        status: call.status,
+        outcome: call.isError ? 'error' : 'ok',
+        duration_ms: call.durationMs
+      })
+  });
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true
@@ -415,20 +453,26 @@ function respondUnauthorized(req: Request, res: Response, auth: McpAuth): void {
   respondJsonRpcError(res, 401, -32001, 'unauthorized');
 }
 
+/** An authenticated caller: its tool context, and who it is for the logs (nobody in static mode). */
+interface Caller {
+  context: ToolContext;
+  who: { connection?: string; organization?: string; user?: string };
+}
+
 /**
  * Map the presented bearer to an identity: in static mode the token to the
  * shared process context (constant-time compare), in OAuth mode a token to a
  * per-request context carrying its grant's hub token (refreshed on demand by
  * the provider's hub client).
  */
-async function resolveIdentity(req: Request, auth: McpAuth): Promise<McpIdentity | undefined> {
+async function resolveIdentity(req: Request, auth: McpAuth): Promise<Caller | undefined> {
   // The auth scheme is case-insensitive (RFC 7235 2.1).
   const header = req.headers.authorization ?? '';
   if (!/^bearer\s+/i.test(header)) return undefined;
   const presented = header.replace(/^bearer\s+/i, '').trim();
 
   if (auth.staticToken && auth.staticContext) {
-    return matches(presented, auth.staticToken) ? { context: auth.staticContext } : undefined;
+    return matches(presented, auth.staticToken) ? { context: auth.staticContext, who: {} } : undefined;
   }
 
   if (!auth.provider) return undefined;
@@ -441,7 +485,10 @@ async function resolveIdentity(req: Request, auth: McpAuth): Promise<McpIdentity
       { ...auth.config, credentials: { organization: { accessToken: hub.accessToken } } },
       auth.provider.hubHttp(hub.grantId, auth.upstream, secrets)
     );
-    return { context: { ...context, secrets }, grantId: hub.grantId };
+    return {
+      context: { ...context, secrets },
+      who: { connection: hub.grantId, organization: hub.tenantId, user: hub.sub }
+    };
   } catch (error) {
     if (error instanceof InvalidTokenError) return undefined;
     throw error;
@@ -456,6 +503,7 @@ function withSecret(context: ToolContext, secret: string): ToolContext {
 /** An unexpected throw in the consent/callback flow; the message never reaches the browser. */
 function failFlow(res: Response, error: unknown): void {
   logError(error instanceof Error ? (error.stack ?? error.message) : String(error));
+  logEvent('sign_in', { outcome: 'failed', reason: 'error' });
   if (res.headersSent) return;
   sendSignInFailedPage(res, 500, 'Restart the connection.');
 }

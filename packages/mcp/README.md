@@ -83,7 +83,9 @@ Everything below is about running the server itself.
 | `XYTE_MCP_ISSUER_URL` | **Hosted server only.** This deployment's public https URL; setting it enables OAuth 2.1. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
-| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: an `sslmode` in the DSN decides; without one, none for `localhost`, otherwise TLS without chain verification (Heroku's). |
+| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
+| `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
+| `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
 `XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for
@@ -204,10 +206,13 @@ It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
 and a restart costs a client nothing.
 
+Stopping it, cutting off one organization or connection, its log events and alerts:
+[packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md).
+
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
-| `GET /healthz` | none | Liveness probe for uptime monitors and the smoke script. Reveals nothing a port scan would not. |
+| `GET /healthz` | none | Health probe for uptime monitors and the smoke script. In OAuth mode it also checks the token database: `503` when the database does not answer. Reveals nothing a port scan would not. |
 | `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /oauth/consent`, `GET /oauth/callback` | — | OAuth mode only; the MCP SDK's auth router plus our consent page and hub's callback. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a
@@ -260,9 +265,13 @@ An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
 unless `XYTE_MCP_ALLOW_WRITES=1`, so `XYTE_MCP_READ_ONLY=1` is no longer needed there.
 
+This build verifies the Postgres certificate against the Procfile's CA bundle path, which is
+checked on the `heroku-24` stack; run the app on that stack. If the boot stops on it,
+`PGSSLMODE=no-verify` restores the old behaviour while the CA is sorted out.
+
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
-drop its three tables (`oauth_tokens`, `oauth_grants`, `oauth_clients`) once before this
-build starts; it recreates them at boot.
+drop its tables (`oauth_tokens`, `oauth_grants`, `oauth_clients` and, if present,
+`oauth_schema_migrations`) once before this build starts; it recreates them at boot.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
@@ -440,9 +449,28 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   other live grant rides the same sign-in.
 - **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
   across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. The schema is created at boot and only ever extended (nullable columns,
-  nothing dropped), so from this release on, rolling back to an older build still boots (a
-  pre-release database needs the one-time drop under [Deploy it](#deploy-it)).
+  logs users out. The schema is versioned: at boot the server applies the migrations it
+  has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
+  so two booting dynos take turns. All of them run in one transaction, so a failed
+  migration leaves the database unchanged and stops the boot with the migration's version
+  and the database error. Each migration declares whether it is rollback-safe, i.e. whether
+  an older build still boots against it: adding tables, nullable columns or indexes is
+  safe; dropping, renaming or tightening is not. An older build boots against a newer
+  rollback-safe schema, and refuses to boot (naming the version) against one that is not.
+  A build from before versioning does not check, so never roll back past this release
+  once a breaking migration has run. During a deploy the old dyno still serves against the
+  new schema, so a breaking migration may only drop or rewrite what the previous release
+  already stopped reading. A database created before versioning is adopted as version 1
+  with its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
+  TLS to a non-local database verifies the certificate (chain and hostname) against Node's CA bundle
+  plus `NODE_EXTRA_CA_CERTS`, one PEM file added to Node's built-in CAs (the Procfile
+  defaults it to the system bundle, which holds Heroku Postgres's CAs; a config var of the
+  same name replaces that path), or a DSN `sslmode=verify-full&sslrootcert=<pem path>`. A compose
+  or CI database without TLS takes `sslmode=disable`. `PGSSLMODE=no-verify` skips the check
+  — an explicit, accepted MITM risk. A missing or wrong CA stops the boot with a message
+  naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
+  one-off dyno (`heroku run`) needs it as a config var
+  (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
 - **One dyno.** The pending consent state, the refresh single-flight and the rate-limit
   counters are in memory, so the app must run on a single dyno (a second one doubles every
   budget).

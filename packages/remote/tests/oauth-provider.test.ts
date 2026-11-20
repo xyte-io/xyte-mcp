@@ -631,7 +631,8 @@ describe('XyteOAuthProvider: our tokens', () => {
     );
   });
 
-  // The Postgres store returns a grant without its hub tokens when it cannot decrypt them.
+  // Defensive: the Postgres store revokes an unreadable grant on read, but the `!grant?.hub`
+  // check stays, matching liveHub and verifyAccessToken.
   it('refuses a refresh on a grant whose hub tokens are unreadable, like an access check', async () => {
     const { provider, store } = makeProvider();
     const client = await registeredClient(provider);

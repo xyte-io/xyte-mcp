@@ -452,19 +452,20 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   database: a backup, fork or follower taken before still holds usable hub refresh tokens. So
   after that upgrade, have the hub re-issue this server's OAuth client secret and set it as
   `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` (a hub refresh needs it, so the old copies' tokens stop
-  working), and treat those copies as sensitive until then. The schema is versioned: at boot the server applies the migrations it
-  has not yet recorded in `oauth_schema_migrations`, in order and once each, under a lock
-  so two booting dynos take turns. All of them run in one transaction, so a failed
-  migration leaves the database unchanged and stops the boot with the migration's version
-  and the database error. Each migration declares whether it is rollback-safe, i.e. whether
-  an older build still boots against it: adding tables, nullable columns or indexes is
-  safe; dropping, renaming or tightening is not. An older build boots against a newer
-  rollback-safe schema, and refuses to boot (naming the version) against one that is not.
-  A build from before versioning does not check, so never roll back past this release
-  once a breaking migration has run. During a deploy the old dyno still serves against the
-  new schema, so a breaking migration may only drop or rewrite what the previous release
-  already stopped reading. A database created before versioning is adopted as version 1
-  with its data; a pre-release database needs the one-time drop under [Deploy it](#deploy-it).
+  working), and treat those copies as sensitive until then. The schema is versioned: at boot
+  the server applies the migrations it has not yet recorded in `oauth_schema_migrations`, in
+  order and once each, under a lock so two booting dynos take turns. All of them run in one
+  transaction, so a failed migration leaves the database unchanged and stops the boot with
+  the migration's version and the database error. Each migration declares whether it is
+  rollback-safe, i.e. whether an older build still boots against it: adding tables, nullable
+  columns or indexes is safe; dropping, renaming or tightening is not. An older build boots
+  against a newer rollback-safe schema, and refuses to boot (naming the version) against one
+  that is not. A build from before versioning does not check, so never roll back past this
+  release once a breaking migration has run. During a deploy the old dyno still serves
+  against the new schema, so a breaking migration may only drop or rewrite what the previous
+  release already stopped reading. A database created before versioning is adopted as
+  version 1 with its data; a pre-release database needs the one-time drop under
+  [Deploy it](#deploy-it).
 - **One dyno.** The pending consent state and the refresh single-flight are in memory, so
   the app must run on a single dyno.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
@@ -512,18 +513,18 @@ a public sign-in URL.
   running the old config keeps serving while the new one starts: first keep
   `XYTE_MCP_TOKEN_KEY` and set the new key as `XYTE_MCP_TOKEN_KEY_PREVIOUS` (every dyno can
   now read it; none writes with it yet); once that is fully rolled out, set the new key as
-  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS`. A connection in use is rewritten under the new key at its next hub refresh
-  (hourly); an idle one when it is next used, and one idle for 30 days can no longer
-  refresh anyway (our refresh tokens' lifetime). Count the live connections still on the old
-  key, with its id from the boot log:
+  `XYTE_MCP_TOKEN_KEY` and the old one as `XYTE_MCP_TOKEN_KEY_PREVIOUS`. A grant is rewritten
+  under the new key only at its next hub refresh, which a tool call triggers once the hub
+  access token has expired (hourly); refreshing this server's own tokens does not reach the
+  hub. Count the live connections still on the old key, with its id from the boot log:
 
   ```sql
   SELECT count(*) FROM oauth_grants
    WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
   ```
 
-  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0. After 30 days, first revoke the ones
-  left (they can no longer refresh):
+  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0. After 30 days, the ones left have made
+  no tool call in that time; revoke them first (their users connect again once):
 
   ```sql
   UPDATE oauth_grants
@@ -534,7 +535,8 @@ a public sign-in URL.
 
   The server refuses to boot while a live connection uses a key it has neither as
   `XYTE_MCP_TOKEN_KEY` nor as `XYTE_MCP_TOKEN_KEY_PREVIOUS`, naming that key id, so a wrong
-  key stops the deploy instead of signing everyone out.
+  key keeps the server from starting (the app is down until the key is fixed) instead of
+  signing everyone out.
 
 ## License
 

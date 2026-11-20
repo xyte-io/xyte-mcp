@@ -309,7 +309,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   it('refuses to boot while live grants use a key it does not have, naming only the key id', async () => {
     const KEY_C = randomBytes(32);
     const store = await open(KEY_A);
-    await store.createGrant('c1', signIn());
+    const id = await store.createGrant('c1', signIn());
     const idA = new TokenCipher(KEY_A).currentKeyId;
 
     const refused = open(KEY_B);
@@ -323,7 +323,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     await open(KEY_A, KEY_B);
     await open(KEY_B, KEY_A);
     // The grant revoked (its tokens dropped): nothing left to read.
-    await store.revokeGrant('1');
+    await store.revokeGrant(id);
     await open(KEY_C);
   });
 

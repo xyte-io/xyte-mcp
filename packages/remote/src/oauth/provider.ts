@@ -549,7 +549,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       throw new InvalidGrantError('refresh token is invalid or expired');
     }
     const grant = await this.store.getGrant(record.grantId);
-    // No hub pair (revoked, or unreadable at rest): nothing to serve under.
+    // Defensive, like liveHub and verifyAccessToken: the store revokes an unreadable
+    // grant on read, so a live grant without its hub pair should not reach here.
     if (!grant?.hub || grant.revoked || grant.clientId !== client.client_id) {
       throw new InvalidGrantError('refresh token is invalid or expired');
     }

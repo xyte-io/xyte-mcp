@@ -19,6 +19,7 @@ import { createHubOAuth } from '../oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
 import { MemoryOAuthStore, type OAuthStore } from '../oauth/store.js';
+import { TokenCipher } from '../oauth/token-cipher.js';
 import { redactText } from '@xyteai/mcp/redact.js';
 import { createServer } from '@xyteai/mcp/server.js';
 import { log, logError } from '@xyteai/mcp/log.js';
@@ -145,7 +146,11 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   });
   if (oauth) {
     if (oauth.databaseUrl) {
-      store = await PgOAuthStore.connect(oauth.databaseUrl);
+      store = await PgOAuthStore.connect(
+        oauth.databaseUrl,
+        // resolveHttpConfig refuses a database without a key.
+        new TokenCipher(oauth.tokenKey!, oauth.previousTokenKey)
+      );
     } else {
       store = new MemoryOAuthStore();
       logError(

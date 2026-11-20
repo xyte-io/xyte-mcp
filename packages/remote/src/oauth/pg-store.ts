@@ -3,7 +3,7 @@ import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { XyteError } from '@xyteai/mcp/http/errors.js';
 import { log, logError } from '@xyteai/mcp/log.js';
-import { errorCodeOf } from '../log-event.js';
+import { errorCodeOf, logEvent } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -13,6 +13,7 @@ import {
   type TokenKind,
   type TokenRecord
 } from './store.js';
+import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
 
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
@@ -21,7 +22,8 @@ import {
  * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
  * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
  * server never queries inside it — it goes back to the SDK exactly as
- * registered.
+ * registered. The hub tokens are encrypted (TokenCipher); the refresh token's
+ * hash sits next to them, so a rotation compares without decrypting.
  */
 
 /**
@@ -51,6 +53,7 @@ export interface Migration {
  * during a deploy the old dyno keeps serving against the new schema until it
  * stops. So a breaking migration may only drop or rewrite what the previous
  * release already stopped reading — ship the reader change one release ahead.
+ * Version 2 is a deliberate pre-launch exception (README, "Deploy it").
  *
  * All pending migrations run in one transaction, so a statement that cannot
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
@@ -99,6 +102,20 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
   -- The sibling check on revoke (hasLiveHubSibling) joins on both.
   CREATE INDEX IF NOT EXISTS oauth_tokens_grant_id ON oauth_tokens (grant_id);
   CREATE INDEX IF NOT EXISTS oauth_grants_hub_sign_in ON oauth_grants (hub_sub, hub_tenant);
+`
+  },
+  // The hub tokens are encrypted from here on. Live grants hold plain text this
+  // build cannot read, so they are signed out (their users connect again once);
+  // and an older build would send this build's ciphertext to hub as a token.
+  {
+    version: 2,
+    name: 'encrypt_hub_tokens',
+    breaksRollback: true,
+    sql: `
+  ALTER TABLE oauth_grants ADD COLUMN hub_refresh_token_hash text;
+  UPDATE oauth_grants
+     SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
+   WHERE revoked_at IS NULL;
 `
   }
 ];
@@ -320,6 +337,74 @@ export function bootFailureMessage(error: unknown): string {
   return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
 }
 
+/**
+ * The shape of an encrypted value up to its key id, as a Postgres regex (a
+ * parameter, so no escaping rules apply). Anything else is plain text from an
+ * older build or a malformed value.
+ */
+const ENCRYPTED_SHAPE = '^v1\\.[0-9a-f]{8}\\.';
+
+/**
+ * Boot checks over the live grants, in one transaction under the migrations'
+ * lock_timeout, so a boot never hangs on a row a running query holds.
+ *
+ * First revoke (same columns as revokeGrant) every live grant with either
+ * token not in the encrypted shape: an older build still serving during the
+ * rollout writes plain text, which must not stay at rest. Then, as a wrong key
+ * would revoke every remaining live grant on its first read, refuse to boot
+ * (rolling the sweep back) while any uses a key id this build lacks. Revoked
+ * rows are never decrypted, so they don't count. Only an 8-hex key id is ever
+ * read out, so the error never echoes a token.
+ */
+async function checkAndSweepHubTokens(pool: pg.Pool, cipher: TokenCipher): Promise<void> {
+  const client = await pool.connect();
+  let failed = false;
+  try {
+    await client.query('BEGIN');
+    try {
+      await client.query(`SET LOCAL lock_timeout = '10s'`);
+      const plaintext = await client.query(
+        `UPDATE oauth_grants
+            SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+                hub_refresh_token_hash = NULL
+          WHERE revoked_at IS NULL
+            AND (COALESCE(hub_access_token, '') !~ $1 OR COALESCE(hub_refresh_token, '') !~ $1)`,
+        [ENCRYPTED_SHAPE]
+      );
+      // ponytail: two sequential scans of every grants row, revoked ones included
+      // (nothing indexes revoked_at); a partial index on live grants if it ever matters.
+      const { rows } = await client.query<{ key_id: string }>(
+        `SELECT DISTINCT split_part(token, '.', 2) AS key_id FROM (
+           SELECT hub_refresh_token AS token FROM oauth_grants WHERE revoked_at IS NULL
+           UNION ALL
+           SELECT hub_access_token FROM oauth_grants WHERE revoked_at IS NULL
+         ) live WHERE token ~ $1`,
+        [ENCRYPTED_SHAPE]
+      );
+      const unknown = rows
+        .map((row) => row.key_id)
+        .filter((keyId) => keyId !== cipher.currentKeyId && keyId !== cipher.previousKeyId);
+      if (unknown.length) {
+        // A key problem, not a connection one: thrown as is past the boot wrapper.
+        throw new XyteError(
+          'config',
+          `OAuth store: live grants use hub token key id(s) ${unknown.join(', ')}, which XYTE_MCP_TOKEN_KEY (key id ${cipher.currentKeyId}) and XYTE_MCP_TOKEN_KEY_PREVIOUS do not match; set the key those grants were written with as XYTE_MCP_TOKEN_KEY, or as XYTE_MCP_TOKEN_KEY_PREVIOUS while rotating`
+        );
+      }
+      await client.query('COMMIT');
+      if (plaintext.rowCount) {
+        log(`OAuth store: revoked ${plaintext.rowCount} live grant(s) holding unencrypted hub tokens`);
+      }
+    } catch (error) {
+      failed = true;
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  } finally {
+    client.release(failed);
+  }
+}
+
 interface TokenRow {
   grant_id: string;
   code_challenge: string | null;
@@ -341,9 +426,12 @@ interface GrantRow {
 }
 
 export class PgOAuthStore implements OAuthStore {
-  private constructor(private readonly pool: pg.Pool) {}
+  private constructor(
+    private readonly pool: pg.Pool,
+    private readonly cipher: TokenCipher
+  ) {}
 
-  static async connect(databaseUrl: string): Promise<PgOAuthStore> {
+  static async connect(databaseUrl: string, cipher: TokenCipher): Promise<PgOAuthStore> {
     let migrationPool: pg.Pool | undefined;
     let pool: pg.Pool | undefined;
     try {
@@ -361,12 +449,14 @@ export class PgOAuthStore implements OAuthStore {
       migrationPool = new pg.Pool({ ...connection, max: 1 });
       migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
       await migrateOAuthSchema(migrationPool);
+      await checkAndSweepHubTokens(migrationPool, cipher);
       pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
       // An idle client dropped server-side (maintenance, failover) is emitted here;
       // unhandled, it exits the process. The pool replaces the client on its own.
       pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
     } catch (error) {
       await pool?.end().catch(() => {});
+      if (error instanceof XyteError) throw error;
       throw new XyteError(
         'config',
         `Postgres setup failed at boot: ${bootFailureMessage(error)}`,
@@ -375,7 +465,11 @@ export class PgOAuthStore implements OAuthStore {
     } finally {
       await migrationPool?.end().catch(() => {});
     }
-    return new PgOAuthStore(pool);
+    log(
+      `OAuth store: hub token key id ${cipher.currentKeyId}` +
+        (cipher.previousKeyId ? ` (previous: ${cipher.previousKeyId})` : '')
+    );
+    return new PgOAuthStore(pool, cipher);
   }
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
@@ -396,14 +490,15 @@ export class PgOAuthStore implements OAuthStore {
 
   async createGrant(clientId: string, hub: HubSignIn): Promise<string> {
     const result = await this.pool.query<{ id: string }>(
-      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_tenant,
-                                 hub_refresh_token, hub_expires_at, hub_sub, hub_email)
-       VALUES ($1, $2, $3, $4, to_timestamp($5), $6, $7) RETURNING id`,
+      `INSERT INTO oauth_grants (client_id, hub_access_token, hub_tenant, hub_refresh_token,
+                                 hub_refresh_token_hash, hub_expires_at, hub_sub, hub_email)
+       VALUES ($1, $2, $3, $4, $5, to_timestamp($6), $7, $8) RETURNING id`,
       [
         clientId,
-        hub.accessToken,
+        this.cipher.encrypt(hub.accessToken, 'hub_access_token'),
         hub.tenantId,
-        hub.refreshToken,
+        this.cipher.encrypt(hub.refreshToken, 'hub_refresh_token'),
+        hashToken(hub.refreshToken),
         hub.expiresAt,
         hub.sub,
         hub.email ?? null
@@ -420,14 +515,28 @@ export class PgOAuthStore implements OAuthStore {
     ]);
     const row = result.rows[0];
     if (!row) return undefined;
+    const tokens = this.hubTokensOf(row);
+    if (tokens === 'unreadable') {
+      // Revoked, not just signed out: a grant left unrevoked would still count
+      // as a live sibling and skip the hub revoke of the user's next sign-in.
+      await this.revokeGrant(row.id);
+      if (row.revoked_at === null) {
+        logEvent('revoke', {
+          connection: row.id,
+          organization: row.hub_tenant,
+          user: row.hub_sub,
+          reason: 'unreadable_token'
+        });
+      }
+      return { id: row.id, clientId: row.client_id, revoked: true };
+    }
     return {
       id: row.id,
       clientId: row.client_id,
-      ...(row.hub_access_token !== null && row.hub_refresh_token !== null
+      ...(tokens
         ? {
             hub: {
-              accessToken: row.hub_access_token,
-              refreshToken: row.hub_refresh_token,
+              ...tokens,
               expiresAt: Math.floor(row.hub_expires_at.getTime() / 1000),
               sub: row.hub_sub,
               tenantId: row.hub_tenant,
@@ -439,10 +548,32 @@ export class PgOAuthStore implements OAuthStore {
     };
   }
 
+  /**
+   * The decrypted pair; undefined when there is none; 'unreadable' when it
+   * cannot be read (a plaintext row from an older build, a key no longer
+   * configured): the grant is then revoked, and its user connects again.
+   */
+  private hubTokensOf(
+    row: GrantRow
+  ): { accessToken: string; refreshToken: string } | 'unreadable' | undefined {
+    if (row.hub_access_token === null || row.hub_refresh_token === null) return undefined;
+    try {
+      return {
+        accessToken: this.cipher.decrypt(row.hub_access_token, 'hub_access_token'),
+        refreshToken: this.cipher.decrypt(row.hub_refresh_token, 'hub_refresh_token')
+      };
+    } catch (error) {
+      if (!(error instanceof TokenDecryptError)) throw error;
+      logError(`grant ${row.id}: ${error.message}; revoking the grant`);
+      return 'unreadable';
+    }
+  }
+
   async revokeGrant(grantId: string): Promise<void> {
     await this.pool.query(
       `UPDATE oauth_grants
-          SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
+          SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
+              hub_refresh_token_hash = NULL
         WHERE id = $1 AND revoked_at IS NULL`,
       [grantId]
     );
@@ -453,11 +584,20 @@ export class PgOAuthStore implements OAuthStore {
     previousRefreshToken: string,
     next: HubTokens
   ): Promise<boolean> {
+    // Encryption is randomized, so the swap compares the refresh token's hash.
     const result = await this.pool.query(
       `UPDATE oauth_grants
-          SET hub_access_token = $3, hub_refresh_token = $4, hub_expires_at = to_timestamp($5)
-        WHERE id = $1 AND hub_refresh_token = $2`,
-      [grantId, previousRefreshToken, next.accessToken, next.refreshToken, next.expiresAt]
+          SET hub_access_token = $3, hub_refresh_token = $4, hub_refresh_token_hash = $5,
+              hub_expires_at = to_timestamp($6)
+        WHERE id = $1 AND hub_refresh_token_hash = $2 AND revoked_at IS NULL`,
+      [
+        grantId,
+        hashToken(previousRefreshToken),
+        this.cipher.encrypt(next.accessToken, 'hub_access_token'),
+        this.cipher.encrypt(next.refreshToken, 'hub_refresh_token'),
+        hashToken(next.refreshToken),
+        next.expiresAt
+      ]
     );
     return result.rowCount === 1;
   }

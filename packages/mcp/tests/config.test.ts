@@ -188,9 +188,118 @@ describe('resolveHttpConfig', () => {
       resolveHttpConfig({
         ...hubClientEnv,
         [ENV.issuerUrl]: issuer,
-        [ENV.databaseUrl]: 'postgres://x'
+        [ENV.databaseUrl]: 'postgres://x',
+        [ENV.tokenKey]: tokenKey
       }).oauth
-    ).toEqual({ issuerUrl: issuer, databaseUrl: 'postgres://x', hubClient });
+    ).toEqual({
+      issuerUrl: issuer,
+      databaseUrl: 'postgres://x',
+      hubClient,
+      tokenKey: Buffer.from(tokenKey, 'base64')
+    });
+  });
+
+  // Fixed bytes whose base64 holds '+' and '/', so the base64url case below differs.
+  const tokenKeyBytes = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 37 + 251) % 256));
+  const tokenKey = tokenKeyBytes.toString('base64');
+  const previousTokenKey = Buffer.from(tokenKeyBytes.map((byte) => byte ^ 0x5a)).toString('base64');
+  const pgOAuthEnv = {
+    ...hubClientEnv,
+    [ENV.issuerUrl]: 'https://mcp.example.com',
+    [ENV.databaseUrl]: 'postgres://x'
+  };
+
+  // The stored hub tokens are encrypted under it; without one they would sit in plain text.
+  it('refuses a Postgres token store without a valid token key, never echoing the value', () => {
+    // The two cases below only test the re-encode check if they still decode to 32 bytes.
+    expect(Buffer.from(`${tokenKey.slice(0, 10)}!${tokenKey.slice(10)}`, 'base64')).toHaveLength(32);
+    expect(tokenKeyBytes.toString('base64url')).not.toBe(tokenKey);
+    expect(Buffer.from(tokenKeyBytes.toString('base64url'), 'base64')).toHaveLength(32);
+    for (const bad of [
+      undefined,
+      '',
+      Buffer.alloc(16, 7).toString('base64'), // too short
+      Buffer.alloc(33, 7).toString('base64'), // too long
+      `${tokenKey.slice(0, 10)}!${tokenKey.slice(10)}`, // a character base64 silently drops
+      tokenKey.replace(/=$/, ''), // unpadded
+      tokenKeyBytes.toString('base64url'), // base64url, not standard base64
+      Buffer.alloc(32, 7).toString('base64'), // a placeholder: one byte value repeated
+      Buffer.alloc(32).toString('base64') // all zeros
+    ]) {
+      const env = { ...pgOAuthEnv, ...(bad === undefined ? {} : { [ENV.tokenKey]: bad }) };
+      expect(() => resolveHttpConfig(env), String(bad)).toThrow(XyteError);
+      expect(() => resolveHttpConfig(env)).toThrow(new RegExp(ENV.tokenKey));
+      try {
+        resolveHttpConfig(env);
+      } catch (error) {
+        const { message, hints } = error as XyteError;
+        expect(message + JSON.stringify(hints)).toContain("randomBytes(32).toString('base64')");
+        if (bad) expect(message + JSON.stringify(hints)).not.toContain(bad);
+      }
+    }
+  });
+
+  it('takes an optional previous token key, validated the same way', () => {
+    expect(
+      resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: ` ${tokenKey} `,
+        [ENV.previousTokenKey]: previousTokenKey
+      }).oauth
+    ).toMatchObject({
+      tokenKey: Buffer.from(tokenKey, 'base64'),
+      previousTokenKey: Buffer.from(previousTokenKey, 'base64')
+    });
+    for (const badPrevious of ['not-a-key', Buffer.alloc(32, 9).toString('base64')]) {
+      const env = { ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.previousTokenKey]: badPrevious };
+      expect(() => resolveHttpConfig(env)).toThrow(new RegExp(ENV.previousTokenKey));
+      expect(() => resolveHttpConfig(env)).not.toThrow(badPrevious);
+    }
+  });
+
+  it('treats an empty or whitespace previous token key as unset', () => {
+    for (const blank of ['', '   ']) {
+      const oauth = resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: tokenKey,
+        [ENV.previousTokenKey]: blank
+      }).oauth;
+      expect(oauth).toMatchObject({ tokenKey: Buffer.from(tokenKey, 'base64') });
+      expect(oauth).not.toHaveProperty('previousTokenKey');
+    }
+  });
+
+  // Same key twice is a rotation step done wrong (KEY changed, PREVIOUS not, or vice versa).
+  it('refuses a previous token key equal to the current one, never echoing it', () => {
+    const env = { ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.previousTokenKey]: ` ${tokenKey}` };
+    expect(() => resolveHttpConfig(env)).toThrow(
+      new RegExp(`${ENV.previousTokenKey} must differ from ${ENV.tokenKey}`)
+    );
+    expect(() => resolveHttpConfig(env)).not.toThrow(tokenKey);
+  });
+
+  it('ignores the previous token key for the in-memory store, even an invalid one', () => {
+    const oauth = resolveHttpConfig({
+      ...pgOAuthEnv,
+      [ENV.databaseUrl]: '',
+      [ENV.previousTokenKey]: 'not-a-key'
+    }).oauth;
+    expect(oauth).not.toHaveProperty('previousTokenKey');
+    expect(oauth).not.toHaveProperty('tokenKey');
+  });
+
+  it('needs no token key for the in-memory store, and ignores an invalid one', () => {
+    expect(resolveHttpConfig({ ...pgOAuthEnv, [ENV.databaseUrl]: '' }).oauth).toEqual({
+      issuerUrl: 'https://mcp.example.com',
+      hubClient
+    });
+    expect(
+      resolveHttpConfig({
+        ...hubClientEnv,
+        [ENV.issuerUrl]: 'https://mcp.example.com',
+        [ENV.tokenKey]: 'not-a-key'
+      }).oauth
+    ).toEqual({ issuerUrl: 'https://mcp.example.com', hubClient });
   });
 
   it('refuses OAuth without the hub client credentials', () => {

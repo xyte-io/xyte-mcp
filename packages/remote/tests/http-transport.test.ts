@@ -408,6 +408,22 @@ describe('http transport', () => {
     expect(stderr).toContain('  - Unset XYTE_MCP_HTTP_TOKEN for OAuth');
   });
 
+  it('refuses to start OAuth on Postgres without a token key, saying how to make one', async () => {
+    const { code, stderr } = await runToExit([], {
+      PORT: String(await freePort()),
+      XYTE_MCP_ISSUER_URL: 'https://mcp.example.com',
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
+      // Never reached: config fails first.
+      DATABASE_URL: 'postgres://localhost:9/none',
+      XYTE_MCP_TOKEN_KEY: ''
+    });
+
+    expect(code).toBe(1);
+    expect(stderr).toContain('XYTE_MCP_TOKEN_KEY must be the base64 of exactly 32 random bytes');
+    expect(stderr).toContain("  - Generate one: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"");
+  });
+
   it('refuses to start without a bearer token, naming the variable', async () => {
     const { code, stderr } = await runToExit([], {
       PORT: String(await freePort()),

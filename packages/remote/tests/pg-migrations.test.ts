@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MIGRATIONS, PgOAuthStore, migrateOAuthSchema, type Migration } from '../src/oauth/pg-store.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
 
 /**
  * The schema migrator against a throwaway database (TEST_DATABASE_URL). Each
@@ -12,6 +13,9 @@ import { MIGRATIONS, PgOAuthStore, migrateOAuthSchema, type Migration } from '..
 const PG_URL = process.env.TEST_DATABASE_URL;
 
 const BASELINE = { version: 1, name: 'baseline', breaks_rollback: false };
+const ENCRYPT = { version: 2, name: 'encrypt_hub_tokens', breaks_rollback: true };
+/** A build that only knew the baseline. */
+const V1 = [MIGRATIONS[0]!];
 
 describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
   let admin: pg.Pool;
@@ -61,7 +65,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     await admin.query(`DROP SCHEMA ${schema} CASCADE`);
   });
 
-  it('creates the schema on an empty database and records version 1', async () => {
+  it('creates the schema on an empty database and records every version', async () => {
     const logText = captureLog();
     await migrateOAuthSchema(poolForSchema());
 
@@ -71,8 +75,9 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
       'oauth_schema_migrations',
       'oauth_tokens'
     ]);
-    expect(await appliedVersions()).toEqual([BASELINE]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT]);
     expect(logText()).toContain('OAuth store schema migrated to version 1 (baseline)');
+    expect(logText()).toContain('OAuth store schema migrated to version 2 (encrypt_hub_tokens)');
   });
 
   it('adopts a database created before versioning as version 1, keeping its rows', async () => {
@@ -87,13 +92,48 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     const logText = captureLog();
     await migrateOAuthSchema(pool);
 
-    expect(await appliedVersions()).toEqual([BASELINE]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT]);
     expect(logText()).toContain('adopted the existing schema as version 1 (baseline)');
     expect((await pool.query('SELECT client_id FROM oauth_clients')).rows).toEqual([
       { client_id: 'c1' }
     ]);
-    expect((await pool.query('SELECT count(*)::int AS n FROM oauth_grants')).rows).toEqual([
-      { n: 1 }
+    // Kept, but signed out by version 2: its hub tokens were plain text.
+    expect(
+      (await pool.query('SELECT revoked_at IS NOT NULL AS revoked FROM oauth_grants')).rows
+    ).toEqual([{ revoked: true }]);
+  });
+
+  // Their hub tokens are plain text, which the encrypting build cannot read.
+  it('version 2 signs out every live grant written unencrypted, keeping the rows', async () => {
+    const pool = poolForSchema();
+    await migrateOAuthSchema(pool, V1);
+    await pool.query(
+      `INSERT INTO oauth_grants (client_id, hub_sub, hub_tenant, hub_access_token, hub_refresh_token, hub_expires_at)
+       VALUES ('c1', 'sub', 'tenant', 'xoat_plain', 'xort_plain', now())`
+    );
+    await pool.query(
+      `INSERT INTO oauth_grants (client_id, hub_sub, hub_tenant, hub_expires_at, revoked_at)
+       VALUES ('c1', 'sub', 'tenant', now(), '2020-01-01')`
+    );
+
+    captureLog();
+    await migrateOAuthSchema(pool);
+
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT]);
+    const grants = await pool.query(
+      `SELECT revoked_at IS NOT NULL AS revoked, revoked_at < '2021-01-01' AS revoked_earlier,
+              hub_access_token, hub_refresh_token, hub_refresh_token_hash
+         FROM oauth_grants ORDER BY id`
+    );
+    const signedOut = {
+      revoked: true,
+      hub_access_token: null,
+      hub_refresh_token: null,
+      hub_refresh_token_hash: null
+    };
+    expect(grants.rows).toEqual([
+      { ...signedOut, revoked_earlier: false },
+      { ...signedOut, revoked_earlier: true }
     ]);
   });
 
@@ -112,7 +152,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
   it('lets two boots migrate an empty database at once without racing', async () => {
     await Promise.all([migrateOAuthSchema(poolForSchema()), migrateOAuthSchema(poolForSchema())]);
 
-    expect(await appliedVersions()).toEqual([BASELINE]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT]);
   });
 
   it('records whether a migration breaks rollback', async () => {
@@ -177,7 +217,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
   it('leaves an already-migrated database at its version when a later migration fails', async () => {
     const pool = poolForSchema();
-    await migrateOAuthSchema(pool);
+    await migrateOAuthSchema(pool, V1);
 
     const failing: Migration[] = [
       MIGRATIONS[0]!,
@@ -195,13 +235,13 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
   it('boots against a newer version that is rollback-safe, changing nothing', async () => {
     const pool = poolForSchema();
-    await migrateOAuthSchema(pool);
+    await migrateOAuthSchema(pool, V1);
     await pool.query(
       `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (2, 'newer', false)`
     );
 
     const logText = captureLog();
-    await expect(migrateOAuthSchema(pool)).resolves.toBeUndefined();
+    await expect(migrateOAuthSchema(pool, V1)).resolves.toBeUndefined();
 
     expect(await appliedVersions()).toEqual([BASELINE, { version: 2, name: 'newer', breaks_rollback: false }]);
     expect(logText()).toContain(
@@ -212,7 +252,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
   it('refuses to boot against a newer version that breaks rollback, before running anything', async () => {
     const pool = poolForSchema();
-    await migrateOAuthSchema(pool);
+    await migrateOAuthSchema(pool, V1);
     await pool.query(
       `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (3, 'breaking', true)`
     );
@@ -234,14 +274,18 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
   it('fails PgOAuthStore.connect with the migration error', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
+    const newer = MIGRATIONS.length + 1;
     await pool.query(
-      `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (2, 'breaking', true)`
+      `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES ($1, 'breaking', true)`,
+      [newer]
     );
     const url = new URL(PG_URL!);
     url.searchParams.set('options', `-c search_path=${schema}`);
 
-    await expect(PgOAuthStore.connect(url.toString())).rejects.toThrow(
-      /^Postgres setup failed at boot: OAuth store schema is at version 2, which this build/
+    await expect(
+      PgOAuthStore.connect(url.toString(), new TokenCipher(Buffer.alloc(32)))
+    ).rejects.toThrow(
+      new RegExp(`^Postgres setup failed at boot: OAuth store schema is at version ${newer}, which this build`)
     );
   });
 });

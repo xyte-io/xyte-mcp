@@ -9,7 +9,8 @@ import type { HubSignIn, HubTokens } from './hub-oauth.js';
  *
  * Our tokens are stored as SHA-256 hashes — a leaked database row must not be
  * a usable credential. The hub tokens inside a grant are the exception: they
- * have to be sent to the hub verbatim, so they are stored as-is. Revocation is
+ * have to be sent to the hub verbatim, so the Postgres store encrypts them
+ * (token-cipher.ts) rather than hashing them. Revocation is
  * grant-level on purpose: revoking any one token kills the login it came from,
  * which is the behavior a "disconnect" button needs.
  */
@@ -123,7 +124,7 @@ export class MemoryOAuthStore implements OAuthStore {
     next: HubTokens
   ): Promise<boolean> {
     const grant = this.grants.get(grantId);
-    if (!grant?.hub || grant.hub.refreshToken !== previousRefreshToken) return false;
+    if (!grant?.hub || grant.revoked || grant.hub.refreshToken !== previousRefreshToken) return false;
     grant.hub = { ...grant.hub, ...next };
     return true;
   }

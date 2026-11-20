@@ -17,6 +17,10 @@ export const ENV = {
   /** This server's confidential-client credentials at hub's OAuth server; required with OAuth. */
   hubOAuthClientId: 'XYTE_MCP_HUB_OAUTH_CLIENT_ID',
   hubOAuthClientSecret: 'XYTE_MCP_HUB_OAUTH_CLIENT_SECRET',
+  /** Base64 of 32 random bytes; encrypts the hub tokens in the Postgres store. Required with DATABASE_URL. */
+  tokenKey: 'XYTE_MCP_TOKEN_KEY',
+  /** The key being rotated out; only decrypts. */
+  previousTokenKey: 'XYTE_MCP_TOKEN_KEY_PREVIOUS',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;
@@ -54,6 +58,10 @@ export interface OAuthConfig {
   databaseUrl?: string;
   /** xyte-mcp's own client registration at hub's OAuth server (client_secret_basic). */
   hubClient: { id: string; secret: string };
+  /** AES-256 key for the hub tokens at rest; set whenever `databaseUrl` is. */
+  tokenKey?: Buffer;
+  /** The key being rotated out: read with, never written with. */
+  previousTokenKey?: Buffer;
 }
 
 /** Configuration of the HTTP listener itself, as opposed to of a tool call. */
@@ -187,12 +195,27 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
         ]
       );
     }
+    const databaseUrl = trimmed(env[ENV.databaseUrl]);
+    // ponytail: the in-memory store holds nothing at rest, so it takes no key.
+    const tokenKey = databaseUrl ? parseTokenKey(env, ENV.tokenKey) : undefined;
+    const previousTokenKey =
+      databaseUrl && trimmed(env[ENV.previousTokenKey])
+        ? parseTokenKey(env, ENV.previousTokenKey)
+        : undefined;
+    if (tokenKey && previousTokenKey?.equals(tokenKey)) {
+      throw new XyteError(
+        'config',
+        `${ENV.previousTokenKey} must differ from ${ENV.tokenKey}: during a rotation ${ENV.tokenKey} is the new key and ${ENV.previousTokenKey} the old one.`
+      );
+    }
     oauth = {
       // The origin, as the SDK normalizes it (lowercase host, no default port),
       // so the RFC 8707 resource compares equal to what clients send back.
       issuerUrl: new URL(issuerUrl).origin,
-      ...(trimmed(env[ENV.databaseUrl]) ? { databaseUrl: trimmed(env[ENV.databaseUrl]) } : {}),
-      hubClient: { id, secret }
+      ...(databaseUrl ? { databaseUrl } : {}),
+      hubClient: { id, secret },
+      ...(tokenKey ? { tokenKey } : {}),
+      ...(previousTokenKey ? { previousTokenKey } : {})
     };
   }
 
@@ -229,6 +252,30 @@ function validateIssuerUrl(value: string): void {
   if (url.pathname !== '/') {
     throw new XyteError('config', `${ENV.issuerUrl} must not have a path (got ${url.pathname}).`);
   }
+}
+
+/**
+ * Exactly 32 bytes of standard base64. Buffer.from skips characters that are
+ * not base64, so the decoded key must re-encode to the same text. One byte
+ * value repeated (all zeros, say) is a placeholder, not a random key. The
+ * value is a secret: it never goes into the error.
+ */
+function parseTokenKey(env: NodeJS.ProcessEnv, name: string): Buffer {
+  const value = trimmed(env[name]);
+  const key = value ? Buffer.from(value, 'base64') : undefined;
+  if (
+    !key ||
+    key.length !== 32 ||
+    key.toString('base64') !== value ||
+    key.every((byte) => byte === key[0])
+  ) {
+    throw new XyteError(
+      'config',
+      `${name} must be the base64 of exactly 32 random bytes: with ${ENV.databaseUrl} set, the stored hub tokens are encrypted under it.`,
+      [`Generate one: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`]
+    );
+  }
+  return key;
 }
 
 /** An unset PORT defaults; a set-but-invalid one is a misconfiguration, not a default. */

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { hubAcceptsPkce } from './support/pkce.js';
 import { existsSync, readFileSync } from 'node:fs';
 import {
@@ -11,6 +11,7 @@ import {
 } from 'node:http';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 /**
@@ -21,6 +22,13 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
  * token → revocation, at hub too. One sequential suite,
  * because each step consumes the previous one's output — exactly like a real
  * client.
+ *
+ * In-memory token store by default; with TEST_DATABASE_URL, the Postgres one
+ * (in a schema of its own, dropped after) with an encryption key, plus a
+ * restart that must keep the connection.
+ *
+ * It spawns the built dist, so test:unit alone runs stale code: run
+ * `npm run build -w @xyteai/mcp-remote` first (or use npm test, which builds).
  */
 
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
@@ -49,8 +57,15 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+const PG_URL = process.env.TEST_DATABASE_URL;
+const PG_SCHEMA = `oauth_http_test_${randomUUID().replaceAll('-', '')}`;
+
 /** Hub token lifetime the fake hub hands out; a test sets it inside the refresh window. */
 let hubExpiresIn = 3600;
+/** The number in the hub token pair the fake hub hands out next. */
+let hubPairNumber = 1;
+/** While set, the fake hub rejects the next API call's bearer as hub does an expired one. */
+let rejectNextHubCall = false;
 /** While set, the fake hub parks refresh requests here instead of answering. */
 let heldRefreshes: Array<() => void> | undefined;
 
@@ -76,8 +91,8 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(
             JSON.stringify({
-              access_token: 'xoat_1',
-              refresh_token: 'xort_1',
+              access_token: `xoat_${hubPairNumber}`,
+              refresh_token: `xort_${hubPairNumber}`,
               expires_in: hubExpiresIn,
               token_type: 'Bearer',
               id_token: ID_TOKEN
@@ -93,6 +108,12 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
       }
       if (req.method === 'POST' && req.url === '/oauth/revoke') {
         res.writeHead(200);
+        res.end();
+        return;
+      }
+      if (rejectNextHubCall && req.url?.startsWith('/core/')) {
+        rejectNextHubCall = false;
+        res.writeHead(401, { 'WWW-Authenticate': 'Bearer error="invalid_token"' });
         res.end();
         return;
       }
@@ -114,6 +135,8 @@ let hubChallenge: string | undefined;
 let base = '';
 let hub: ReturnType<typeof fakeHub>;
 const stderr: string[] = [];
+let serverEnv: NodeJS.ProcessEnv;
+let admin: pg.Pool | undefined;
 
 beforeAll(async () => {
   if (!existsSync(DIST_ENTRY)) {
@@ -123,20 +146,41 @@ beforeAll(async () => {
   const hubPort = await freePort();
   await new Promise<void>((resolve) => hub.server.listen(hubPort, '127.0.0.1', resolve));
 
+  let databaseUrl = '';
+  if (PG_URL) {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+    await admin.query(`CREATE SCHEMA ${PG_SCHEMA}`);
+    const url = new URL(PG_URL);
+    url.searchParams.set('options', `-c search_path=${PG_SCHEMA}`);
+    databaseUrl = url.toString();
+  }
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
+  serverEnv = {
+    ...process.env,
+    PORT: String(port),
+    XYTE_MCP_ISSUER_URL: base,
+    XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+    XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
+    XYTE_ORG_API_KEY: ORG_KEY,
+    XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
+    XYTE_MCP_READ_ONLY: '1',
+    DATABASE_URL: databaseUrl,
+    XYTE_MCP_TOKEN_KEY: randomBytes(32).toString('base64')
+  };
+  await startServer();
+}, 20_000);
+
+afterAll(async () => {
+  child?.kill('SIGKILL');
+  await new Promise<void>((resolve) => hub.server.close(() => resolve()));
+  await admin?.query(`DROP SCHEMA ${PG_SCHEMA} CASCADE`);
+  await admin?.end();
+});
+
+async function startServer(): Promise<void> {
   child = spawn(process.execPath, [DIST_ENTRY], {
-    env: {
-      ...process.env,
-      PORT: String(port),
-      XYTE_MCP_ISSUER_URL: base,
-      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
-      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
-      XYTE_ORG_API_KEY: ORG_KEY,
-      XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
-      XYTE_MCP_READ_ONLY: '1',
-      DATABASE_URL: ''
-    },
+    env: serverEnv,
     stdio: ['ignore', 'pipe', 'pipe']
   });
   child.stderr?.setEncoding('utf8');
@@ -153,12 +197,7 @@ beforeAll(async () => {
     if (Date.now() > deadline) throw new Error(`server never became ready\n${stderr.join('')}`);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-}, 20_000);
-
-afterAll(async () => {
-  child?.kill('SIGKILL');
-  await new Promise<void>((resolve) => hub.server.close(() => resolve()));
-});
+}
 
 /** The server's JSON event lines of one kind, in order. */
 function events(name: string): Array<Record<string, unknown>> {
@@ -215,6 +254,28 @@ async function approve(): Promise<{ hubUrl: URL; cookie: string }> {
   const hubUrl = new URL(response.headers.get('location')!);
   hubChallenge = hubUrl.searchParams.get('code_challenge') ?? undefined;
   return { hubUrl, cookie: cookieOf(response) };
+}
+
+/** A fresh sign-in for the registered client, through to our access token. */
+async function connectAgain(): Promise<string> {
+  const { hubUrl, cookie } = await approve();
+  const callback = await fetch(
+    `${base}/oauth/callback?state=${hubUrl.searchParams.get('state')}&code=hub-code`,
+    { redirect: 'manual', headers: { Cookie: cookie } }
+  );
+  const freshCode = new URL(callback.headers.get('location')!).searchParams.get('code')!;
+  const exchange = await fetch(`${base}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form({
+      grant_type: 'authorization_code',
+      code: freshCode,
+      code_verifier: verifier,
+      client_id: clientId,
+      redirect_uri: REDIRECT
+    })
+  });
+  return ((await exchange.json()) as { access_token: string }).access_token;
 }
 
 // State threaded through the sequential dance.
@@ -496,7 +557,7 @@ describe('oauth over http, in order', () => {
     expect(all).not.toContain('user@example.com');
   });
 
-  it('warned at boot that the token store is in-memory', () => {
+  it.skipIf(PG_URL)('warned at boot that the token store is in-memory', () => {
     expect(stderr.join('')).toContain('no DATABASE_URL');
   });
 
@@ -512,29 +573,71 @@ describe('oauth over http, in order', () => {
     }
   });
 
+  it.skipIf(!PG_URL)('keeps a connection across a restart mid key rotation: hub gets the decrypted token, and a forced refresh rotates it under the new key', async () => {
+    const token = await connectAgain();
+    const live = await admin!.query<{ hub_access_token: string; hub_refresh_token: string }>(
+      `SELECT hub_access_token, hub_refresh_token FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL`
+    );
+    expect(live.rows).toHaveLength(1);
+    expect(live.rows[0]!.hub_access_token).toMatch(/^v1\./);
+    expect(live.rows[0]!.hub_refresh_token).toMatch(/^v1\./);
+
+    // Restart as step 2 of a key rotation: the grant was written under the old key,
+    // which only XYTE_MCP_TOKEN_KEY_PREVIOUS still holds.
+    const keyIdOf = (key: string) =>
+      createHash('sha256').update(Buffer.from(key, 'base64')).digest('hex').slice(0, 8);
+    const oldKey = serverEnv.XYTE_MCP_TOKEN_KEY!;
+    const newKey = randomBytes(32).toString('base64');
+    expect(live.rows[0]!.hub_refresh_token).toMatch(new RegExp(`^v1\\.${keyIdOf(oldKey)}\\.`));
+    const exited = new Promise((resolve) => child!.once('exit', resolve));
+    child!.kill('SIGTERM');
+    await exited;
+    serverEnv = { ...serverEnv, XYTE_MCP_TOKEN_KEY: newKey, XYTE_MCP_TOKEN_KEY_PREVIOUS: oldKey };
+    await startServer();
+    expect(stderr.join('')).toContain(
+      `hub token key id ${keyIdOf(newKey)} (previous: ${keyIdOf(oldKey)})`
+    );
+
+    const listDevices = () =>
+      mcp(token, {
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'tools/call',
+        params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+      });
+    expect((await listDevices()).status).toBe(200);
+    expect((hub.requests.at(-1)!.headers as Record<string, string>).authorization).toBe('Bearer xoat_1');
+
+    hubPairNumber = 2;
+    rejectNextHubCall = true;
+    const before = hub.requests.length;
+    try {
+      expect((await listDevices()).status).toBe(200);
+    } finally {
+      hubPairNumber = 1;
+      rejectNextHubCall = false;
+    }
+    const [rejected, refresh, retried] = hub.requests.slice(before);
+    expect((rejected!.headers as Record<string, string>).authorization).toBe('Bearer xoat_1');
+    expect(new URLSearchParams(refresh!.body as string).get('refresh_token')).toBe('xort_1');
+    expect((retried!.headers as Record<string, string>).authorization).toBe('Bearer xoat_2');
+    const rotated = await admin!.query<{ hub_refresh_token: string; hub_refresh_token_hash: string }>(
+      `SELECT hub_refresh_token, hub_refresh_token_hash FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL`
+    );
+    expect(rotated.rows).toEqual([
+      {
+        hub_refresh_token: expect.stringMatching(new RegExp(`^v1\\.${keyIdOf(newKey)}\\.`)),
+        hub_refresh_token_hash: createHash('sha256').update('xort_2').digest('hex')
+      }
+    ]);
+  });
+
   // The request that started the refresh is gone (client hung up), so only
   // drain() stands between SIGTERM and an exit that loses the rotated pair.
   // Windows has no SIGTERM: kill() ends the child at once, so there is no shutdown to observe.
   it.skipIf(process.platform === 'win32')('on SIGTERM, waits for an in-flight hub refresh, then exits cleanly', async () => {
     hubExpiresIn = 30; // this sign-in's hub token starts inside the refresh window
-    const { hubUrl, cookie } = await approve();
-    const callback = await fetch(
-      `${base}/oauth/callback?state=${hubUrl.searchParams.get('state')}&code=hub-code`,
-      { redirect: 'manual', headers: { Cookie: cookie } }
-    );
-    const freshCode = new URL(callback.headers.get('location')!).searchParams.get('code')!;
-    const exchange = await fetch(`${base}/token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form({
-        grant_type: 'authorization_code',
-        code: freshCode,
-        code_verifier: verifier,
-        client_id: clientId,
-        redirect_uri: REDIRECT
-      })
-    });
-    const { access_token: token } = (await exchange.json()) as { access_token: string };
+    const token = await connectAgain();
     hubExpiresIn = 3600;
 
     heldRefreshes = [];

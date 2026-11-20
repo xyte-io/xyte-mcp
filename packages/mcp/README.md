@@ -204,10 +204,13 @@ It is **stateless**: no session ids, no session table, every POST a complete
 request/response. So there is nothing to keep warm, any instance can answer any request,
 and a restart costs a client nothing.
 
+Stopping it, cutting off one organization or connection, its log events and alerts:
+[packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md).
+
 | Route | Auth | Purpose |
 | --- | --- | --- |
 | `POST /mcp` | bearer | The MCP endpoint. The whole protocol. |
-| `GET /healthz` | none | Liveness probe for uptime monitors and the smoke script. Reveals nothing a port scan would not. |
+| `GET /healthz` | none | Health probe for uptime monitors and the smoke script. In OAuth mode it also checks the token database: `503` when the database does not answer. Reveals nothing a port scan would not. |
 | `/.well-known/*`, `/authorize`, `/token`, `/register`, `/revoke`, `POST /oauth/consent`, `GET /oauth/callback` | — | OAuth mode only; the MCP SDK's auth router plus our consent page and hub's callback. |
 
 `GET` and `DELETE` on `/mcp` are `405` with `Allow: POST`, which the spec permits for a

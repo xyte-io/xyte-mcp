@@ -1,6 +1,7 @@
 import pg from 'pg';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { log, logError } from '@xyteai/mcp/log.js';
+import { errorCodeOf } from '../log-event.js';
 import type { HubSignIn, HubTokens } from './hub-oauth.js';
 import {
   hashToken,
@@ -270,7 +271,7 @@ export class PgOAuthStore implements OAuthStore {
     // only abandons a statement client-side, so a migration statement over
     // 10 s could never commit. lock_timeout bounds their waits instead.
     const migrationPool = new pg.Pool({ ...connection, max: 1 });
-    migrationPool.on('error', (error) => logError(`postgres migration pool: ${error.message}`));
+    migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
     try {
       await migrateOAuthSchema(migrationPool);
     } finally {
@@ -279,7 +280,7 @@ export class PgOAuthStore implements OAuthStore {
     const pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
     // An idle client dropped server-side (maintenance, failover) is emitted here;
     // unhandled, it exits the process. The pool replaces the client on its own.
-    pool.on('error', (error) => logError(`postgres pool: ${error.message}`));
+    pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
     return new PgOAuthStore(pool);
   }
 

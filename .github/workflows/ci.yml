@@ -68,6 +68,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      # GitHub shows the root copies, npm the package copies; keep them identical.
+      - name: Root README and LICENSE match the published package's copies
+        run: |
+          cmp README.md packages/mcp/README.md
+          cmp LICENSE packages/mcp/LICENSE
       - name: Validate committed catalog
         run: |
           node --input-type=module -e '

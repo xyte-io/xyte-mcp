@@ -95,7 +95,7 @@ the upgrade. Where the two disagree, the restrictive one wins. New stdio configu
 use `XYTE_MCP_READ_ONLY`; on the hosted server, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
 writes on (`XYTE_MCP_READ_ONLY=0` alone does not).
 
-From the next release, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
+From 0.4.0, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
 `package.json` `exports`; deep imports into `dist/` no longer resolve.
 
 ## Tools
@@ -363,9 +363,9 @@ npm run smoke:pack-install -w @xyteai/mcp       # packs, installs, runs the bina
 
 # 3. Bump the version and tag it. The publish job refuses to ship a tag that
 #    disagrees with packages/mcp/package.json.
-npm version 0.1.0 -w @xyteai/mcp --no-git-tag-version
-git commit -am "Release v0.1.0" && git push origin main
-git tag v0.1.0 && git push origin v0.1.0
+npm version <x.y.z> -w @xyteai/mcp --no-git-tag-version
+git commit -am "Release v<x.y.z>" && git push origin main
+git tag v<x.y.z> && git push origin v<x.y.z>
 ```
 
 `node packages/mcp/scripts/generate-catalog.mjs --hub-path ../hub --check` exits non-zero when the

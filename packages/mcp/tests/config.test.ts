@@ -251,8 +251,7 @@ describe('resolveHttpConfig', () => {
   });
 
   it('needs no token key for the in-memory store', () => {
-    const { [ENV.databaseUrl]: _unused, ...memoryEnv } = pgOAuthEnv;
-    expect(resolveHttpConfig(memoryEnv).oauth).toEqual({
+    expect(resolveHttpConfig({ ...pgOAuthEnv, [ENV.databaseUrl]: '' }).oauth).toEqual({
       issuerUrl: 'https://mcp.example.com',
       hubClient
     });

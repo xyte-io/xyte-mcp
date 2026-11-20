@@ -638,7 +638,8 @@ describe('XyteOAuthProvider: our tokens', () => {
     const { tokens } = await connected(provider, client);
     const getGrant = store.getGrant.bind(store);
     vi.spyOn(store, 'getGrant').mockImplementation(async (id) => {
-      const { hub: _unreadable, ...grant } = (await getGrant(id))!;
+      const grant = (await getGrant(id))!;
+      delete grant.hub; // a copy: the store hands out snapshots
       return grant;
     });
 

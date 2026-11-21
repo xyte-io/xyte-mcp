@@ -1,4 +1,4 @@
-import { XyteError } from '@xyteai/mcp/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 
 /**
@@ -163,7 +163,11 @@ export class HubRefreshError extends XyteError {
     readonly status: number,
     error: string
   ) {
-    super(status >= 500 ? 'network' : 'auth', `hub token refresh failed: ${status} ${error}`);
+    super(
+      status >= 500 ? 'network' : 'auth',
+      `hub token refresh failed: ${status} ${error}`,
+      status === 403 && error === 'application_paused' ? [APPLICATION_PAUSED_HINT] : []
+    );
     this.name = 'HubRefreshError';
   }
 }

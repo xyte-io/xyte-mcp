@@ -15,6 +15,10 @@ export type ErrorKind =
   | 'network'
   | 'timeout';
 
+/** Hub paused the OAuth application: temporary, and the sign-in is kept (403 `application_paused`). */
+export const APPLICATION_PAUSED_HINT =
+  'This connection is temporarily paused. You are still signed in, so there is no need to reconnect. Try again later.';
+
 export class XyteError extends Error {
   constructor(
     readonly kind: ErrorKind,

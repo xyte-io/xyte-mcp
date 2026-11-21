@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { getEndpoint, suggestKeys } from '../catalog/catalog.js';
 import { buildRequest } from '../http/build-request.js';
-import { XyteHttpError, isXyteError } from '../http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteHttpError, isXyteError } from '../http/errors.js';
 import { redactValue } from '../redact.js';
 import { evaluateWritePolicy } from '../write-policy.js';
 import { defineTool, errorResult, textResult } from './types.js';
@@ -157,6 +157,7 @@ function signedInAccessHint(error: XyteHttpError): string | undefined {
     if (errorCode === 'no_access_to_resource') {
       return 'You have no access to this item. Ask an organization administrator for access.';
     }
+    if (errorCode === 'application_paused') return APPLICATION_PAUSED_HINT;
     return undefined;
   }
   if (error.status === 401) {

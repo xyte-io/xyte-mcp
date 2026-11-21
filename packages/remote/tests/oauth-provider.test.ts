@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
-import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
@@ -1108,6 +1108,41 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     });
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  it('a 403 application_paused on refresh says the connection is paused and keeps the grant', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    const sentBefore = hub.refreshes().length;
+    hub.onRefresh = () =>
+      json(403, {
+        error: 'application_paused',
+        error_description: 'This application is temporarily paused. Try again later.',
+        error_code: 'application_paused'
+      });
+    const get = () =>
+      provider
+        .hubHttp(grantId, upstreamOk())
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+
+    await expect(get()).rejects.toMatchObject({
+      kind: 'auth',
+      message: 'hub token refresh failed: 403 application_paused',
+      hints: [APPLICATION_PAUSED_HINT]
+    });
+    expect(hub.refreshes()).toHaveLength(sentBefore + 1);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+
+    // Once unpaused, the same refresh token works: the paused answer burned nothing.
+    hub.onRefresh = undefined;
+    await get();
+    const [paused, resumed] = hub
+      .refreshes()
+      .slice(-2)
+      .map((call) => call.form.get('refresh_token'));
+    expect(resumed).toBe(paused);
   });
 });
 

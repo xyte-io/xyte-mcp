@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { apiCallTool } from '../src/tools/api-call.js';
 import { endpointDescribeTool } from '../src/tools/endpoint-describe.js';
 import { endpointsListTool } from '../src/tools/endpoints-list.js';
-import { XyteHttpError } from '../src/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteHttpError } from '../src/http/errors.js';
 import { REDACTED } from '../src/redact.js';
 import { stubHttp, testContext } from './support/context.js';
 
@@ -199,6 +199,7 @@ describe('xyte_api_call', () => {
     it.each([
       [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined, ADMIN_HINT],
       [403, { error_code: 'no_access_to_resource', error: 'x' }, undefined, NO_ACCESS_HINT],
+      [403, { error_code: 'application_paused', error: 'x' }, undefined, APPLICATION_PAUSED_HINT],
       [
         401,
         { error: 'x' },

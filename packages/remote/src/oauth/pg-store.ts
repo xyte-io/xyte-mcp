@@ -474,6 +474,12 @@ export class PgOAuthStore implements OAuthStore {
       // An idle client dropped server-side (maintenance, failover) is emitted here;
       // unhandled, it exits the process. The pool replaces the client on its own.
       pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
+      // query_timeout only abandons a statement client-side: bound lock waits
+      // server-side below it, so an abandoned UPDATE does not land later. Set
+      // per connection, as a DSN's own `options` would override a pool option.
+      pool.on('connect', (client) => {
+        client.query('SET lock_timeout = 9000').catch(() => {});
+      });
       // No query_timeout: a lock holder's transaction spans a hub refresh, and
       // a waiter is bounded server-side by lock_timeout (see withGrantLock).
       // ponytail: 3 grants refreshing at once per process; more wait for a
@@ -496,7 +502,9 @@ export class PgOAuthStore implements OAuthStore {
       `OAuth store: hub token key id ${cipher.currentKeyId}` +
         (cipher.previousKeyId ? ` (previous: ${cipher.previousKeyId})` : '')
     );
-    return new PgOAuthStore(pool, lockPool, cipher, hubTimeoutMs);
+    // Clamped, so the grant lock's SET LOCAL values are always valid integers.
+    const hubWaitMs = Number.isFinite(hubTimeoutMs) ? Math.min(Math.max(Math.round(hubTimeoutMs), 0), 600_000) : 15_000;
+    return new PgOAuthStore(pool, lockPool, cipher, hubWaitMs);
   }
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
@@ -647,9 +655,19 @@ export class PgOAuthStore implements OAuthStore {
    * Postgres on disconnect: both roll back, so the stored pair is unchanged.
    */
   async withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T> {
-    if (this.closing) throw new Error('the OAuth store is closing');
+    if (this.closing) {
+      throw new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.']);
+    }
     const client = await this.lockPool.connect();
     let failed = false;
+    // pg-pool drops its idle 'error' listener on checkout. Unhandled, the server
+    // ending this session while fn awaits hub (idle in transaction) would crash
+    // the process; the next statement on the client then fails instead.
+    const onError = (error: Error) => {
+      failed = true;
+      logError(`postgres grant lock connection: ${errorCodeOf(error)}`);
+    };
+    client.on('error', onError);
     try {
       try {
         await client.query('BEGIN');
@@ -685,6 +703,7 @@ export class PgOAuthStore implements OAuthStore {
         throw error;
       }
     } finally {
+      client.off('error', onError);
       // After a failure the connection may still hold an open transaction.
       client.release(failed);
     }

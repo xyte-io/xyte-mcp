@@ -13,6 +13,7 @@ import {
   type OAuthStore
 } from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
+import { lockWaiters } from './support/two-process.js';
 
 /**
  * The store guarantees the provider relies on, run against both stores: always
@@ -770,17 +771,36 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     await holder.query('BEGIN');
     await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [id]);
     const waiter = store.withGrantLock(id, async () => undefined).catch(() => undefined);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
     try {
-      await new Promise((resolve) => setTimeout(resolve, 200)); // queued on the row
+      await vi.waitFor(async () => expect(await lockWaiters(pool)).toBe(1), { timeout: 5_000 });
       const started = Date.now();
       await store.close();
       expect(Date.now() - started).toBeLessThan(5_000);
-      await expect(store.withGrantLock(id, async () => undefined)).rejects.toThrow();
+      await expect(store.withGrantLock(id, async () => undefined)).rejects.toMatchObject({
+        kind: 'network',
+        message: 'The server is restarting.'
+      });
     } finally {
       await holder.query('ROLLBACK');
       holder.release();
       await waiter;
     }
+  });
+
+  // Server-side, under the pool's 10 s query_timeout: a statement the client gave
+  // up on must not wait on, then apply, an UPDATE later.
+  it('bounds the main pool\'s lock waits server-side below its query timeout', async () => {
+    const store = await open(KEY_A);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    expect((await pool.query<{ lock_timeout: string }>('SHOW lock_timeout')).rows[0]!.lock_timeout).toBe('9s');
+  });
+
+  it('clamps an out-of-range hub timeout, so the grant lock still sets valid limits', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), { hubTimeoutMs: 1e21 });
+    stores.push(store);
+    const id = await store.createGrant('c1', signIn());
+    expect(await store.withGrantLock(id, async (locked) => locked.grant?.id)).toBe(id);
   });
 
   it('rolls back what the grant lock holder wrote when it throws', async () => {

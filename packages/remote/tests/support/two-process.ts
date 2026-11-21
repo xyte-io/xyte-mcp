@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import {
@@ -206,8 +206,6 @@ export function newTokenKey(): string {
 
 export interface ServerProcess {
   base: string;
-  child: ChildProcess;
-  stderr(): string;
   /** SIGKILL, and wait for the exit. */
   kill(): Promise<void>;
 }
@@ -220,10 +218,9 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
   const child = spawn(process.execPath, [DIST_ENTRY], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   child.stderr!.setEncoding('utf8');
   child.stderr!.on('data', (chunk: string) => output.push(chunk));
+  const stderr = () => output.join('');
   const server: ServerProcess = {
     base,
-    child,
-    stderr: () => output.join(''),
     kill: async () => {
       if (child.exitCode !== null || child.signalCode !== null) return;
       const exited = new Promise((resolve) => child.once('exit', resolve));
@@ -233,7 +230,7 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
   };
   const deadline = Date.now() + 10_000;
   for (;;) {
-    if (child.exitCode !== null) throw new Error(`server exited\n${server.stderr()}`);
+    if (child.exitCode !== null) throw new Error(`server exited\n${stderr()}`);
     try {
       if ((await fetch(`${base}/healthz`)).ok) return server;
     } catch {
@@ -241,7 +238,7 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
     }
     if (Date.now() > deadline) {
       await server.kill();
-      throw new Error(`server never became ready\n${server.stderr()}`);
+      throw new Error(`server never became ready\n${stderr()}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }

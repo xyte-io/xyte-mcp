@@ -82,6 +82,47 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
   const get = (provider: XyteOAuthProvider, grantId: string, upstream = stubHttp(() => ({ data: {} }))) =>
     provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${hub.url}/x`, headers: {}, endpointKey: 'k' });
 
+  type Run = (sql: string, values?: unknown[]) => Promise<unknown>;
+  /** The next grant lock connection of `store` sends every statement through `intercept`. */
+  function interceptLockStatements(
+    store: PgOAuthStore,
+    intercept: (sql: string, run: Run, values?: unknown[]) => Promise<unknown>
+  ) {
+    const lockPool = (store as unknown as { lockPool: pg.Pool }).lockPool;
+    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
+    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
+      const client = await connect();
+      const run = client.query.bind(client) as Run;
+      client.query = ((sql: string, values?: unknown[]) => intercept(sql, run, values)) as never;
+      return client;
+    }) as never);
+  }
+  /** The commit is lost: the transaction rolls back. */
+  const failCommit = async (sql: string, run: Run, values?: unknown[]) => {
+    if (sql !== 'COMMIT') return run(sql, values);
+    await run('ROLLBACK');
+    throw Object.assign(new Error('connection lost'), { code: '08006' });
+  };
+  /** Every save of a rotated pair fails at the server, aborting the transaction. */
+  const failRotate = (sql: string, run: Run, values?: unknown[]) =>
+    sql.includes('SET hub_access_token') ? run('SELECT 1 / 0') : run(sql, values);
+  /** Used at hub already, as by an earlier lost refresh: the next refresh gets invalid_grant. */
+  const burn = (refreshToken: string) =>
+    fetch(`${hub.url}/oauth/token`, {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
+    });
+  /** Runs `fn` with stderr captured; returns what was written. */
+  async function captureStderr(fn: () => Promise<unknown>): Promise<string> {
+    const write = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    try {
+      await fn();
+      return write.mock.calls.map(([line]) => String(line)).join('');
+    } finally {
+      write.mockRestore();
+    }
+  }
+
   it('sends one hub refresh between both instances for parallel calls on an expiring token', async () => {
     const [a, b] = await instances();
     const { grantId, refreshToken } = await expiringGrant(a.store);
@@ -181,24 +222,8 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
   it('invalid_grant whose revoke fails to commit still revokes the grant, and the next call sends no refresh', async () => {
     const [a, b] = await instances();
     const { grantId, refreshToken } = await expiringGrant(a.store);
-    await fetch(`${hub.url}/oauth/token`, {
-      method: 'POST',
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
-    });
-    const lockPool = (a.store as unknown as { lockPool: pg.Pool }).lockPool;
-    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
-    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
-      const client = await connect();
-      const query = client.query.bind(client) as (sql: string, values?: unknown[]) => Promise<unknown>;
-      client.query = (async (sql: string, values?: unknown[]) => {
-        if (sql === 'COMMIT') {
-          await query('ROLLBACK');
-          throw Object.assign(new Error('connection lost'), { code: '08006' });
-        }
-        return query(sql, values);
-      }) as never;
-      return client;
-    }) as never);
+    await burn(refreshToken);
+    interceptLockStatements(a.store, failCommit);
     const sent = hub.refreshes.length;
 
     await expect(get(a.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
@@ -208,26 +233,90 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     expect(hub.refreshes).toHaveLength(sent + 1);
   });
 
+  it('when that revoke cannot be redone either, logs it and still signs the call out, with no revoke event', async () => {
+    const [a] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    await burn(refreshToken);
+    interceptLockStatements(a.store, failCommit);
+    vi.spyOn(a.store, 'revokeGrant').mockRejectedValue(Object.assign(new Error('db down'), { code: '57P01' }));
+
+    const stderr = await captureStderr(() =>
+      expect(get(a.provider, grantId)).rejects.toMatchObject({ kind: 'auth' })
+    );
+    vi.restoreAllMocks();
+    expect(stderr).toContain(`ERROR grant ${grantId}: could not revoke the grant after a failed hub refresh`);
+    expect(stderr).not.toContain('"event":"revoke"');
+  });
+
+  // Fail closed under the lock: the stored token is burned at hub.
+  it('a save of the new pair that fails on every try revokes the grant under the lock; neither instance refreshes again', async () => {
+    const [a, b] = await instances();
+    const { grantId } = await expiringGrant(a.store);
+    interceptLockStatements(a.store, failRotate);
+    const sent = hub.refreshes.length;
+
+    const stderr = await captureStderr(() =>
+      expect(get(a.provider, grantId)).rejects.toMatchObject({ kind: 'auth' })
+    );
+    vi.restoreAllMocks();
+    expect(stderr).toContain('"reason":"hub_save_failed"');
+    expect(await revokedInDb(grantId)).toBe(true);
+    await expect(get(b.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes).toHaveLength(sent + 1);
+  });
+
+  // The documented window: the lock is released before the pair is safe, and it
+  // is saved on the main pool. (A waiter queued meanwhile could replay; not tested.)
+  it('a commit lost after a successful refresh saves the new pair outside the lock; the other instance then sends nothing', async () => {
+    const [a, b] = await instances();
+    const { grantId } = await expiringGrant(a.store);
+    interceptLockStatements(a.store, failCommit);
+    const sent = hub.refreshes.length;
+
+    await get(a.provider, grantId);
+    vi.restoreAllMocks();
+    expect((await b.store.getGrant(grantId))?.hub?.refreshToken).toBe(hub.rotatedTo.at(-1));
+    await get(b.provider, grantId);
+    expect(hub.refreshes).toHaveLength(sent + 1);
+  });
+
+  // pg-pool drops its idle 'error' listener on checkout: unhandled, the server
+  // ending the session mid hub refresh would crash the whole process.
+  it('a lock connection the server ends during the hub refresh does not crash the process: the pair is saved outside the lock', async () => {
+    const [a, b] = await instances();
+    const { grantId } = await expiringGrant(a.store);
+    const sent = hub.refreshes.length;
+    hub.holdRefreshes = true;
+
+    const call = get(a.provider, grantId);
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
+    const { rows } = await schema.admin.query(
+      `SELECT pg_terminate_backend(pid) AS ended FROM pg_stat_activity
+        WHERE application_name = current_setting('application_name')
+          AND state = 'idle in transaction' AND query LIKE '%FOR NO KEY UPDATE%'`
+    );
+    expect(rows).toEqual([{ ended: true }]);
+    await new Promise((resolve) => setTimeout(resolve, 300)); // the session's end reaches the client
+    hub.holdRefreshes = false;
+    hub.releaseHeld();
+    await captureStderr(() => call);
+
+    expect((await b.store.getGrant(grantId))?.hub?.refreshToken).toBe(hub.rotatedTo.at(-1));
+    await get(b.provider, grantId); // the lock is free, and the saved pair is fresh
+    expect(hub.refreshes).toHaveLength(sent + 1);
+  });
+
   // Retried inside the lock: released between tries, a waiter elsewhere would read
   // the stored, now burned token and send it to hub.
   it('a failed save of the new pair is retried under the lock: a waiter on the other instance sends nothing', async () => {
     const [a, b] = await instances();
     const { grantId, refreshToken } = await expiringGrant(a.store);
-    const lockPool = (a.store as unknown as { lockPool: pg.Pool }).lockPool;
-    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
     let failed = false;
-    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
-      const client = await connect();
-      const query = client.query.bind(client) as (sql: string, values?: unknown[]) => Promise<unknown>;
-      client.query = (async (sql: string, values?: unknown[]) => {
-        if (!failed && sql.includes('SET hub_access_token')) {
-          failed = true;
-          return query('SELECT 1 / 0'); // fails at the server: the transaction is aborted
-        }
-        return query(sql, values);
-      }) as never;
-      return client;
-    }) as never);
+    interceptLockStatements(a.store, (sql, run, values) => {
+      if (failed) return run(sql, values);
+      failed = sql.includes('SET hub_access_token');
+      return failRotate(sql, run, values);
+    });
     const before = hub.refreshes.length;
     hub.holdRefreshes = true;
 

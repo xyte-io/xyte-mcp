@@ -4,10 +4,11 @@
 # $PORT within 60s, else R10). $PORT is assigned by the platform and read via
 # resolveHttpConfig.
 #
-# Exactly one web dyno. The MCP transport itself is stateless, but in OAuth mode
-# the pending consent/sign-in state lives in this process's memory: a second dyno
-# would lose callbacks. (The hub-token refresh is serialized across dynos by a
-# row lock in Postgres.)
+# Exactly one web dyno (README, "One dyno"). The MCP transport itself is
+# stateless, but in OAuth mode two things still live in this process's memory:
+# the pending consent/sign-in state (a second dyno would lose callbacks) and the
+# rate-limit counters (a second dyno doubles every budget). The hub-token refresh
+# is already serialized across dynos by a row lock in Postgres.
 #
 # NODE_EXTRA_CA_CERTS: Node does not read the system CA bundle on its own, and that
 # bundle holds the CAs of Heroku Postgres's certificates, which the server verifies.

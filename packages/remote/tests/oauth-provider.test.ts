@@ -3,6 +3,7 @@ import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
@@ -99,6 +100,22 @@ function tokenRejected(): XyteHttpError {
 }
 
 let currentHub: ReturnType<typeof fakeHub> | undefined;
+
+/**
+ * The grant lock's connection or commit fails once, after its holder ran: what
+ * it wrote rolls back (here: its save writes nothing), and the provider saves
+ * the new pair outside the lock (saveHubTokens).
+ */
+function failGrantLockCommitOnce(store: MemoryOAuthStore): void {
+  const withLock = store.withGrantLock.bind(store);
+  vi.spyOn(store, 'withGrantLock').mockImplementationOnce((async (
+    id: string,
+    fn: Parameters<MemoryOAuthStore['withGrantLock']>[1]
+  ) => {
+    await withLock(id, (locked) => fn({ ...locked, rotate: async () => true }));
+    throw Object.assign(new Error('connection lost'), { code: '08006' });
+  }) as never);
+}
 
 function makeProvider() {
   const store = new MemoryOAuthStore();
@@ -863,12 +880,53 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     ]);
   });
 
+  // Under the lock the stored pair is the one just read, so a save that matches
+  // nothing means the row is inconsistent: fail closed rather than drop the pair.
+  it('a save under the lock that matches no stored pair revokes the grant and signs the call out', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockResolvedValueOnce(false);
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    expect(upstream.calls).toHaveLength(0);
+    expect(eventsIn(stderr)).toContainEqual(
+      expect.objectContaining({ event: 'revoke', connection: grantId, reason: 'hub_save_failed' })
+    );
+    expect(hub.revokes()).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('a store that is closing fails the refresh as restarting, asking hub nothing', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
+    );
+
+    await expect(
+      provider.hubHttp(grantId, upstreamOk()).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'network', message: 'The server is restarting.' });
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
   it('a lost compare-and-set on save logs, keeps the stored pair and still serves the call', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     vi.spyOn(store, 'rotateHubTokens').mockResolvedValueOnce(false);
     const upstream = upstreamOk();
 
@@ -890,6 +948,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -920,6 +979,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const { grantId: siblingId } = await connected(provider, client);
     const siblingHub = (await store.getGrant(siblingId))?.hub;
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -948,6 +1008,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     hub.revokeStatus = 503;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -975,6 +1036,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       const client = await registeredClient(provider);
       const { grantId } = await connected(provider, client);
       hub.expiresIn = 3600;
+      failGrantLockCommitOnce(store);
       vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id) => {
         if (failing === 'hasLiveHubSibling') await store.revokeGrant(id);
         vi.spyOn(store, failing).mockRejectedValueOnce(new Error('db down'));
@@ -1422,7 +1484,7 @@ describe('XyteOAuthProvider: revocation', () => {
   });
 
   it('logs and fails a revoke that cannot take the grant lock', async () => {
-    const { provider, store } = makeProvider();
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
     const { grantId, tokens } = await connected(provider, client);
     vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
@@ -1433,6 +1495,47 @@ describe('XyteOAuthProvider: revocation', () => {
     );
     expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a revoke (55P03)`);
     expect(eventsIn(stderr)).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+    expect(hub.revokes()).toEqual([]);
+  });
+
+  // An OAuth error the SDK answers with 400 temporarily_unavailable, not a 500.
+  it('answers a revoke while the store is closing as temporarily unavailable', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
+    );
+    await expect(provider.revokeToken(client, { token: tokens.access_token })).rejects.toBeInstanceOf(
+      TemporarilyUnavailableError
+    );
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  // The revoke has committed: what is left is best effort, and the client is answered.
+  it('a failing sibling check after the revoke is logged, skips the hub revoke, and the revoke succeeds', async () => {
+    const { provider, store, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'hasLiveHubSibling').mockRejectedValueOnce(
+      Object.assign(new Error('db down'), { code: '57P01' })
+    );
+    const stderr = await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(stderr).toContain(`grant ${grantId}: sibling check failed after the revoke (57P01); not revoking at hub`);
+    expect(hub.revokes()).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('a hub revoke that throws after the revoke is logged, and the revoke succeeds', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    const hubOAuth = (provider as unknown as { hub: { revoke(token: string): Promise<void> } }).hub;
+    vi.spyOn(hubOAuth, 'revoke').mockRejectedValueOnce(new TypeError('fetch failed'));
+    const stderr = await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(stderr).toContain(`grant ${grantId}: hub revoke failed (TypeError)`);
+    expect((await store.getGrant(grantId))?.revoked).toBe(true);
   });
 
   it("revoking another client's token is a silent no-op", async () => {

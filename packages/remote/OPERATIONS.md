@@ -109,9 +109,12 @@ of the same `connection` just before it.
 
 One connection's hub refresh runs once at a time across all server processes (a Postgres row
 lock); a revoke of the connection waits for it too. A call that waits longer than the hub
-timeout plus 5 s (20 s by default) fails with a retryable error and an `[xyte-mcp] error:
-grant <id>: could not lock the grant for a hub refresh (<code>)` line (`55P03` for the lock
-wait); nothing was sent to the hub, and the connection is kept. A disconnect that cannot get
+timeout plus 5 s (20 s by default) for the lock fails with a retryable error and an
+`[xyte-mcp] error: grant <id>: could not lock the grant for a hub refresh (<code>)` line
+(`55P03` for the lock wait); nothing was sent to the hub, and the connection is kept. When
+all 3 lock connections of the process are busy, the call first waits up to 10 s for one, so
+the worst case is about the hub timeout plus 15 s; a failed wait for a connection shows the
+error's class name instead of a `55P03` code. A disconnect that cannot get
 the lock in that time answers `500`, with an `[xyte-mcp] error: grant <id>: could not lock the
 grant for a revoke (<code>)` line; the connection is not revoked, and the client may retry.
 
@@ -123,6 +126,12 @@ already used token and end that connection. If the database is fully down, so th
 saving the new tokens nor revoking the connection works, the new tokens live only in that
 process's memory (an `[xyte-mcp] error: ERROR grant <id>: could not save rotated hub tokens`
 line) until a later refresh saves them; a restart before the save loses them.
+
+Two more `[xyte-mcp] error: ERROR grant <id>:` lines mean the stored token may be one hub has
+already used, so that connection may end on its next refresh:
+`could not revoke the grant after a failed hub refresh` (the hub refresh failed or its new
+tokens could not be saved, and the database refused the revoke too), and
+`rotated hub tokens lost at shutdown` (new tokens held in memory were never saved).
 
 Each server process holds up to 8 Postgres connections: 5 for requests and 3 for the refresh
 lock, plus one more briefly at boot for the schema migration. Size the Postgres plan's
@@ -195,7 +204,8 @@ it from production data**.
 - **Revoke spike:** the `reason`. First rule out [the 90-day end](#the-90-day-end):
   `invalid_grant` on connections whose sign-in was about 90 days ago (find it on their
   `sign_in` `ok` line). Otherwise `invalid_grant` for many users at once often means a change
-  at the hub (for example the OAuth app was disabled there).
+  at the hub (for example the OAuth app was disabled there). `hub_save_failed` means database
+  trouble: the new hub tokens could not be saved, so look at the database first.
 - **Rate-limit hits:** which source. Router `429` on `/token` or `/register` from one IP is
   usually a client's backend. A hub `429` (`tool_call` `status=429` or `hub_refresh`
   `rate_limited`) usually means the hub's limit for this server's address, which every

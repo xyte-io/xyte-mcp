@@ -769,7 +769,8 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: pending sign-ins on Postgres', () =
   });
 
   // The SDK's authorize handler turns the rejection into a server_error
-  // redirect to the client: a clean error, bounded by the pool's connect timeout.
+  // redirect to the client: a clean error, bounded by the pool's connect
+  // timeout.
   it('rejects an /authorize promptly while Postgres is down, setting no cookie', async () => {
     const store = await db.connect(KEY_A);
     const { provider } = makeProvider(store);

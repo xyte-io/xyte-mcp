@@ -341,8 +341,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     process.exit(1);
   });
   // OAuth mode: expired pending sign-ins and tokens, and grants and clients
-  // nothing uses any more, are deleted now and then hourly. One run at a time; the next tick retries
-  // a failed run.
+  // nothing uses any more, are deleted now and then hourly. One run at a time;
+  // the next tick retries a failed run.
   let oauthCleanup: NodeJS.Timeout | undefined;
   if (store) {
     const cleanupStore = store;

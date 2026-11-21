@@ -144,7 +144,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     // enough abandoned flows grow the Cookie header past the server's limit.
     const flowCookies = cookieNames(res.req);
     if (flowCookies.length) {
-      // Housekeeping only: on a failed lookup the old cookies wait for the next /authorize.
+      // Housekeeping only: on a failed lookup the old cookies wait for the next
+      // /authorize.
       const live = await this.store
         .livePendingSignInIds(
           flowCookies.map((name) => name.slice(COOKIE_PREFIX.length)),

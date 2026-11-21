@@ -809,8 +809,9 @@ export class PgOAuthStore implements OAuthStore {
 
   /**
    * Four autocommit DELETEs: expired pending sign-ins, then the rest in
-   * foreign-key order (a token references its grant, without cascade). Each locks only the rows it deletes, which no
-   * request uses any more, so requests keep being served.
+   * foreign-key order (a token references its grant, without cascade). Each
+   * locks only the rows it deletes, which no request uses any more, so requests
+   * keep being served.
    *
    * Token expiries come from this app's clock, created_at and revoked_at from
    * Postgres now(); a skew between the two is harmless at day-scale retentions.

@@ -197,7 +197,8 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
     }
     const databaseUrl = trimmed(env[ENV.databaseUrl]);
     // The in-memory store loses every sign-in and token on a restart, and a
-    // sign-in started on one instance cannot finish on another: a local run only.
+    // sign-in started on one instance cannot finish on another: a local run
+    // only.
     if (!databaseUrl && !localIssuer) {
       throw new XyteError(
         'config',

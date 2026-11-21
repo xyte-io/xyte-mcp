@@ -155,16 +155,16 @@ export interface OAuthStore {
   livePendingSignInIds(ids: string[], now: number): Promise<Set<string>>;
 
   /**
-   * Deletes, as of `now` (seconds since epoch): expired pending sign-ins; expired tokens; grants with no
-   * token left that were revoked more than REVOKED_GRANT_RETENTION_SECONDS ago,
-   * or are unrevoked but whose client is gone (a sign-in still at the hub when
-   * a sweep deleted its client: nothing can use it, /token needs the client),
-   * or are unrevoked and created more than ABANDONED_GRANT_RETENTION_SECONDS
-   * ago; clients with no grant, registered more than
-   * UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger unrevoked grant whose
-   * client exists: a refresh exchange deletes the old refresh token before it
-   * saves the new pair, so a live grant can briefly have none (and a client
-   * with a grant is never deleted).
+   * Deletes, as of `now` (seconds since epoch): expired pending sign-ins;
+   * expired tokens; grants with no token left that were revoked more than
+   * REVOKED_GRANT_RETENTION_SECONDS ago, or are unrevoked but whose client is
+   * gone (a sign-in still at the hub when a sweep deleted its client: nothing
+   * can use it, /token needs the client), or are unrevoked and created more
+   * than ABANDONED_GRANT_RETENTION_SECONDS ago; clients with no grant,
+   * registered more than UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger
+   * unrevoked grant whose client exists: a refresh exchange deletes the old
+   * refresh token before it saves the new pair, so a live grant can briefly
+   * have none (and a client with a grant is never deleted).
    * An orphan's hub tokens are not revoked at hub: nobody holds them once the
    * row is gone, and hub ends the chain by itself.
    * Safe while requests are served; a second run deletes nothing more.

@@ -273,6 +273,9 @@ rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). T
 Deploy this release with preboot off (`heroku features:disable preboot -a <app>`), so the old
 and new process overlap only for the shutdown drain.
 
+An OAuth app whose issuer is not localhost or 127.0.0.1 refuses to boot on this build
+without `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`: set both before deploying it.
+
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
 unless `XYTE_MCP_ALLOW_WRITES=1`, so `XYTE_MCP_READ_ONLY=1` is no longer needed there.
@@ -283,7 +286,8 @@ checked on the `heroku-24` stack; run the app on that stack. If the boot stops o
 
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
 drop its tables (`oauth_tokens`, `oauth_grants`, `oauth_clients` and, if present,
-`oauth_schema_migrations`) once before this build starts; it recreates them at boot.
+`oauth_schema_migrations` and `oauth_pending_sign_ins`) once before this build starts; it
+recreates them at boot.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.

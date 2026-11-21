@@ -276,7 +276,8 @@ export class MemoryOAuthStore implements OAuthStore {
   ): Promise<boolean> {
     this.deleteExpiredPendingSignIns(now);
     if (this.pendingSignIns.size >= max) return false;
-    this.pendingSignIns.set(id, { ...entry });
+    // Like the Postgres column's default: only Approve sets it.
+    this.pendingSignIns.set(id, { ...entry, approved: false });
     return true;
   }
 

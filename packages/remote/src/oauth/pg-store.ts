@@ -758,6 +758,8 @@ export class PgOAuthStore implements OAuthStore {
     return result.rowCount === 1;
   }
 
+  // pg's query_timeout is client-side, so a take that timed out may still have
+  // deleted the row; the user then restarts the sign-in (accepted).
   async takePendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined> {
     const result = await this.pool.query<PendingSignInRow>(
       `DELETE FROM oauth_pending_sign_ins

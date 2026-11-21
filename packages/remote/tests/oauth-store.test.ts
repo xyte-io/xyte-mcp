@@ -243,7 +243,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 
     it('approves only a live one, and a second approve (a double click) still succeeds', async () => {
       const now = NOW();
-      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      // Starts unapproved whatever the caller passed: only Approve sets it.
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600, approved: true }), MAX, now);
+      expect((await store().getPendingSignIn('p1', now))?.approved).toBe(false);
 
       expect(await store().approvePendingSignIn('p1', now)).toBe(true);
       expect(await store().approvePendingSignIn('p1', now)).toBe(true);

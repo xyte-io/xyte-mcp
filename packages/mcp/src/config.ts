@@ -12,7 +12,7 @@ export const ENV = {
   httpToken: 'XYTE_MCP_HTTP_TOKEN',
   /** Public base URL of this deployment; setting it turns OAuth on. */
   issuerUrl: 'XYTE_MCP_ISSUER_URL',
-  /** Set by Heroku Postgres; the OAuth token store. Absent → in-memory store. */
+  /** Set by Heroku Postgres; the OAuth token store. Required with OAuth unless the issuer is localhost/127.0.0.1, where absent → in-memory store. */
   databaseUrl: 'DATABASE_URL',
   /** This server's confidential-client credentials at hub's OAuth server; required with OAuth. */
   hubOAuthClientId: 'XYTE_MCP_HUB_OAUTH_CLIENT_ID',
@@ -54,7 +54,7 @@ export interface Credentials {
 export interface OAuthConfig {
   /** Public https base URL of this deployment (RFC 8414 issuer). */
   issuerUrl: string;
-  /** Postgres DSN for the token store; absent → in-memory (dev only). */
+  /** Postgres DSN for the token store; absent only for a localhost/127.0.0.1 issuer → in-memory. */
   databaseUrl?: string;
   /** xyte-mcp's own client registration at hub's OAuth server (client_secret_basic). */
   hubClient: { id: string; secret: string };

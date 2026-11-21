@@ -58,6 +58,8 @@ const PENDING_TTL_SECONDS = 10 * 60;
 // ponytail: a fixed ceiling on parked logins (DCR is open, so /authorize is
 // reachable from any number of IPs); per-client caps if this is ever hit.
 const MAX_PENDING = 10_000;
+/** Clients send a short random value; this bounds what an unauthenticated /authorize parks for 10 minutes. */
+const MAX_STATE_LENGTH = 1024;
 const COOKIE_PREFIX = '__Host-xmcp_';
 const EXPIRED = 'Authorization expired or invalid. Restart the connection.';
 
@@ -107,6 +109,10 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   ): Promise<void> {
     if (params.resource && params.resource.href !== this.expectedResource) {
       res.status(400).type('html').send(errorPage('This authorization is for a different server.'));
+      return;
+    }
+    if (params.state && params.state.length > MAX_STATE_LENGTH) {
+      res.status(400).type('html').send(errorPage('The state parameter is too long.'));
       return;
     }
     const pendingId = random();
@@ -200,9 +206,14 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 
     if (form.decision !== 'approve') {
       // Taken, not just deleted: a callback racing this Deny finds it gone.
-      await this.store.takePendingSignIn(pendingId, nowSeconds());
-      logEvent('sign_in', { outcome: 'denied', client: entry.clientId });
+      // Gone already: that callback ran first, so this Deny decides nothing.
+      const taken = await this.store.takePendingSignIn(pendingId, nowSeconds());
       clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+      if (!taken) {
+        endOnExpiredPage(res, 'expired', entry.clientId);
+        return;
+      }
+      logEvent('sign_in', { outcome: 'denied', client: entry.clientId });
       res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
       return;
     }

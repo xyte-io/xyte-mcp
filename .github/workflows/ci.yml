@@ -56,7 +56,7 @@ jobs:
       # The remote package imports the shared modules from @xyteai/mcp's dist;
       # oauth-http.test.ts spawns the built remote server (its dist/index.js).
       - run: npm run build -w @xyteai/mcp -w @xyteai/mcp-remote
-      - run: npm run test:unit -w @xyteai/mcp-remote -- tests/oauth-store.test.ts tests/pg-migrations.test.ts tests/oauth-http.test.ts
+      - run: npm run test:unit -w @xyteai/mcp-remote -- tests/oauth-store.test.ts tests/pg-migrations.test.ts tests/oauth-http.test.ts tests/oauth-provider.test.ts
 
   catalog-shape:
     # The generator needs a hub checkout, which CI does not have, so validate the

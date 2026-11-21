@@ -185,7 +185,11 @@ async function openConsent(provider: XyteOAuthProvider, client: OAuthClientInfor
 
 /** Approve on the consent page; returns the hub redirect and the rotated cookie. */
 async function approve(provider: XyteOAuthProvider, client: OAuthClientInformationFull) {
-  return submitApprove(provider, await openConsent(provider, client));
+  const approved = await submitApprove(provider, await openConsent(provider, client));
+  // Specs built on this would otherwise pass on a refused Approve.
+  expect(approved.out.status).toBe(302);
+  expect(approved.cookie).not.toBe('');
+  return approved;
 }
 
 /** Approve a consent page opened earlier, possibly on another instance. */
@@ -327,6 +331,45 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(hub.calls).toHaveLength(0);
     // The flow is over, so its cookie goes too.
     expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    // ...and a callback on it, even with that cookie, finds nothing.
+    const late = await callback(provider, { state: consent.pending, code: 'hub-code' }, consent.cookie);
+    expect(late.status).toBe(400);
+    expect(late.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('refuses an Approve once the sign-in has expired, asking hub nothing', async () => {
+    const { provider, hub } = makeProvider();
+    const consent = await openConsent(provider, await registeredClient(provider));
+    vi.useFakeTimers({ now: Date.now() + 11 * 60 * 1000 });
+    try {
+      const { out } = await submitApprove(provider, consent);
+      expect(out.status).toBe(400);
+      expect(out.html).toContain('Authorization expired or invalid');
+      expect(out.location).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  // Saved for ten minutes from an unauthenticated request, so it is bounded.
+  it('refuses an /authorize whose state is over 1024 characters, saving nothing', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const create = vi.spyOn(store, 'createPendingSignIn');
+    const start = async (state: string) => {
+      const { out, res } = fakeRes();
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT, state }, res);
+      return out;
+    };
+
+    const long = await start('x'.repeat(1025));
+    expect(long.status).toBe(400);
+    expect(long.location).toBe('');
+    expect(long.cookies).toEqual({});
+    expect(create).not.toHaveBeenCalled();
+    expect((await start('x'.repeat(1024))).status).toBe(200);
   });
 
   it('expires flow cookies whose flow is gone when a new /authorize starts', async () => {
@@ -442,11 +485,12 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
 
   // The state is in hub's URL (history, logs): knowing it must not cancel a login.
   it('a cookieless callback leaves the login for its own browser to finish', async () => {
-    const { provider } = makeProvider();
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     const { pending, cookie } = await approve(provider, client);
 
     expect((await callback(provider, { state: pending, code: 'c' })).status).toBe(400);
+    expect(await store.getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
     const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
     expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
     // ...once: the replay is refused.
@@ -723,6 +767,37 @@ describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', 
     expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a Deny whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out, res } = fakeRes();
+    await instances[1].consent(
+      fakeReq({ body: { pending: consent.pending, csrf: consent.csrf, decision: 'deny' }, cookie: consent.cookie }),
+      res
+    );
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+  });
+
+  it('a cookieless callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    expect((await callback(instances[1], { state: pending, code: 'c' })).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
   });
 
   it('answers 503 once the store is at its cap', async () => {

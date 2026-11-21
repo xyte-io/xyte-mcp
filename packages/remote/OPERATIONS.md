@@ -45,9 +45,10 @@ An admin of that organization disconnects the app in the hub, under **Connected 
 ends the connection of every member of that organization. To connect again, an admin must
 approve the app again.
 
-The hub shows **Connected apps** to every organization with a live connection, so no flag is
-needed. After the last disconnect the screen hides again, unless the partner has the
-`connected_apps` feature flag on. When no admin of the organization is available, the steps
+The hub shows **Connected apps** to every organization that has approved the app (its hub
+grant is active), so no flag is needed. A user who disconnects from their client does not
+change this. Once an admin disconnects the app there (or the hub grant is revoked another
+way), the screen hides again, unless the partner has the `connected_apps` feature flag on. When no admin of the organization is available, the steps
 for support are in the hub's internal runbook (`docs/remote_mcp_support_runbook.md`).
 
 ## Cut off one connection

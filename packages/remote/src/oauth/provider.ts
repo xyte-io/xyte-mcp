@@ -28,7 +28,7 @@ import {
   type HubSignIn,
   type HubTokens
 } from './hub-oauth.js';
-import type { OAuthStore, TokenRecord } from './store.js';
+import { hashToken, type OAuthStore, type PendingSignIn, type TokenRecord } from './store.js';
 
 /**
  * The OAuth 2.1 authorization server, backed by hub's own OAuth server.
@@ -54,23 +54,6 @@ const HUB_REFRESH_SKEW_SECONDS = 60;
 /** Attempts at saving a rotated hub pair. Only the DB write repeats — never the hub POST. */
 const HUB_SAVE_ATTEMPTS = 3;
 
-/** An /authorize request parked across our consent page and hub's sign-in. */
-interface PendingAuthorization {
-  clientId: string;
-  redirectUri: string;
-  codeChallenge: string;
-  state?: string;
-  resource?: string;
-  /** Echoed by the consent form. */
-  csrf: string;
-  /** Held by the consenting browser in a cookie; the callback must present it. */
-  browserKey: string;
-  approved: boolean;
-  /** Our PKCE verifier for the hub leg. */
-  hubVerifier: string;
-  expiresAt: number;
-}
-
 const PENDING_TTL_SECONDS = 10 * 60;
 // ponytail: a fixed ceiling on parked logins (DCR is open, so /authorize is
 // reachable from any number of IPs); per-client caps if this is ever hit.
@@ -80,9 +63,9 @@ const EXPIRED = 'Authorization expired or invalid. Restart the connection.';
 
 export class XyteOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
-  // ponytail: in-memory, as is the refresh single-flight below — which is why
-  // the Procfile pins one dyno. A restart mid-login just makes the user retry.
-  private readonly pending = new Map<string, PendingAuthorization>();
+  // ponytail: the refresh single-flight is in-memory, which is why the
+  // Procfile pins one dyno. Pending sign-ins live in the store (Postgres off
+  // localhost), so a sign-in started on one instance finishes on any other.
   private readonly refreshing = new Map<string, Promise<string>>();
   /** Rotated hub pairs the store failed to save, used in place of the stored ones. */
   private readonly unsaved = new Map<string, HubTokens>();
@@ -127,34 +110,42 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       return;
     }
     const pendingId = random();
-    const entry: PendingAuthorization = {
+    const csrf = random();
+    const browserKey = random();
+    const now = nowSeconds();
+    const entry: PendingSignIn = {
       clientId: client.client_id,
       redirectUri: params.redirectUri,
       codeChallenge: params.codeChallenge,
       ...(params.state ? { state: params.state } : {}),
       ...(params.resource ? { resource: params.resource.href } : {}),
-      csrf: random(),
-      browserKey: random(),
+      csrfHash: hashToken(csrf),
+      browserKeyHash: hashToken(browserKey),
       approved: false,
       // RFC 7636 4.1 (and hub) require 43-128 chars: 32 bytes is 43 in base64url.
       hubVerifier: randomBytes(32).toString('base64url'),
-      expiresAt: nowSeconds() + PENDING_TTL_SECONDS
+      expiresAt: now + PENDING_TTL_SECONDS
     };
-    this.prunePending();
-    if (this.pending.size >= MAX_PENDING) {
+    if (!(await this.store.createPendingSignIn(pendingId, entry, MAX_PENDING, now))) {
       res.status(503).type('html').send(errorPage('Too many sign-ins in progress. Try again shortly.'));
       return;
     }
-    this.pending.set(pendingId, entry);
     // One cookie per started flow: expire the ones whose flow is gone, or
     // enough abandoned flows grow the Cookie header past the server's limit.
-    for (const name of cookieNames(res.req)) {
-      if (!this.pending.has(name.slice(COOKIE_PREFIX.length))) clearBrowserCookie(res, name);
+    const flowCookies = cookieNames(res.req);
+    if (flowCookies.length) {
+      const live = await this.store.livePendingSignInIds(
+        flowCookies.map((name) => name.slice(COOKIE_PREFIX.length)),
+        now
+      );
+      for (const name of flowCookies) {
+        if (!live.has(name.slice(COOKIE_PREFIX.length))) clearBrowserCookie(res, name);
+      }
     }
 
     // Set with the page, not only on Approve: a cross-site auto-submitted
     // Approve carries no SameSite=Lax cookie, so it cannot skip this page.
-    setBrowserCookie(res, pendingId, entry.browserKey);
+    setBrowserCookie(res, pendingId, browserKey);
     frameDeny(res)
       .status(200)
       .type('html')
@@ -163,7 +154,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           clientName: typeof client.client_name === 'string' ? client.client_name : undefined,
           redirectTarget: redirectTarget(params.redirectUri),
           pendingId,
-          csrf: entry.csrf
+          csrf
         })
       );
   }
@@ -172,7 +163,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   async consent(req: Request, res: Response): Promise<void> {
     const form = (req.body ?? {}) as Record<string, unknown>;
     const pendingId = typeof form.pending === 'string' ? form.pending : '';
-    const entry = this.livePending(pendingId);
+    const entry = await this.store.getPendingSignIn(pendingId, nowSeconds());
     const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
     // A mismatch leaves the entry alone: the pending id travels in URLs, so
     // dropping it here would let anyone who saw one cancel that login.
@@ -181,26 +172,33 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       endOnExpiredPage(res, 'expired');
       return;
     }
-    if (!same(form.csrf, entry.csrf)) {
+    if (!matchesHash(form.csrf, entry.csrfHash)) {
       endOnExpiredPage(res, 'csrf', entry.clientId);
       return;
     }
-    if (!same(cookie, entry.browserKey)) {
+    if (!matchesHash(cookie, entry.browserKeyHash)) {
       endOnExpiredPage(res, 'cookie', entry.clientId);
       return;
     }
 
     if (form.decision !== 'approve') {
+      // Taken, not just deleted: a callback racing this Deny finds it gone.
+      await this.store.takePendingSignIn(pendingId, nowSeconds());
       logEvent('sign_in', { outcome: 'denied', client: entry.clientId });
-      this.pending.delete(pendingId);
       clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
       res.redirect(302, clientRedirect(entry, { error: 'access_denied' }));
       return;
     }
 
-    // Same key as set with the page, so a double-clicked Approve stays valid.
-    entry.approved = true;
-    setBrowserCookie(res, pendingId, entry.browserKey);
+    // Gone since the read above: its callback already ran, or it just expired.
+    if (!(await this.store.approvePendingSignIn(pendingId, nowSeconds()))) {
+      clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
+      endOnExpiredPage(res, 'expired', entry.clientId);
+      return;
+    }
+    // The verified cookie set again (the store keeps only its hash): the same
+    // key as set with the page, so a double-clicked Approve stays valid.
+    setBrowserCookie(res, pendingId, cookie);
     res.redirect(
       302,
       this.hub.authorizeUrl({
@@ -219,7 +217,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   async callback(req: Request, res: Response): Promise<void> {
     const query = req.query as Record<string, unknown>;
     const pendingId = typeof query.state === 'string' ? query.state : '';
-    const entry = this.livePending(pendingId);
+    const entry = await this.store.getPendingSignIn(pendingId, nowSeconds());
     const cookie = readCookie(req, COOKIE_PREFIX + pendingId);
     // Without the cookie the entry is left alone, as in consent(): the state is
     // in hub's URL, and knowing it must not be enough to cancel the login.
@@ -228,15 +226,21 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       endOnExpiredPage(res, 'expired');
       return;
     }
-    if (!same(cookie, entry.browserKey)) {
+    if (!matchesHash(cookie, entry.browserKeyHash)) {
       endOnExpiredPage(res, 'cookie', entry.clientId);
       return;
     }
-    // Single-use from here: a replayed callback must not mint twice.
-    this.pending.delete(pendingId);
+    // Single-use from here: of a replayed or a concurrent second callback, on
+    // any instance, only the one whose delete took the row goes on. Approved
+    // is read from the taken row, so an Approve landing meanwhile counts.
+    const taken = await this.store.takePendingSignIn(pendingId, nowSeconds());
     clearBrowserCookie(res, COOKIE_PREFIX + pendingId);
-    if (!entry.approved) {
-      endOnExpiredPage(res, 'not_approved', entry.clientId);
+    if (!taken) {
+      endOnExpiredPage(res, 'expired', entry.clientId);
+      return;
+    }
+    if (!taken.approved) {
+      endOnExpiredPage(res, 'not_approved', taken.clientId);
       return;
     }
 
@@ -244,15 +248,15 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       logEvent(
         'sign_in',
         query.error === 'access_denied'
-          ? { outcome: 'denied', client: entry.clientId }
-          : { outcome: 'failed', reason: 'hub_error', client: entry.clientId }
+          ? { outcome: 'denied', client: taken.clientId }
+          : { outcome: 'failed', reason: 'hub_error', client: taken.clientId }
       );
       const description = [query.error_reason, query.error_description]
         .filter((part): part is string => typeof part === 'string' && part.length > 0)
         .join(': ');
       res.redirect(
         302,
-        clientRedirect(entry, {
+        clientRedirect(taken, {
           error: query.error,
           ...(description ? { error_description: description } : {})
         })
@@ -262,16 +266,16 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 
     try {
       if (typeof query.code !== 'string') throw new Error('hub callback has no code or error');
-      const signIn = await this.hub.exchangeCode(query.code, entry.hubVerifier);
-      const grantId = await this.store.createGrant(entry.clientId, signIn);
+      const signIn = await this.hub.exchangeCode(query.code, taken.hubVerifier);
+      const grantId = await this.store.createGrant(taken.clientId, signIn);
       const code = mintToken('ac');
       await this.store.saveToken({
         token: code,
         kind: 'code',
         grantId,
-        codeChallenge: entry.codeChallenge,
-        redirectUri: entry.redirectUri,
-        ...(entry.resource ? { resource: entry.resource } : {}),
+        codeChallenge: taken.codeChallenge,
+        redirectUri: taken.redirectUri,
+        ...(taken.resource ? { resource: taken.resource } : {}),
         expiresAt: nowSeconds() + CODE_TTL_SECONDS
       });
       logEvent('sign_in', {
@@ -280,7 +284,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         organization: signIn.tenantId,
         user: signIn.sub
       });
-      res.redirect(302, clientRedirect(entry, { code }));
+      res.redirect(302, clientRedirect(taken, { code }));
     } catch (error) {
       // A JSON parse error quotes its input — the id_token or the response body.
       const detail =
@@ -290,23 +294,11 @@ export class XyteOAuthProvider implements OAuthServerProvider {
             ? error.message
             : String(error);
       logError(`hub sign-in failed: ${detail}`);
-      logEvent('sign_in', { outcome: 'failed', reason: 'exchange', client: entry.clientId });
+      logEvent('sign_in', { outcome: 'failed', reason: 'exchange', client: taken.clientId });
       res.redirect(
         302,
-        clientRedirect(entry, { error: 'server_error', error_description: 'Xyte sign-in failed' })
+        clientRedirect(taken, { error: 'server_error', error_description: 'Xyte sign-in failed' })
       );
-    }
-  }
-
-  private livePending(pendingId: string): PendingAuthorization | undefined {
-    const entry = this.pending.get(pendingId);
-    return entry && entry.expiresAt > nowSeconds() ? entry : undefined;
-  }
-
-  private prunePending(): void {
-    const now = nowSeconds();
-    for (const [key, value] of this.pending) {
-      if (value.expiresAt <= now) this.pending.delete(key);
     }
   }
 
@@ -746,11 +738,11 @@ function random(): string {
   return randomBytes(24).toString('base64url');
 }
 
-/** Constant-time string comparison; anything that is not a string never matches. */
-function same(presented: unknown, expected: string): boolean {
+/** Whether `presented` hashes to `expectedHash`, compared in constant time; a non-string never matches. */
+function matchesHash(presented: unknown, expectedHash: string): presented is string {
   if (typeof presented !== 'string') return false;
-  const a = Buffer.from(presented);
-  const b = Buffer.from(expected);
+  const a = Buffer.from(hashToken(presented));
+  const b = Buffer.from(expectedHash);
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -790,7 +782,7 @@ function readCookie(req: Request, name: string): string | undefined {
 }
 
 /** Only ever to the redirect URI stored at /authorize, where the SDK checked it against the client. */
-function clientRedirect(entry: PendingAuthorization, params: Record<string, string>): string {
+function clientRedirect(entry: PendingSignIn, params: Record<string, string>): string {
   const target = new URL(entry.redirectUri);
   for (const [key, value] of Object.entries(params)) target.searchParams.set(key, value);
   if (entry.state) target.searchParams.set('state', entry.state);

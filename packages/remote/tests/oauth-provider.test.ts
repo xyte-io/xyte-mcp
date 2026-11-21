@@ -1,11 +1,15 @@
-import { describe, expect, it, vi } from 'vitest';
+import { randomBytes, randomUUID } from 'node:crypto';
+import pg from 'pg';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
-import { MemoryOAuthStore } from '../src/oauth/store.js';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
+import { MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
 import { stubHttp } from '../../mcp/tests/support/context.js';
 import { hubAcceptsPkce } from './support/pkce.js';
 
@@ -100,9 +104,7 @@ function tokenRejected(): XyteHttpError {
 
 let currentHub: ReturnType<typeof fakeHub> | undefined;
 
-function makeProvider() {
-  const store = new MemoryOAuthStore();
-  const hub = fakeHub();
+function makeProvider(store: OAuthStore = new MemoryOAuthStore(), hub = fakeHub()) {
   currentHub = hub;
   const provider = new XyteOAuthProvider(
     store,
@@ -183,7 +185,14 @@ async function openConsent(provider: XyteOAuthProvider, client: OAuthClientInfor
 
 /** Approve on the consent page; returns the hub redirect and the rotated cookie. */
 async function approve(provider: XyteOAuthProvider, client: OAuthClientInformationFull) {
-  const consent = await openConsent(provider, client);
+  return submitApprove(provider, await openConsent(provider, client));
+}
+
+/** Approve a consent page opened earlier, possibly on another instance. */
+async function submitApprove(
+  provider: XyteOAuthProvider,
+  consent: { pending: string; csrf: string; cookie: string }
+) {
   const { out, res } = fakeRes();
   await provider.consent(
     fakeReq({
@@ -192,9 +201,9 @@ async function approve(provider: XyteOAuthProvider, client: OAuthClientInformati
     }),
     res
   );
-  const [cookieName, cookie] = Object.entries(out.cookies)[0]!;
-  currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
-  return { out, pending: consent.pending, cookie: `${cookieName}=${cookie.value}` };
+  const [cookieName, cookie] = Object.entries(out.cookies)[0] ?? [];
+  if (out.location) currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
+  return { out, pending: consent.pending, cookie: cookieName ? `${cookieName}=${cookie!.value}` : '' };
 }
 
 async function callback(
@@ -544,6 +553,181 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       res
     );
     expect(out.status).toBe(400);
+  });
+});
+
+const PG_URL = process.env.TEST_DATABASE_URL;
+const KEY_A = randomBytes(32);
+const KEY_B = randomBytes(32);
+
+/** A Postgres schema of its own, so oauth-store.test.ts's truncates never meet these rows. */
+async function pgSchema() {
+  const schema = `provider_test_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(PG_URL!);
+  url.searchParams.set('options', `-c search_path=${schema}`);
+  const stores: PgOAuthStore[] = [];
+  return {
+    connect: async (key: Buffer) => {
+      const store = await PgOAuthStore.connect(url.toString(), new TokenCipher(key));
+      stores.push(store);
+      return store;
+    },
+    drop: async () => {
+      await Promise.all(stores.map((store) => store.close().catch(() => undefined)));
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  };
+}
+
+/** Two stores on one database, as two server instances have; the memory pair shares one store. */
+const storePairs: Array<[string, () => Promise<{ stores: [OAuthStore, OAuthStore]; drop(): Promise<void> }>]> = [
+  [
+    'memory',
+    async () => {
+      const store = new MemoryOAuthStore();
+      return { stores: [store, store], drop: async () => {} };
+    }
+  ]
+];
+if (PG_URL) {
+  storePairs.push([
+    'postgres',
+    async () => {
+      const db = await pgSchema();
+      return { stores: [await db.connect(KEY_A), await db.connect(KEY_A)], drop: db.drop };
+    }
+  ]);
+}
+
+describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', (_name, makeStores) => {
+  let pair: Awaited<ReturnType<typeof makeStores>>;
+  let instances: [XyteOAuthProvider, XyteOAuthProvider];
+  let hub: ReturnType<typeof fakeHub>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    pair = await makeStores();
+    hub = fakeHub();
+    instances = [makeProvider(pair.stores[0], hub).provider, makeProvider(pair.stores[1], hub).provider];
+  });
+  afterEach(async () => {
+    await pair.drop();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    [0, 1, 0],
+    [1, 0, 1],
+    [0, 0, 1],
+    [0, 1, 1]
+  ])('authorize on %i, consent on %i, callback on %i mints a working code', async (authorizeOn, consentOn, callbackOn) => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[authorizeOn]!, client);
+    const approved = await submitApprove(instances[consentOn]!, consent);
+    expect(approved.out.status).toBe(302);
+
+    const out = await callback(instances[callbackOn]!, { state: consent.pending, code: 'hub-code' }, approved.cookie);
+    const code = new URL(out.location).searchParams.get('code')!;
+    expect(code).toMatch(/^xmcp_ac_/);
+    const tokens = await instances[1 - callbackOn]!.exchangeAuthorizationCode(client, code);
+    expect(hubIdentityOf(await instances[authorizeOn]!.verifyAccessToken(tokens.access_token)).accessToken).toBe(
+      'xoat_1'
+    );
+  });
+
+  it('a replayed callback, and two concurrent ones on both instances, mint one code', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const outs = await Promise.all(
+      instances.map((instance) => callback(instance, { state: pending, code: 'hub-code' }, cookie))
+    );
+    expect(outs.map((out) => out.status).sort()).toEqual([302, 400]);
+    expect(outs.filter((out) => out.location.includes('code=xmcp_ac_'))).toHaveLength(1);
+    expect((await callback(instances[1], { state: pending, code: 'hub-code' }, cookie)).status).toBe(400);
+    expect(hub.calls.filter((call) => call.form.get('grant_type') === 'authorization_code')).toHaveLength(1);
+  });
+
+  it('a double-clicked Approve, on either instance, still finishes the sign-in', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const first = await submitApprove(instances[0], consent);
+    const second = await submitApprove(instances[1], consent);
+
+    expect([first.out.status, second.out.status]).toEqual([302, 302]);
+    expect(second.out.location).toBe(first.out.location);
+    expect(second.cookie).toBe(consent.cookie);
+    const out = await callback(instances[0], { state: consent.pending, code: 'hub-code' }, second.cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('answers 503 once the store is at its cap', async () => {
+    const client = await registeredClient(instances[0]);
+    for (const store of new Set(pair.stores)) {
+      const create = store.createPendingSignIn.bind(store);
+      vi.spyOn(store, 'createPendingSignIn').mockImplementation((id, entry, _max, now) => create(id, entry, 2, now));
+    }
+    await openConsent(instances[0], client);
+    await openConsent(instances[1], client);
+
+    const { out, res } = fakeRes();
+    await instances[0].authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+    expect(out.status).toBe(503);
+    expect(out.cookies).toEqual({});
+  });
+});
+
+describe.skipIf(!PG_URL)('XyteOAuthProvider: pending sign-ins on Postgres', () => {
+  let db: Awaited<ReturnType<typeof pgSchema>>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    db = await pgSchema();
+  });
+  afterEach(async () => {
+    await db.drop();
+    vi.restoreAllMocks();
+  });
+
+  // An instance without the key the sign-in was started under (a rotation
+  // without XYTE_MCP_TOKEN_KEY_PREVIOUS) cannot read its hub verifier.
+  it('a callback on an instance without the key of the hub verifier ends on the expired page, not a 500', async () => {
+    const hub = fakeHub();
+    const writer = makeProvider(await db.connect(KEY_A), hub).provider;
+    const reader = makeProvider(await db.connect(KEY_B), hub).provider;
+    const client = await registeredClient(writer);
+    const { pending, cookie } = await approve(writer, client);
+
+    const out = await callback(reader, { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  // The SDK's authorize handler turns the rejection into a server_error
+  // redirect to the client: a clean error, bounded by the pool's connect timeout.
+  it('rejects an /authorize promptly while Postgres is down, setting no cookie', async () => {
+    const store = await db.connect(KEY_A);
+    const { provider } = makeProvider(store);
+    const client = await registeredClient(provider);
+    const live = (store as unknown as { pool: pg.Pool }).pool;
+    const down = new pg.Pool({ connectionString: 'postgres://127.0.0.1:9/none', connectionTimeoutMillis: 2000 });
+    (store as unknown as { pool: pg.Pool }).pool = down;
+    try {
+      const { out, res } = fakeRes();
+      const started = Date.now();
+      await expect(
+        provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+      ).rejects.toThrow();
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(out.cookies).toEqual({});
+      expect(out.html).toBe('');
+    } finally {
+      (store as unknown as { pool: pg.Pool }).pool = live;
+      await down.end();
+    }
   });
 });
 

@@ -83,7 +83,7 @@ Everything below is about running the server itself.
 | `XYTE_MCP_ISSUER_URL` | **Hosted server only.** This deployment's public https URL; setting it enables OAuth 2.1. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
-| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
+| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Required unless `XYTE_MCP_ISSUER_URL` is on `localhost` or `127.0.0.1` (the server refuses to boot); with a local issuer, absent → in-memory, tokens and sign-ins in progress die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
 | `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
 | `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
@@ -459,9 +459,11 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Disconnect.** Revoking any of our tokens revokes its grant, and calls hub's revoke —
   which ends that user's sign-in on that organization for every client — only when no
   other live grant rides the same sign-in.
-- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
-  across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. At boot and then hourly the server deletes expired tokens, revoked grants
+- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants, token hashes and
+  sign-ins in progress across dyno restarts, so a sign-in started on one instance finishes on
+  any other. It is required unless the issuer is on `localhost` or `127.0.0.1`; there, without
+  it, an in-memory store logs a loud warning and every restart logs users out. At boot and
+  then hourly the server deletes sign-ins in progress past their 10 minutes, expired tokens, revoked grants
   with no token left after 7 days (the row shows who was signed out and when), sign-ins with
   no token left, 97 days after the sign-in (hub's 90-day chain has ended, plus a week), sign-ins whose
   client is gone, and registered clients with no grant after 30 days (registration is open,

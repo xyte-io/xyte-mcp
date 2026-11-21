@@ -1102,7 +1102,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
         provider
           .hubHttp(grantId, upstreamOk())
           .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
-      ).rejects.toMatchObject({ kind: 'network', message: 'Another request is refreshing this connection.' })
+      ).rejects.toMatchObject({ kind: 'network', message: 'This connection is busy.' })
     );
     expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a hub refresh (55P03)`);
     expect(hub.refreshes()).toHaveLength(0);

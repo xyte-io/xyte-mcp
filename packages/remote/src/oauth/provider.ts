@@ -397,13 +397,14 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     let posted = false;
     /** Set once hub answered with a new pair: from then on it must not be lost. */
     const answered: { hub?: HubSignIn; stored?: string; next?: HubTokens; saved?: boolean } = {};
-    let accessToken: string;
+    /** Set when this refresh ended the grant; logged once the revoke has committed. */
+    const ended: { hub?: HubSignIn; reason?: string } = {};
+    let accessToken: string | undefined;
     try {
+      // Every signed-out outcome returns undefined rather than throwing: a throw
+      // would roll back the revoke (or the unreadable-token revoke of the locked read).
       accessToken = await this.store.withGrantLock(grantId, async (locked) => {
-        if (!locked.grant?.hub || locked.grant.revoked) {
-          this.unsaved.delete(grantId);
-          throw signInGone();
-        }
+        if (!locked.grant?.hub || locked.grant.revoked) return undefined;
         const stored = locked.grant.hub.refreshToken;
         const hub = { ...locked.grant.hub, ...this.unsaved.get(grantId) };
         // A flight here or in another process already replaced the token this caller saw.
@@ -441,16 +442,14 @@ export class XyteOAuthProvider implements OAuthServerProvider {
               `(${error instanceof XyteError ? error.message : 'unreadable hub response'}); ending the grant`
           );
           await locked.revoke();
-          this.unsaved.delete(grantId);
-          logEvent('revoke', { ...whoOf(grantId, hub), reason: 'refresh_unknown' });
-          throw signInGone();
+          Object.assign(ended, { hub, reason: 'refresh_unknown' });
+          return undefined;
         }
         if (next === 'invalid_grant') {
           logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'invalid_grant', hub_status: 400 });
           await locked.revoke();
-          this.unsaved.delete(grantId);
-          logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });
-          throw signInGone();
+          Object.assign(ended, { hub, reason: 'invalid_grant' });
+          return undefined;
         }
         logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
         Object.assign(answered, { hub, stored, next });
@@ -467,9 +466,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       // No lock (another refresh holds it past lock_timeout, no connection, a
       // failed BEGIN): nothing was sent to hub, so the call may simply retry.
       logError(`grant ${grantId}: could not lock the grant for a hub refresh (${errorCodeOf(error)})`);
-      throw new XyteError('network', 'Another request is refreshing this connection.', [
-        'Retry in a few seconds.'
-      ]);
+      throw new XyteError('network', 'This connection is busy.', ['Retry in a few seconds.']);
+    }
+    if (accessToken === undefined) {
+      this.unsaved.delete(grantId);
+      if (ended.reason) logEvent('revoke', { ...whoOf(grantId, ended.hub), reason: ended.reason });
+      throw signInGone();
     }
     if (answered.next) {
       if (answered.saved) this.unsaved.delete(grantId);

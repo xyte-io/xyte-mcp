@@ -129,6 +129,69 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     expect(hub.refreshes).toHaveLength(before + 1);
   });
 
+  const revokedInDb = async (grantId: string) =>
+    (
+      await schema.admin.query(
+        `SELECT 1 FROM oauth_grants
+          WHERE id = $1 AND revoked_at IS NOT NULL AND hub_access_token IS NULL AND hub_refresh_token IS NULL`,
+        [grantId]
+      )
+    ).rowCount === 1;
+
+  // A revoke inside the lock commits with it: rolled back, the grant would keep a burned token.
+  it.each([
+    [
+      'invalid_grant',
+      async (refreshToken: string) => {
+        // Burn the token at hub first, as an earlier lost refresh would have.
+        await fetch(`${hub.url}/oauth/token`, {
+          method: 'POST',
+          body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
+        });
+      },
+      () => undefined
+    ],
+    [
+      'an unknown outcome (hub hung up)',
+      async () => {
+        hub.holdRefreshes = true;
+      },
+      async () => {
+        await vi.waitFor(() => expect(hub.held()).toBe(1));
+        hub.holdRefreshes = false;
+        hub.dropHeld();
+      }
+    ]
+  ])('%s on refresh revokes the grant in the database, and the next call sends no refresh', async (_name, before, during) => {
+    const [a, b] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    await before(refreshToken);
+    const sent = hub.refreshes.length;
+
+    const call = get(a.provider, grantId);
+    await during();
+    await expect(call).rejects.toMatchObject({ kind: 'auth' });
+    expect(await revokedInDb(grantId)).toBe(true);
+    await expect(get(b.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes).toHaveLength(sent + 1);
+  });
+
+  it('an unreadable hub token read under the lock stays revoked', async () => {
+    const [a] = await instances();
+    const { grantId } = await expiringGrant(a.store);
+    await schema.admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [grantId]
+    );
+    const sent = hub.refreshes.length;
+    // Straight to the locked read, as a refresh after a hub 401 does.
+    await expect(
+      (a.provider as unknown as { refreshHub(id: string, stale: string): Promise<string> }).refreshHub(grantId, 'xoat_seed')
+    ).rejects.toMatchObject({ kind: 'auth' });
+    expect(await revokedInDb(grantId)).toBe(true);
+    expect(hub.refreshes).toHaveLength(sent);
+  });
+
   it('a waiter past the lock timeout gets a retryable error and never sends the refresh token', async () => {
     const [, b] = await instances(0); // lock_timeout: 5 s
     const { grantId } = await expiringGrant(b.store);
@@ -139,7 +202,7 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
       await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE', [grantId]);
       await expect(get(b.provider, grantId)).rejects.toMatchObject({
         kind: 'network',
-        message: 'Another request is refreshing this connection.'
+        message: 'This connection is busy.'
       });
     } finally {
       await holder.query('ROLLBACK');

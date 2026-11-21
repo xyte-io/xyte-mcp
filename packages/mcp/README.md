@@ -508,9 +508,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
   one-off dyno (`heroku run`) needs it as a config var
   (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
-- **One dyno.** The pending consent state, the refresh single-flight and the rate-limit
-  counters are in memory, so the app must run on a single dyno (a second one doubles every
-  budget).
+- **One dyno.** The refresh single-flight and the rate-limit counters are in memory, so
+  the app must run on a single dyno (a second one doubles every budget).
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of

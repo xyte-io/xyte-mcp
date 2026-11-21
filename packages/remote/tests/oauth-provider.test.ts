@@ -663,6 +663,25 @@ describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', 
     expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
   });
 
+  it('an Approve whose sign-in is taken between its read and its approve ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    // The other instance takes the row right after this consent has read it.
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out } = await submitApprove(instances[1], consent);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
   it('answers 503 once the store is at its cap', async () => {
     const client = await registeredClient(instances[0]);
     for (const store of new Set(pair.stores)) {

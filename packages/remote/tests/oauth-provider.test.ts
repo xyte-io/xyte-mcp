@@ -1055,8 +1055,9 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const get = () => http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
 
     const stderr = await captureStderr(get);
-    expect(save).toHaveBeenCalledTimes(4); // the DB write under the lock, retried 3 times after it...
-    expect(revoke).toHaveBeenCalledTimes(3);
+    // 3 tries under the lock, then (the revoke under the lock failed too) 3 more after it...
+    expect(save).toHaveBeenCalledTimes(6);
+    expect(revoke).toHaveBeenCalledTimes(4);
     expect(hub.refreshes()).toHaveLength(1); // ...the hub POST is not
     expect(stderr).toContain('another instance may replay the stored hub token until the save lands');
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
@@ -1418,6 +1419,20 @@ describe('XyteOAuthProvider: revocation', () => {
     await store.sweepExpiredOAuthRows(now);
     await provider.revokeToken(client, { token: 'expired-after' });
     expect((await store.getGrant(after.grantId))?.revoked).toBe(false);
+  });
+
+  it('logs and fails a revoke that cannot take the grant lock', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' })
+    );
+    const stderr = await captureStderr(() =>
+      expect(provider.revokeToken(client, { token: tokens.access_token })).rejects.toMatchObject({ code: '55P03' })
+    );
+    expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a revoke (55P03)`);
+    expect(eventsIn(stderr)).toEqual([]);
   });
 
   it("revoking another client's token is a silent no-op", async () => {

@@ -761,6 +761,28 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     }
   });
 
+  // Shutdown: a waiter queued on another process's lock sends nothing, so it must
+  // not hold close() until its lock_timeout.
+  it('close() does not wait for a grant lock waiter, and refuses new lock attempts', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const id = await store.createGrant('c1', signIn());
+    const holder = await admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [id]);
+    const waiter = store.withGrantLock(id, async () => undefined).catch(() => undefined);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 200)); // queued on the row
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await expect(store.withGrantLock(id, async () => undefined)).rejects.toThrow();
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await waiter;
+    }
+  });
+
   it('rolls back what the grant lock holder wrote when it throws', async () => {
     const store = await open(KEY_A);
     const id = await store.createGrant('c1', signIn());

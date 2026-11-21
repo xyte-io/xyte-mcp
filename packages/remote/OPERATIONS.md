@@ -109,13 +109,18 @@ One connection's hub refresh runs once at a time across all server processes (a 
 lock); a revoke of the connection waits for it too. A call that waits longer than the hub
 timeout plus 5 s (20 s by default) fails with a retryable error and an `[xyte-mcp] error:
 grant <id>: could not lock the grant for a hub refresh (<code>)` line (`55P03` for the lock
-wait); nothing was sent to the hub, and the connection is kept.
+wait); nothing was sent to the hub, and the connection is kept. A disconnect that cannot get
+the lock in that time answers `500`, with an `[xyte-mcp] error: grant <id>: could not lock the
+grant for a revoke (<code>)` line; the connection is not revoked, and the client may retry.
 
-If the database is fully down after a hub refresh, so that neither saving the new tokens nor
-revoking the connection works, the new tokens live only in that process's memory (an
-`[xyte-mcp] error: ERROR grant <id>: could not save rotated hub tokens` line) until a later
-refresh saves them. Until then another process may send the stored, already used token and
-end that connection; a restart before the save loses the tokens.
+Saving the new tokens after a hub refresh is retried while the lock is held, and if every try
+fails the connection is revoked under the same lock (`hub_save_failed`). Only when the lock's
+own database connection or its commit fails is the lock released before the tokens are safe:
+the save is then retried outside it, and another process may meanwhile send the stored,
+already used token and end that connection. If the database is fully down, so that neither
+saving the new tokens nor revoking the connection works, the new tokens live only in that
+process's memory (an `[xyte-mcp] error: ERROR grant <id>: could not save rotated hub tokens`
+line) until a later refresh saves them; a restart before the save loses them.
 
 Each server process holds up to 8 Postgres connections: 5 for requests and 3 for the refresh
 lock, plus one more briefly at boot for the schema migration. Size the Postgres plan's

@@ -208,6 +208,44 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     expect(hub.refreshes).toHaveLength(sent + 1);
   });
 
+  // Retried inside the lock: released between tries, a waiter elsewhere would read
+  // the stored, now burned token and send it to hub.
+  it('a failed save of the new pair is retried under the lock: a waiter on the other instance sends nothing', async () => {
+    const [a, b] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    const lockPool = (a.store as unknown as { lockPool: pg.Pool }).lockPool;
+    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
+    let failed = false;
+    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
+      const client = await connect();
+      const query = client.query.bind(client) as (sql: string, values?: unknown[]) => Promise<unknown>;
+      client.query = (async (sql: string, values?: unknown[]) => {
+        if (!failed && sql.includes('SET hub_access_token')) {
+          failed = true;
+          return query('SELECT 1 / 0'); // fails at the server: the transaction is aborted
+        }
+        return query(sql, values);
+      }) as never;
+      return client;
+    }) as never);
+    const before = hub.refreshes.length;
+    hub.holdRefreshes = true;
+
+    const first = get(a.provider, grantId);
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
+    const waiter = get(b.provider, grantId);
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1), { timeout: 5_000 });
+    hub.holdRefreshes = false;
+    hub.releaseHeld();
+    await first;
+    await waiter;
+    vi.restoreAllMocks();
+
+    expect(failed).toBe(true);
+    expect(hub.refreshes.slice(before)).toEqual([refreshToken]);
+    expect((await a.store.getGrant(grantId))?.hub?.refreshToken).toBe(hub.rotatedTo.at(-1));
+  });
+
   it('an unreadable hub token read under the lock stays revoked', async () => {
     const [a] = await instances();
     const { grantId } = await expiringGrant(a.store);

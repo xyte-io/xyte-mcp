@@ -404,7 +404,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     /** Set once hub answered with a new pair: from then on it must not be lost. */
     const answered: { hub?: HubSignIn; stored?: string; next?: HubTokens; saved?: boolean } = {};
     /** Set when this refresh ended the grant; logged once the revoke has committed. */
-    const ended: { hub?: HubSignIn; reason?: string } = {};
+    const ended: { hub?: HubSignIn; reason?: string; code?: string } = {};
     let accessToken: string | undefined;
     try {
       // Every signed-out outcome returns undefined rather than throwing: a throw
@@ -465,12 +465,27 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         }
         logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
         Object.assign(answered, { hub, stored, next });
-        answered.saved = await locked.rotate(stored, next);
-        return next.accessToken;
+        // Retried here, holding the lock: released between tries, a flight in
+        // another process would read the stored token (burned now) and send it.
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            answered.saved = await locked.rotate(stored, next);
+            return next.accessToken;
+          } catch (error) {
+            if (attempt < HUB_SAVE_ATTEMPTS) {
+              await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+              continue;
+            }
+            // Fail closed, as saveHubTokens does: the stored token is burned.
+            Object.assign(ended, { hub, reason: 'hub_save_failed', code: errorCodeOf(error) });
+            await locked.revoke();
+            return undefined;
+          }
+        }
       });
     } catch (error) {
       if (answered.next) {
-        // The save or its commit failed after hub answered: save outside the lock.
+        // The locked connection or the commit failed after hub answered: save outside the lock.
         await this.saveHubTokens(grantId, answered.hub!, answered.stored!, answered.next);
         return answered.next.accessToken;
       }
@@ -495,6 +510,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     }
     if (accessToken === undefined) {
       this.unsaved.delete(grantId);
+      if (ended.reason === 'hub_save_failed') {
+        logError(
+          `grant ${grantId}: could not save rotated hub tokens after ${HUB_SAVE_ATTEMPTS} attempts ` +
+            `(${ended.code}); revoked the grant`
+        );
+      }
       if (ended.reason) logEvent('revoke', { ...whoOf(grantId, ended.hub), reason: ended.reason });
       throw signInGone();
     }
@@ -737,12 +758,18 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         // Under the grant lock: a hub refresh in any process lands first, and
         // none starts until the revoke commits — either would rotate the pair
         // just after we read it, and hub would be sent the already-burned token.
-        const hub = await this.store.withGrantLock(grant.id, async (locked) => {
-          await locked.revoke();
-          return locked.grant?.hub && !locked.grant.revoked
-            ? { ...locked.grant.hub, ...this.unsaved.get(grant.id) }
-            : undefined;
-        });
+        let hub: HubSignIn | undefined;
+        try {
+          hub = await this.store.withGrantLock(grant.id, async (locked) => {
+            await locked.revoke();
+            return locked.grant?.hub && !locked.grant.revoked
+              ? { ...locked.grant.hub, ...this.unsaved.get(grant.id) }
+              : undefined;
+          });
+        } catch (error) {
+          logError(`grant ${grant.id}: could not lock the grant for a revoke (${errorCodeOf(error)})`);
+          throw error;
+        }
         this.unsaved.delete(grant.id);
         logEvent('revoke', { ...whoOf(grant.id, hub), reason: 'client' });
         if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {

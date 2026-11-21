@@ -647,6 +647,7 @@ export class PgOAuthStore implements OAuthStore {
    * Postgres on disconnect: both roll back, so the stored pair is unchanged.
    */
   async withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T> {
+    if (this.closing) throw new Error('the OAuth store is closing');
     const client = await this.lockPool.connect();
     let failed = false;
     try {
@@ -662,7 +663,18 @@ export class PgOAuthStore implements OAuthStore {
         );
         const result = await fn({
           grant: rows[0] && (await this.grantOf(rows[0], client)),
-          rotate: (previous, next) => this.rotateHubTokensOn(client, grantId, previous, next),
+          // In a savepoint, so a failed try leaves the transaction (and the lock) usable for the next.
+          rotate: async (previous, next) => {
+            await client.query('SAVEPOINT rotate');
+            try {
+              const rotated = await this.rotateHubTokensOn(client, grantId, previous, next);
+              await client.query('RELEASE SAVEPOINT rotate');
+              return rotated;
+            } catch (error) {
+              await client.query('ROLLBACK TO SAVEPOINT rotate');
+              throw error;
+            }
+          },
           revoke: () => revokeGrantOn(client, grantId)
         });
         await client.query('COMMIT');
@@ -792,7 +804,14 @@ export class PgOAuthStore implements OAuthStore {
   async close(): Promise<void> {
     this.closing = true;
     // Waits for statements in flight (a cleanup step included), then disconnects.
-    await Promise.all([this.pool.end(), this.lockPool.end()]);
+    // ponytail: the grant lock pool gets 1 s. drain() has already awaited every
+    // flight that reached hub; what is left waits on another process's lock and
+    // sends nothing, and would hold shutdown for its whole lock_timeout. On exit
+    // Postgres rolls its transaction back.
+    await Promise.all([
+      this.pool.end(),
+      Promise.race([this.lockPool.end(), new Promise((resolve) => setTimeout(resolve, 1_000).unref())])
+    ]);
   }
 }
 

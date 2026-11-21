@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import type pg from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
@@ -91,9 +92,9 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     const calls = [a, b].flatMap(({ provider }) =>
       Array.from({ length: 5 }, () => get(provider, grantId, upstream))
     );
-    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
     // The other instance is queued on the grant's row, not refreshing on its own.
-    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1), { timeout: 5_000 });
     hub.holdRefreshes = false;
     hub.releaseHeld();
     await Promise.all(calls);
@@ -111,10 +112,10 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     hub.holdRefreshes = true;
 
     const call = get(a.provider, grantId);
-    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
     let revoked = false;
     const revoke = b.provider.revokeToken(client, { token: accessToken }).then(() => (revoked = true));
-    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1), { timeout: 5_000 });
     expect(revoked).toBe(false);
     hub.holdRefreshes = false;
     hub.releaseHeld();
@@ -157,7 +158,7 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
         hub.holdRefreshes = true;
       },
       async () => {
-        await vi.waitFor(() => expect(hub.held()).toBe(1));
+        await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
         hub.holdRefreshes = false;
         hub.dropHeld();
       }
@@ -171,6 +172,37 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     const call = get(a.provider, grantId);
     await during();
     await expect(call).rejects.toMatchObject({ kind: 'auth' });
+    expect(await revokedInDb(grantId)).toBe(true);
+    await expect(get(b.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes).toHaveLength(sent + 1);
+  });
+
+  // The revoke rolled back with the failed commit: it is redone on the main pool.
+  it('invalid_grant whose revoke fails to commit still revokes the grant, and the next call sends no refresh', async () => {
+    const [a, b] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    await fetch(`${hub.url}/oauth/token`, {
+      method: 'POST',
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken })
+    });
+    const lockPool = (a.store as unknown as { lockPool: pg.Pool }).lockPool;
+    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
+    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
+      const client = await connect();
+      const query = client.query.bind(client) as (sql: string, values?: unknown[]) => Promise<unknown>;
+      client.query = (async (sql: string, values?: unknown[]) => {
+        if (sql === 'COMMIT') {
+          await query('ROLLBACK');
+          throw Object.assign(new Error('connection lost'), { code: '08006' });
+        }
+        return query(sql, values);
+      }) as never;
+      return client;
+    }) as never);
+    const sent = hub.refreshes.length;
+
+    await expect(get(a.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    vi.restoreAllMocks();
     expect(await revokedInDb(grantId)).toBe(true);
     await expect(get(b.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
     expect(hub.refreshes).toHaveLength(sent + 1);

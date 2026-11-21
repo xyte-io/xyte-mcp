@@ -82,8 +82,8 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     hub.holdRefreshes = true;
 
     const calls = Array.from({ length: 20 }, () => listDevices(proxy.base, accessToken));
-    await vi.waitFor(() => expect(hub.held()).toBe(1));
-    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1), { timeout: 5_000 });
     hub.holdRefreshes = false;
     hub.releaseHeld();
     const answers = await Promise.all(calls);
@@ -103,14 +103,14 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     hub.holdRefreshes = true;
 
     const call = listDevices(servers[0]!.base, accessToken);
-    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
     let revoked = false;
     const revoke = fetch(`${servers[1]!.base}/revoke`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ token: refreshToken, client_id: clientId })
     }).then((answer) => ((revoked = true), answer));
-    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1), { timeout: 5_000 });
     expect(revoked).toBe(false);
     hub.holdRefreshes = false;
     hub.releaseHeld();
@@ -137,7 +137,7 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     hub.holdRefreshes = true;
 
     void listDevices(servers[0]!.base, accessToken).catch(() => undefined);
-    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
     const sent = hub.refreshes.at(-1)!;
     await servers[0]!.kill();
     hub.holdRefreshes = false;

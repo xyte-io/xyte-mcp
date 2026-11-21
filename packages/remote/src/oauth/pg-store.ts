@@ -647,8 +647,8 @@ export class PgOAuthStore implements OAuthStore {
     const client = await this.lockPool.connect();
     let failed = false;
     try {
-      await client.query('BEGIN');
       try {
+        await client.query('BEGIN');
         await client.query(`SET LOCAL lock_timeout = ${this.hubTimeoutMs + 5_000}`);
         await client.query(
           `SET LOCAL idle_in_transaction_session_timeout = ${this.hubTimeoutMs + 15_000}`

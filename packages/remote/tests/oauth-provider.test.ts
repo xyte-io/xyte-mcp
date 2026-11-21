@@ -1193,6 +1193,33 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
   });
 });
 
+// A flight queued on the grant lock (another process refreshing) must not reach hub
+// after drain started: its POST could outlast the shutdown deadline.
+describe('XyteOAuthProvider: drain while a refresh waits on the grant lock', () => {
+  it('sends nothing once it gets the lock: the call fails retryably and the grant is kept', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    let release!: () => void;
+    const holder = store.withGrantLock(grantId, () => new Promise<void>((resolve) => (release = resolve)));
+
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    call.catch(() => undefined);
+    await tick();
+    const drain = provider.drain();
+    release();
+    await holder;
+    await drain;
+
+    await expect(call).rejects.toMatchObject({ kind: 'network', message: 'The server is restarting.' });
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+});
+
 describe('XyteOAuthProvider: revocation', () => {
   it('revoking any token revokes the whole grant and, alone on the sign-in, revokes at hub', async () => {
     const { provider, hub } = makeProvider();

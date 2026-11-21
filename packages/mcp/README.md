@@ -12,7 +12,7 @@ read-only server. The hosted HTTP server is read-only unless `XYTE_MCP_ALLOW_WRI
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models and warranties. This server
-puts that API in front of an agent as three tools instead of 78 hand-written ones — it can
+puts that API in front of an agent as three tools instead of 88 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
 

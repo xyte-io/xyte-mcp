@@ -995,7 +995,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     );
     expect(hub.revokes()).toEqual([]);
     expect(stderr).toContain(
-      `grant ${grantId}: revoked during the hub refresh; a live sibling shares the hub sign-in, so the new hub pair is kept`
+      `grant ${grantId}: revoked during the hub refresh; revoking the new hub pair unless a live sibling shares the hub sign-in`
     );
     expect(siblingHub).toBeDefined();
     expect((await store.getGrant(siblingId))?.hub).toEqual(siblingHub);
@@ -1051,7 +1051,11 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
         ).rejects.toThrow(/sign-in behind this connection has ended/)
       );
       expect(hub.revokes()).toEqual([]);
-      expect(stderr).toContain(`grant ${grantId}: could not check the grant after a lost hub token save`);
+      expect(stderr).toContain(
+        failing === 'getGrant'
+          ? `grant ${grantId}: could not check the grant after a lost hub token save`
+          : `grant ${grantId}: sibling check failed after the revoke`
+      );
       expect(stderr).not.toContain('xort_2');
       expect(stderr).not.toContain('xoat_2');
     }
@@ -1217,9 +1221,12 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
         provider
           .hubHttp(grantId, upstreamOk())
           .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
-      ).rejects.toMatchObject({ kind: 'network', message: 'This connection is busy.' })
+      ).rejects.toMatchObject({
+        kind: 'network',
+        message: 'This Xyte sign-in is busy: another request is refreshing it, or the server is busy.'
+      })
     );
-    expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a hub refresh (55P03)`);
+    expect(stderr).toContain(`grant ${grantId}: grant lock transaction failed for a hub refresh (55P03)`);
     expect(hub.refreshes()).toHaveLength(0);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
@@ -1429,7 +1436,7 @@ describe('XyteOAuthProvider: revocation', () => {
     await tick();
     expect(hub.revokes()).toEqual([]); // waiting on the refresh, not racing it
     answer();
-    await Promise.allSettled([call, revoke]);
+    await Promise.all([call, revoke]); // both succeed: the call with the new pair, then the revoke
 
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
     await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
@@ -1493,7 +1500,7 @@ describe('XyteOAuthProvider: revocation', () => {
     const stderr = await captureStderr(() =>
       expect(provider.revokeToken(client, { token: tokens.access_token })).rejects.toMatchObject({ code: '55P03' })
     );
-    expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a revoke (55P03)`);
+    expect(stderr).toContain(`grant ${grantId}: grant lock transaction failed for a revoke (55P03)`);
     expect(eventsIn(stderr)).toEqual([]);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
     expect(hub.revokes()).toEqual([]);
@@ -1840,16 +1847,40 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('a client revoke of a grant whose hub sign-in is already gone logs only the connection and reason', async () => {
-    const { provider, store } = makeProvider();
+  // Ended by someone else after the revoke's own check: that one logged and revoked it.
+  it('a client revoke of a grant ended before it took the lock logs nothing and revokes nothing at hub', async () => {
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
-    const { grantId, tokens } = await connected(provider, client);
-    // The grant passes the revoke's own check, then its hub sign-in is gone by the time it is read.
+    const { tokens } = await connected(provider, client);
     const getGrant = store.getGrant.bind(store);
-    vi.spyOn(store, 'getGrant').mockImplementationOnce(getGrant).mockResolvedValueOnce(undefined);
+    vi.spyOn(store, 'getGrant').mockImplementationOnce(async (id) => {
+      const grant = await getGrant(id);
+      await store.revokeGrant(id);
+      return grant;
+    });
     const stderr = await captureStderr(() =>
       provider.revokeToken(client, { token: tokens.access_token })
     );
-    expect(eventsIn(stderr)).toEqual([{ event: 'revoke', connection: grantId, reason: 'client' }]);
+    expect(eventsIn(stderr)).toEqual([]);
+    expect(hub.revokes()).toEqual([]);
+  });
+
+  it('a client revoke while the current hub pair is held only in memory revokes that pair at hub', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
+    );
+    save.mockRestore();
+    revoke.mockRestore();
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1'); // xort_2 only in memory
+
+    await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
   });
 });

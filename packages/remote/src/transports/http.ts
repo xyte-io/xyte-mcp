@@ -152,7 +152,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         oauth.databaseUrl,
         // resolveHttpConfig refuses a database without a key.
         new TokenCipher(oauth.tokenKey!, oauth.previousTokenKey),
-        { hubTimeoutMs: config.timeoutMs }
+        config.timeoutMs
       );
     } else {
       store = new MemoryOAuthStore();

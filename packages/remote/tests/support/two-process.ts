@@ -75,6 +75,16 @@ export async function lockWaiters(admin: pg.Pool): Promise<number> {
   return rows[0]!.n;
 }
 
+/** Connections of this schema holding a grant row lock while idle (a holder awaiting the hub). */
+export async function lockHolders(admin: pg.Pool): Promise<number> {
+  const { rows } = await admin.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE state = 'idle in transaction' AND application_name = current_setting('application_name')
+        AND query LIKE '%FOR NO KEY UPDATE%'`
+  );
+  return rows[0]!.n;
+}
+
 export interface FakeHub {
   url: string;
   /** The refresh token of every refresh POST, in arrival order. */

@@ -7,7 +7,14 @@ import { PgOAuthStore } from '../src/oauth/pg-store.js';
 import { XyteOAuthProvider } from '../src/oauth/provider.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
 import { stubHttp } from '../../mcp/tests/support/context.js';
-import { createTestSchema, lockWaiters, startFakeHub, type FakeHub, type TestSchema } from './support/two-process.js';
+import {
+  createTestSchema,
+  lockHolders,
+  lockWaiters,
+  startFakeHub,
+  type FakeHub,
+  type TestSchema
+} from './support/two-process.js';
 
 /**
  * Two providers, each on its own store, over one Postgres database: two server
@@ -39,12 +46,10 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     await schema.drop();
   });
 
-  async function instances(hubTimeoutMs?: number) {
+  async function instances(hubTimeoutMs = 15_000) {
     const pair = [];
     for (let i = 0; i < 2; i += 1) {
-      const store = await PgOAuthStore.connect(schema.databaseUrl, new TokenCipher(KEY), {
-        ...(hubTimeoutMs === undefined ? {} : { hubTimeoutMs })
-      });
+      const store = await PgOAuthStore.connect(schema.databaseUrl, new TokenCipher(KEY), hubTimeoutMs);
       stores.push(store);
       const provider = new XyteOAuthProvider(
         store,
@@ -280,6 +285,71 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     expect(hub.refreshes).toHaveLength(sent + 1);
   });
 
+  // Every save under the lock fails, then so does the commit of the revoke that
+  // follows: the pair is saved (or the grant revoked) outside the lock.
+  it('a save that fails on every try plus a lost commit never leaves the grant live with the burned token', async () => {
+    const [a, b] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    interceptLockStatements(a.store, (sql, run, values) =>
+      sql === 'COMMIT' ? failCommit(sql, run, values) : failRotate(sql, run, values)
+    );
+
+    await captureStderr(() => get(a.provider, grantId).catch(() => undefined));
+    vi.restoreAllMocks();
+    const grant = await b.store.getGrant(grantId);
+    expect(grant?.hub?.refreshToken).not.toBe(refreshToken);
+    expect(grant?.revoked || grant?.hub?.refreshToken === hub.rotatedTo.at(-1)).toBe(true);
+  });
+
+  // A's revoke of an unknown outcome rolled back (hub had not rotated). B then
+  // refreshed and committed a new pair: A's redone revoke must not end it.
+  it('a redone revoke after a lost commit leaves a pair another instance saved meanwhile', async () => {
+    const [a, b] = await instances();
+    const { grantId } = await expiringGrant(a.store);
+    interceptLockStatements(a.store, failCommit);
+    let reached = false;
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    const revokeGrant = a.store.revokeGrant.bind(a.store);
+    vi.spyOn(a.store, 'revokeGrant').mockImplementation(async (...args) => {
+      reached = true;
+      await gate;
+      return revokeGrant(...args);
+    });
+    hub.holdRefreshes = true;
+
+    const call = get(a.provider, grantId);
+    call.catch(() => undefined);
+    await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
+    hub.holdRefreshes = false;
+    hub.dropHeld(); // unknown outcome; hub did not rotate
+    await vi.waitFor(() => expect(reached).toBe(true), { timeout: 5_000 });
+    await get(b.provider, grantId); // B refreshes the unchanged stored token and saves
+    open();
+
+    const stderr = await captureStderr(() =>
+      expect(call).rejects.toMatchObject({ kind: 'network' })
+    );
+    vi.restoreAllMocks();
+    expect(stderr).not.toContain('"event":"revoke"');
+    const grant = await b.store.getGrant(grantId);
+    expect(grant?.revoked).toBe(false);
+    expect(grant?.hub?.refreshToken).toBe(hub.rotatedTo.at(-1));
+  });
+
+  it('a revoke whose commit is lost fails the request, is logged, and leaves the grant live', async () => {
+    const [a] = await instances();
+    const { client, grantId, accessToken } = await expiringGrant(a.store);
+    interceptLockStatements(a.store, failCommit);
+
+    const stderr = await captureStderr(() =>
+      expect(a.provider.revokeToken(client, { token: accessToken })).rejects.toMatchObject({ code: '08006' })
+    );
+    vi.restoreAllMocks();
+    expect(stderr).toContain(`grant ${grantId}: grant lock transaction failed for a revoke (08006)`);
+    expect(await revokedInDb(grantId)).toBe(false);
+  });
+
   // pg-pool drops its idle 'error' listener on checkout: unhandled, the server
   // ending the session mid hub refresh would crash the whole process.
   it('a lock connection the server ends during the hub refresh does not crash the process: the pair is saved outside the lock', async () => {
@@ -290,12 +360,12 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
 
     const call = get(a.provider, grantId);
     await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
-    const { rows } = await schema.admin.query(
-      `SELECT pg_terminate_backend(pid) AS ended FROM pg_stat_activity
+    expect(await lockHolders(schema.admin)).toBe(1);
+    await schema.admin.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
         WHERE application_name = current_setting('application_name')
           AND state = 'idle in transaction' AND query LIKE '%FOR NO KEY UPDATE%'`
     );
-    expect(rows).toEqual([{ ended: true }]);
     await new Promise((resolve) => setTimeout(resolve, 300)); // the session's end reaches the client
     hub.holdRefreshes = false;
     hub.releaseHeld();
@@ -361,7 +431,7 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
       await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [grantId]);
       await expect(get(b.provider, grantId)).rejects.toMatchObject({
         kind: 'network',
-        message: 'This connection is busy.'
+        message: 'This Xyte sign-in is busy: another request is refreshing it, or the server is busy.'
       });
     } finally {
       await holder.query('ROLLBACK');

@@ -4,6 +4,7 @@ import {
   createTestSchema,
   freePort,
   listDevices,
+  lockHolders,
   lockWaiters,
   newTokenKey,
   serverEnv,
@@ -139,6 +140,7 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     void listDevices(servers[0]!.base, accessToken).catch(() => undefined);
     await vi.waitFor(() => expect(hub.held()).toBe(1), { timeout: 5_000 });
     const sent = hub.refreshes.at(-1)!;
+    expect(await lockHolders(schema.admin)).toBe(1); // the refreshing process holds the row
     await servers[0]!.kill();
     hub.holdRefreshes = false;
     hub.dropHeld(); // hub never processed it: the token is not burned

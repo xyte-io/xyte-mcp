@@ -105,18 +105,21 @@ argument. A field without a value is left out.
 
 When the hub rejects a tool call's token and the token refresh that follows fails, the
 `tool_call` line has `outcome` `error` and no `status`. The reason is on the `hub_refresh` line
-of the same `connection` just before it.
+of the same `connection` just before it; if there is none, look for that grant's
+`grant lock transaction failed for a hub refresh` line (below).
 
 One connection's hub refresh runs once at a time across all server processes (a Postgres row
 lock); a revoke of the connection waits for it too. A call that waits longer than the hub
-timeout plus 5 s (20 s by default) for the lock fails with a retryable error and an
-`[xyte-mcp] error: grant <id>: could not lock the grant for a hub refresh (<code>)` line
-(`55P03` for the lock wait); nothing was sent to the hub, and the connection is kept. When
-all 3 lock connections of the process are busy, the call first waits up to 10 s for one, so
-the worst case is about the hub timeout plus 15 s; a failed wait for a connection shows the
-error's class name instead of a `55P03` code. A disconnect that cannot get
-the lock in that time answers `500`, with an `[xyte-mcp] error: grant <id>: could not lock the
-grant for a revoke (<code>)` line; the connection is not revoked, and the client may retry.
+timeout plus 5 s (20 s by default) for the lock fails with a retryable error ("This Xyte
+sign-in is busy") and an `[xyte-mcp] error: grant <id>: grant lock transaction failed for a
+hub refresh (<code>)` line (`55P03` for the lock wait; another code when the lock's database
+transaction failed some other way); nothing was sent to the hub, and the connection is kept.
+When all 3 lock connections of the process are busy, the call first waits up to 10 s for one,
+so the worst case is about the hub timeout plus 15 s; a failed wait for a connection shows the
+code literally as `Error`. A disconnect that cannot get the lock in that time answers `500`,
+with an `[xyte-mcp] error: grant <id>: grant lock transaction failed for a revoke (<code>)`
+line; the connection is not revoked, and the client may retry. During shutdown a disconnect
+answers `400` `temporarily_unavailable`, with no log line.
 
 Saving the new tokens after a hub refresh is retried while the lock is held, and if every try
 fails the connection is revoked under the same lock (`hub_save_failed`). Only when the lock's

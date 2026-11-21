@@ -94,8 +94,12 @@ export interface OAuthStore {
 
   createGrant(clientId: string, hub: HubSignIn): Promise<string>;
   getGrant(grantId: string): Promise<GrantRecord | undefined>;
-  /** Also drops the grant's hub tokens: nothing may use them after this. */
-  revokeGrant(grantId: string): Promise<void>;
+  /**
+   * Also drops the grant's hub tokens: nothing may use them after this. With
+   * `onlyIfRefreshToken`, only while the grant still holds that hub refresh
+   * token. True when this call revoked it.
+   */
+  revokeGrant(grantId: string, onlyIfRefreshToken?: string): Promise<boolean>;
   /**
    * Store a rotated hub token pair — only if the grant still holds
    * `previousRefreshToken`. False means someone else rotated first.
@@ -113,9 +117,10 @@ export interface OAuthStore {
   /**
    * Runs `fn` holding the grant's lock, across every process on the store: the
    * hub refresh and the revoke of one grant take turns, so a single-use hub
-   * refresh token is never sent twice. `fn` gets the grant read under the lock;
-   * its writes and the release are one commit (Postgres), and a throw rolls
-   * them back. Inside `fn`, read and write the grant only through `locked`:
+   * refresh token is never sent twice. `fn` gets the grant read under the lock.
+   * Postgres only: its writes and the release are one commit, and a throw rolls
+   * them back (the memory store keeps what `fn` wrote before throwing). Inside
+   * `fn`, read and write the grant only through `locked`:
    * getGrant or revokeGrant there would wait on the lock `fn` holds.
    */
   withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T>;
@@ -194,13 +199,14 @@ export class MemoryOAuthStore implements OAuthStore {
     return grant && { ...grant };
   }
 
-  async revokeGrant(grantId: string): Promise<void> {
+  async revokeGrant(grantId: string, onlyIfRefreshToken?: string): Promise<boolean> {
     const grant = this.grants.get(grantId);
-    if (grant && !grant.revoked) {
-      this.grantRevokedAt.set(grantId, Math.floor(Date.now() / 1000));
-      grant.revoked = true;
-      delete grant.hub;
-    }
+    if (!grant || grant.revoked) return false;
+    if (onlyIfRefreshToken !== undefined && grant.hub?.refreshToken !== onlyIfRefreshToken) return false;
+    this.grantRevokedAt.set(grantId, Math.floor(Date.now() / 1000));
+    grant.revoked = true;
+    delete grant.hub;
+    return true;
   }
 
   async rotateHubTokens(
@@ -237,7 +243,9 @@ export class MemoryOAuthStore implements OAuthStore {
       fn({
         grant: await this.getGrant(grantId),
         rotate: (previous, next) => this.rotateHubTokens(grantId, previous, next),
-        revoke: () => this.revokeGrant(grantId)
+        revoke: async () => {
+          await this.revokeGrant(grantId);
+        }
       })
     );
     const tail = run.catch(() => undefined);

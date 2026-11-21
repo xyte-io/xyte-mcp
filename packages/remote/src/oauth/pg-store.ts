@@ -449,8 +449,10 @@ export class PgOAuthStore implements OAuthStore {
   static async connect(
     databaseUrl: string,
     cipher: TokenCipher,
-    { hubTimeoutMs = 15_000 }: { hubTimeoutMs?: number } = {}
+    /** The hub client's timeout (XYTE_MCP_TIMEOUT_MS); capped at 10 minutes. */
+    hubTimeoutMs: number
   ): Promise<PgOAuthStore> {
+    const hubWaitMs = Math.min(hubTimeoutMs, 600_000);
     let migrationPool: pg.Pool | undefined;
     let pool: pg.Pool | undefined;
     let lockPool: pg.Pool | undefined;
@@ -477,11 +479,12 @@ export class PgOAuthStore implements OAuthStore {
       // An idle client dropped server-side (maintenance, failover) is emitted here;
       // unhandled, it exits the process. The pool replaces the client on its own.
       pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
-      // No query_timeout: a lock holder's transaction spans a hub refresh, and
-      // a waiter is bounded server-side by lock_timeout (see withGrantLock).
+      // query_timeout is per statement, so the hub POST between statements is
+      // not bounded by it; it sits above the SELECT's lock_timeout (hub + 5 s),
+      // and with keepAlive it ends a statement hung on a half-open connection.
       // ponytail: 3 grants refreshing at once per process; more wait for a
       // connection (10 s, then a retryable error). Raise it if that shows up.
-      lockPool = new pg.Pool({ ...connection, max: 3 });
+      lockPool = new pg.Pool({ ...connection, max: 3, keepAlive: true, query_timeout: hubWaitMs + 10_000 });
       lockPool.on('error', (error) => logError(`postgres grant lock pool: ${errorCodeOf(error)}`));
     } catch (error) {
       await pool?.end().catch(() => {});
@@ -499,8 +502,6 @@ export class PgOAuthStore implements OAuthStore {
       `OAuth store: hub token key id ${cipher.currentKeyId}` +
         (cipher.previousKeyId ? ` (previous: ${cipher.previousKeyId})` : '')
     );
-    // Clamped, so the grant lock's SET LOCAL values are always valid integers.
-    const hubWaitMs = Number.isFinite(hubTimeoutMs) ? Math.min(Math.max(Math.round(hubTimeoutMs), 0), 600_000) : 15_000;
     return new PgOAuthStore(pool, lockPool, cipher, hubWaitMs);
   }
 
@@ -549,20 +550,26 @@ export class PgOAuthStore implements OAuthStore {
     return row && this.grantOf(row, this.pool);
   }
 
-  /** A grant row as a record; an unreadable one is revoked through `db`. */
-  private async grantOf(row: GrantRow, db: Queryable): Promise<GrantRecord> {
+  /**
+   * A grant row as a record; an unreadable one is revoked through `db`. Inside
+   * a transaction, pass `afterCommit`: the revoke event waits for the commit.
+   */
+  private async grantOf(row: GrantRow, db: Queryable, afterCommit?: Array<() => void>): Promise<GrantRecord> {
     const tokens = this.hubTokensOf(row);
     if (tokens === 'unreadable') {
       // Revoked, not just signed out: a grant left unrevoked would still count
       // as a live sibling and skip the hub revoke of the user's next sign-in.
       await revokeGrantOn(db, row.id);
-      if (row.revoked_at === null) {
+      const logRevoke = () =>
         logEvent('revoke', {
           connection: row.id,
           organization: row.hub_tenant,
           user: row.hub_sub,
           reason: 'unreadable_token'
         });
+      if (row.revoked_at === null) {
+        if (afterCommit) afterCommit.push(logRevoke);
+        else logRevoke();
       }
       return { id: row.id, clientId: row.client_id, revoked: true };
     }
@@ -605,8 +612,8 @@ export class PgOAuthStore implements OAuthStore {
     }
   }
 
-  async revokeGrant(grantId: string): Promise<void> {
-    await revokeGrantOn(this.pool, grantId);
+  async revokeGrant(grantId: string, onlyIfRefreshToken?: string): Promise<boolean> {
+    return revokeGrantOn(this.pool, grantId, onlyIfRefreshToken);
   }
 
   async rotateHubTokens(
@@ -655,8 +662,16 @@ export class PgOAuthStore implements OAuthStore {
     if (this.closing) {
       throw new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.']);
     }
-    const client = await this.lockPool.connect();
+    let client: pg.PoolClient;
+    try {
+      client = await this.lockPool.connect();
+    } catch (error) {
+      // close() ended the pool after the check above.
+      if (this.closing) throw new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.']);
+      throw error;
+    }
     let failed = false;
+    const afterCommit: Array<() => void> = [];
     // pg-pool drops its idle 'error' listener on checkout. Unhandled, the server
     // ending this session while fn awaits hub (idle in transaction) would crash
     // the process; the next statement on the client then fails instead.
@@ -677,7 +692,7 @@ export class PgOAuthStore implements OAuthStore {
           [grantId]
         );
         const result = await fn({
-          grant: rows[0] && (await this.grantOf(rows[0], client)),
+          grant: rows[0] && (await this.grantOf(rows[0], client, afterCommit)),
           // In a savepoint, so a failed try leaves the transaction (and the lock) usable for the next.
           rotate: async (previous, next) => {
             await client.query('SAVEPOINT rotate');
@@ -690,9 +705,12 @@ export class PgOAuthStore implements OAuthStore {
               throw error;
             }
           },
-          revoke: () => revokeGrantOn(client, grantId)
+          revoke: async () => {
+            await revokeGrantOn(client, grantId);
+          }
         });
         await client.query('COMMIT');
+        for (const log of afterCommit) log();
         return result;
       } catch (error) {
         failed = true;
@@ -786,14 +804,18 @@ export class PgOAuthStore implements OAuthStore {
       ['tokens', 'DELETE FROM oauth_tokens WHERE expires_at <= to_timestamp($1)', [now]],
       [
         'grants',
-        `DELETE FROM oauth_grants g
-          WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)
-            AND (g.revoked_at < to_timestamp($1)
-              -- An orphan: its sign-in was at the hub when its client was swept.
-              OR (g.revoked_at IS NULL
-                AND NOT EXISTS (SELECT 1 FROM oauth_clients c WHERE c.client_id = g.client_id))
-              -- Abandoned: hub has ended its sign-in chain.
-              OR (g.revoked_at IS NULL AND g.created_at < to_timestamp($2)))`,
+        // SKIP LOCKED: a grant held by the grant lock (a hub refresh) waits for
+        // the next run instead of failing the step on the pool's lock_timeout.
+        `DELETE FROM oauth_grants WHERE id IN (
+           SELECT g.id FROM oauth_grants g
+            WHERE NOT EXISTS (SELECT 1 FROM oauth_tokens t WHERE t.grant_id = g.id)
+              AND (g.revoked_at < to_timestamp($1)
+                -- An orphan: its sign-in was at the hub when its client was swept.
+                OR (g.revoked_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM oauth_clients c WHERE c.client_id = g.client_id))
+                -- Abandoned: hub has ended its sign-in chain.
+                OR (g.revoked_at IS NULL AND g.created_at < to_timestamp($2)))
+            FOR UPDATE SKIP LOCKED)`,
         [now - REVOKED_GRANT_RETENTION_SECONDS, now - ABANDONED_GRANT_RETENTION_SECONDS]
       ],
       [
@@ -831,13 +853,18 @@ export class PgOAuthStore implements OAuthStore {
   }
 }
 
-/** Also drops the hub tokens: nothing may use them after this. */
-async function revokeGrantOn(db: Queryable, grantId: string): Promise<void> {
-  await db.query(
+/**
+ * Also drops the hub tokens: nothing may use them after this. With
+ * `onlyIfRefreshToken`, only while the grant still holds that refresh token.
+ * True when this call revoked it.
+ */
+async function revokeGrantOn(db: Queryable, grantId: string, onlyIfRefreshToken?: string): Promise<boolean> {
+  const result = await db.query(
     `UPDATE oauth_grants
         SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL,
             hub_refresh_token_hash = NULL
-      WHERE id = $1 AND revoked_at IS NULL`,
-    [grantId]
+      WHERE id = $1 AND revoked_at IS NULL AND ($2::text IS NULL OR hub_refresh_token_hash = $2)`,
+    [grantId, onlyIfRefreshToken === undefined ? null : hashToken(onlyIfRefreshToken)]
   );
+  return result.rowCount === 1;
 }

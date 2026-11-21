@@ -1006,7 +1006,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const get = () => http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
 
     await get();
-    expect(save).toHaveBeenCalledTimes(3); // the DB write is retried...
+    expect(save).toHaveBeenCalledTimes(4); // the DB write under the lock, retried 3 times after it...
     expect(hub.refreshes()).toHaveLength(1); // ...the hub POST is not
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
 
@@ -1026,29 +1026,6 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
     expect(hub.refreshes()[1]!.form.get('refresh_token')).toBe('xort_2');
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_3');
-  });
-
-  it('invalid_grant with a stale refresh token does not revoke: the rotated token is used', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId, tokens } = await connected(provider, client);
-    hub.onRefresh = async () => {
-      // Someone else rotated while our POST was in flight.
-      await store.rotateHubTokens(grantId, 'xort_1', {
-        accessToken: 'xoat_other',
-        refreshToken: 'xort_other',
-        expiresAt: Math.floor(Date.now() / 1000) + 3600
-      });
-      return json(400, { error: 'invalid_grant' });
-    };
-    const upstream = upstreamOk();
-
-    await provider
-      .hubHttp(grantId, upstream)
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
-    expect(upstream.calls[0]!.headers.Authorization).toBe('Bearer xoat_other');
-    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
 
   it('invalid_grant with the current refresh token revokes the grant: tool error now, 401 next', async () => {
@@ -1107,6 +1084,28 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       message: expect.stringMatching(/refresh failed: 401/)
     });
     expect(hub.refreshes()).toHaveLength(1);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  // A lock wait past lock_timeout, no free connection, a failed BEGIN: nothing reached hub.
+  it('fails retryably, keeping the grant and asking hub nothing, when the grant lock cannot be taken', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' })
+    );
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider
+          .hubHttp(grantId, upstreamOk())
+          .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toMatchObject({ kind: 'network', message: 'Another request is refreshing this connection.' })
+    );
+    expect(stderr).toContain(`grant ${grantId}: could not lock the grant for a hub refresh (55P03)`);
+    expect(hub.refreshes()).toHaveLength(0);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
 });
@@ -1270,7 +1269,7 @@ describe('XyteOAuthProvider: revocation', () => {
     hub.expiresIn = 30; // every call wants a refresh
     const client = await registeredClient(provider);
     const { grantId, tokens } = await connected(provider, client);
-    // Hold revoke inside its window: after it marks the grant, before it is revoked.
+    // Hold revoke inside the grant lock, before it revokes.
     const getGrant = store.getGrant.bind(store);
     let reads = 0;
     let release!: () => void;
@@ -1286,10 +1285,11 @@ describe('XyteOAuthProvider: revocation', () => {
     const call = provider
       .hubHttp(grantId, stubHttp(() => ({ data: {} })))
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
-    await expect(call).rejects.toMatchObject({ kind: 'auth' });
+    await vi.waitFor(() => expect(reads).toBe(3)); // the call's read, before it queues on the lock
 
     release();
     await revoke;
+    await expect(call).rejects.toMatchObject({ kind: 'auth' });
     expect(hub.refreshes()).toHaveLength(0);
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_1']);
   });
@@ -1572,27 +1572,6 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('invalid_grant after someone else rotated logs hub_refresh already_rotated, not invalid_grant', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId } = await connected(provider, client);
-    hub.onRefresh = async () => {
-      await store.rotateHubTokens(grantId, 'xort_1', {
-        accessToken: 'xoat_other',
-        refreshToken: 'xort_other',
-        expiresAt: Math.floor(Date.now() / 1000) + 3600
-      });
-      return json(400, { error: 'invalid_grant' });
-    };
-    const stderr = await captureStderr(() =>
-      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
-    );
-    expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'already_rotated', hub_status: 400 }
-    ]);
-  });
-
   it('an unknown refresh outcome logs hub_refresh unknown (with a 5xx status), then revoke refresh_unknown', async () => {
     const { provider, hub } = makeProvider();
     hub.expiresIn = 30;
@@ -1620,24 +1599,6 @@ describe('XyteOAuthProvider: log events', () => {
     expect(eventsIn(stderr)).toEqual([
       { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'unknown' },
       { event: 'revoke', connection: grantId, reason: 'refresh_unknown', organization: 'org-1', user: 'user-1' }
-    ]);
-  });
-
-  it('invalid_grant on a grant already ended meanwhile logs hub_refresh, but no second revoke', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId } = await connected(provider, client);
-    // The operator's SQL cut-off lands while the refresh is at the hub.
-    hub.onRefresh = async () => {
-      await store.revokeGrant(grantId);
-      return json(400, { error: 'invalid_grant' });
-    };
-    const stderr = await captureStderr(() =>
-      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
-    );
-    expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 }
     ]);
   });
 

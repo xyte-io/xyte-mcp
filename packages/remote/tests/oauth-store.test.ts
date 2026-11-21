@@ -206,6 +206,53 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     expect((await store().getGrant(id))?.hub).toBeUndefined();
   });
 
+  // The hub refresh single-flight across processes: one holder per grant, each
+  // reading what the previous holder saved.
+  it('runs grant lock holders one at a time, each reading the last one\'s save under the lock', async () => {
+    const id = await store().createGrant('c1', signIn());
+    const other = await store().createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    const order: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+
+    const first = store().withGrantLock(id, async (locked) => {
+      order.push('first');
+      expect(await locked.rotate('xort_1', next)).toBe(true);
+      await held;
+    });
+    await vi.waitFor(() => expect(order).toEqual(['first']));
+    const second = store().withGrantLock(id, async (locked) => {
+      order.push('second');
+      return locked.grant?.hub?.refreshToken;
+    });
+    // Another grant is not queued behind this one.
+    expect(await store().withGrantLock(other, async (locked) => locked.grant?.id)).toBe(other);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual(['first']);
+
+    release();
+    await first;
+    expect(await second).toBe('xort_2');
+    expect(order).toEqual(['first', 'second']);
+  });
+
+  it('frees the grant lock when the holder throws, and revokes through it', async () => {
+    const id = await store().createGrant('c1', signIn());
+    await expect(
+      store().withGrantLock(id, async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    await store().withGrantLock(id, (locked) => locked.revoke());
+    expect(await store().withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    expect(await store().withGrantLock('999999', async (locked) => locked.grant)).toBeUndefined();
+  });
+
   describe('sweepExpiredOAuthRows', () => {
     const DAY = 24 * 60 * 60;
     const client = (id: string) =>
@@ -667,6 +714,38 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
         .rowCount
     ).toBe(1);
     expect(await store.hasLiveHubSibling('user-1', 'org-1', next)).toBe(false);
+  });
+
+  // getGrant's revoke runs on the main pool and would wait on the row the lock holds.
+  it('revokes an unreadable grant read under the grant lock on the locked connection', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    expect(await store.withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    vi.restoreAllMocks();
+    expect(logText()).toContain('"reason":"unreadable_token"');
+    expect((await row(id)).hub_refresh_token).toBeNull();
+  });
+
+  it('rolls back what the grant lock holder wrote when it throws', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    await expect(
+      store.withGrantLock(id, async (locked) => {
+        await locked.rotate('xort_1', next);
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    expect((await row(id)).hub_refresh_token_hash).toBe(hashToken('xort_1'));
   });
 
   // An old dyno still serving during the deploy writes plain text.

@@ -1,0 +1,151 @@
+import { randomBytes } from 'node:crypto';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { createHubOAuth } from '../src/oauth/hub-oauth.js';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
+import { XyteOAuthProvider } from '../src/oauth/provider.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
+import { stubHttp } from '../../mcp/tests/support/context.js';
+import { createTestSchema, lockWaiters, startFakeHub, type FakeHub, type TestSchema } from './support/two-process.js';
+
+/**
+ * Two providers, each on its own store, over one Postgres database: two server
+ * processes in one test process. The hub refresh of a grant is serialized by a
+ * row lock, so they never send one single-use hub refresh token twice.
+ */
+
+const PG_URL = process.env.TEST_DATABASE_URL;
+const ISSUER = 'https://mcp.test';
+const KEY = randomBytes(32);
+const NOW = () => Math.floor(Date.now() / 1000);
+
+describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () => {
+  let schema: TestSchema;
+  let hub: FakeHub;
+  const stores: PgOAuthStore[] = [];
+
+  beforeAll(async () => {
+    schema = await createTestSchema(PG_URL!);
+    hub = await startFakeHub();
+  });
+  afterEach(async () => {
+    hub.releaseHeld();
+    hub.holdRefreshes = false;
+    await Promise.all(stores.splice(0).map((store) => store.close()));
+  });
+  afterAll(async () => {
+    await hub.close();
+    await schema.drop();
+  });
+
+  async function instances(hubTimeoutMs?: number) {
+    const pair = [];
+    for (let i = 0; i < 2; i += 1) {
+      const store = await PgOAuthStore.connect(schema.databaseUrl, new TokenCipher(KEY), {
+        ...(hubTimeoutMs === undefined ? {} : { hubTimeoutMs })
+      });
+      stores.push(store);
+      const provider = new XyteOAuthProvider(
+        store,
+        createHubOAuth({
+          hubUrl: hub.url,
+          clientId: 'mcp-client',
+          clientSecret: 's3cret',
+          redirectUri: `${ISSUER}/oauth/callback`,
+          timeoutMs: 10_000
+        }),
+        ISSUER
+      );
+      pair.push({ store, provider });
+    }
+    return pair as [(typeof pair)[0], (typeof pair)[0]];
+  }
+
+  /** A grant whose hub token is inside the refresh window, with a live access token. */
+  async function expiringGrant(store: PgOAuthStore) {
+    const refreshToken = `xort_seed_${randomBytes(4).toString('hex')}`;
+    const client = { client_id: 'c1', redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull;
+    await store.saveClient(client);
+    const grantId = await store.createGrant('c1', {
+      accessToken: 'xoat_seed',
+      refreshToken,
+      expiresAt: NOW() + 30,
+      sub: `user-${refreshToken}`,
+      tenantId: 'org-1'
+    });
+    const accessToken = `xmcp_at_${randomBytes(8).toString('hex')}`;
+    await store.saveToken({ token: accessToken, kind: 'access', grantId, expiresAt: NOW() + 600 });
+    return { client, grantId, accessToken, refreshToken };
+  }
+
+  const get = (provider: XyteOAuthProvider, grantId: string, upstream = stubHttp(() => ({ data: {} }))) =>
+    provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${hub.url}/x`, headers: {}, endpointKey: 'k' });
+
+  it('sends one hub refresh between both instances for parallel calls on an expiring token', async () => {
+    const [a, b] = await instances();
+    const { grantId, refreshToken } = await expiringGrant(a.store);
+    const before = hub.refreshes.length;
+    hub.holdRefreshes = true;
+    const upstream = stubHttp(() => ({ data: {} }));
+
+    const calls = [a, b].flatMap(({ provider }) =>
+      Array.from({ length: 5 }, () => get(provider, grantId, upstream))
+    );
+    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    // The other instance is queued on the grant's row, not refreshing on its own.
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    hub.holdRefreshes = false;
+    hub.releaseHeld();
+    await Promise.all(calls);
+
+    expect(hub.refreshes.slice(before)).toEqual([refreshToken]);
+    const fresh = (await a.store.getGrant(grantId))!.hub!.accessToken;
+    expect(upstream.calls.map((call) => call.headers.Authorization)).toEqual(Array(10).fill(`Bearer ${fresh}`));
+    expect((await b.store.getGrant(grantId))?.revoked).toBe(false);
+  });
+
+  it('a revoke on one instance waits for the other one\'s refresh, then revokes the new hub token', async () => {
+    const [a, b] = await instances();
+    const { client, grantId, accessToken } = await expiringGrant(a.store);
+    const before = hub.refreshes.length;
+    hub.holdRefreshes = true;
+
+    const call = get(a.provider, grantId);
+    await vi.waitFor(() => expect(hub.held()).toBe(1));
+    let revoked = false;
+    const revoke = b.provider.revokeToken(client, { token: accessToken }).then(() => (revoked = true));
+    await vi.waitFor(async () => expect(await lockWaiters(schema.admin)).toBe(1));
+    expect(revoked).toBe(false);
+    hub.holdRefreshes = false;
+    hub.releaseHeld();
+    await call;
+    await revoke;
+
+    expect(hub.refreshes).toHaveLength(before + 1);
+    expect(hub.revokes.at(-1)).toBe(hub.rotatedTo.at(-1));
+    // Nothing is minted after the revoke.
+    await expect(get(a.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    await expect(get(b.provider, grantId)).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes).toHaveLength(before + 1);
+  });
+
+  it('a waiter past the lock timeout gets a retryable error and never sends the refresh token', async () => {
+    const [, b] = await instances(0); // lock_timeout: 5 s
+    const { grantId } = await expiringGrant(b.store);
+    const before = hub.refreshes.length;
+    const holder = await schema.admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE', [grantId]);
+      await expect(get(b.provider, grantId)).rejects.toMatchObject({
+        kind: 'network',
+        message: 'Another request is refreshing this connection.'
+      });
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+    }
+    expect(hub.refreshes).toHaveLength(before);
+    expect((await b.store.getGrant(grantId))?.revoked).toBe(false);
+  }, 15_000);
+});

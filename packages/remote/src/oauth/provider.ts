@@ -80,16 +80,15 @@ const EXPIRED = 'Authorization expired or invalid. Restart the connection.';
 
 export class XyteOAuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
-  // ponytail: in-memory, as is the refresh single-flight below — which is why
-  // the Procfile pins one dyno. A restart mid-login just makes the user retry.
+  // ponytail: pending sign-ins are in this process's memory, which is why the
+  // Procfile pins one dyno. A restart mid-login just makes the user retry.
   private readonly pending = new Map<string, PendingAuthorization>();
+  /** This process's hub refresh per grant; across processes, the store's grant lock serializes them. */
   private readonly refreshing = new Map<string, Promise<string>>();
   /** Rotated hub pairs the store failed to save, used in place of the stored ones. */
   private readonly unsaved = new Map<string, HubTokens>();
   /** Set by drain(): no new hub refresh may start, so its snapshot is final. */
   private draining = false;
-  /** Grants being revoked: no new hub refresh may start on them (it would burn the token revoke sends). */
-  private readonly ending = new Set<string>();
 
   constructor(
     private readonly store: OAuthStore,
@@ -369,7 +368,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   /**
    * Single-flight per grant: hub refresh tokens are single-use, so concurrent
    * calls must share one refresh rather than race (a loser's replay would be
-   * read by hub as theft). One process only — see the Procfile.
+   * read by hub as theft). Calls in this process share one flight; flights in
+   * other processes queue on the store's grant lock (doRefresh).
    */
   private refreshHub(grantId: string, staleAccessToken: string): Promise<string> {
     let flight = this.refreshing.get(grantId);
@@ -380,9 +380,6 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
         );
       }
-      // Revoke read the refresh token it is about to send hub; rotating it now
-      // would make that send a replay of a burned token.
-      if (this.ending.has(grantId)) return Promise.reject(signInGone());
       flight = this.doRefresh(grantId, staleAccessToken).finally(() => {
         this.refreshing.delete(grantId);
       });
@@ -391,66 +388,94 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     return flight;
   }
 
+  /**
+   * Under the grant lock, so a refresh or revoke in another process waits:
+   * re-read the pair, return one a flight elsewhere already rotated, else send
+   * hub the refresh token once and save its answer in the lock's commit.
+   */
   private async doRefresh(grantId: string, staleAccessToken: string): Promise<string> {
-    const live = await this.liveHub(grantId);
-    if (!live) throw signInGone();
-    const { hub, stored } = live;
-    // An earlier flight already replaced the token this caller saw.
-    if (
-      hub.accessToken !== staleAccessToken &&
-      hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS
-    ) {
-      return hub.accessToken;
-    }
-
-    const sent = hub.refreshToken;
-    // Sent once, never retried: once hub answers, `sent` is burned.
-    let next: HubTokens | 'invalid_grant';
+    let posted = false;
+    /** Set once hub answered with a new pair: from then on it must not be lost. */
+    const answered: { hub?: HubSignIn; stored?: string; next?: HubTokens; saved?: boolean } = {};
+    let accessToken: string;
     try {
-      next = await this.hub.refresh(sent);
+      accessToken = await this.store.withGrantLock(grantId, async (locked) => {
+        if (!locked.grant?.hub || locked.grant.revoked) {
+          this.unsaved.delete(grantId);
+          throw signInGone();
+        }
+        const stored = locked.grant.hub.refreshToken;
+        const hub = { ...locked.grant.hub, ...this.unsaved.get(grantId) };
+        // A flight here or in another process already replaced the token this caller saw.
+        if (
+          hub.accessToken !== staleAccessToken &&
+          hub.expiresAt - nowSeconds() > HUB_REFRESH_SKEW_SECONDS
+        ) {
+          return hub.accessToken;
+        }
+
+        // Sent once, never retried: once hub answers, it is burned.
+        posted = true;
+        let next: HubTokens | 'invalid_grant';
+        try {
+          next = await this.hub.refresh(hub.refreshToken);
+        } catch (error) {
+          const hubStatus = error instanceof HubRefreshError ? error.status : undefined;
+          // A plain 4xx rejection ('auth') never rotated anything: keep the grant.
+          if (error instanceof XyteError && error.kind === 'auth') {
+            logEvent('hub_refresh', {
+              ...whoOf(grantId, hub),
+              outcome: hubStatus === 429 ? 'rate_limited' : 'rejected',
+              hub_status: hubStatus
+            });
+            throw error;
+          }
+          logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'unknown', hub_status: hubStatus });
+          // Timeout, network, 5xx or an unreadable 200: hub may have rotated and
+          // burned the token. A replay inside hub's 60 s window only gets invalid_grant
+          // (no pair), and one after it ends the user's sign-in — so it is never
+          // sent again: the grant ends here and the client reconnects.
+          // Only our own messages: a JSON parse error would quote the response body.
+          logError(
+            `grant ${grantId}: hub refresh outcome unknown ` +
+              `(${error instanceof XyteError ? error.message : 'unreadable hub response'}); ending the grant`
+          );
+          await locked.revoke();
+          this.unsaved.delete(grantId);
+          logEvent('revoke', { ...whoOf(grantId, hub), reason: 'refresh_unknown' });
+          throw signInGone();
+        }
+        if (next === 'invalid_grant') {
+          logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'invalid_grant', hub_status: 400 });
+          await locked.revoke();
+          this.unsaved.delete(grantId);
+          logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });
+          throw signInGone();
+        }
+        logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
+        Object.assign(answered, { hub, stored, next });
+        answered.saved = await locked.rotate(stored, next);
+        return next.accessToken;
+      });
     } catch (error) {
-      const hubStatus = error instanceof HubRefreshError ? error.status : undefined;
-      // A plain 4xx rejection ('auth') never rotated anything: keep the grant.
-      if (error instanceof XyteError && error.kind === 'auth') {
-        logEvent('hub_refresh', {
-          ...whoOf(grantId, hub),
-          outcome: hubStatus === 429 ? 'rate_limited' : 'rejected',
-          hub_status: hubStatus
-        });
-        throw error;
+      if (answered.next) {
+        // The save or its commit failed after hub answered: save outside the lock.
+        await this.saveHubTokens(grantId, answered.hub!, answered.stored!, answered.next);
+        return answered.next.accessToken;
       }
-      logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'unknown', hub_status: hubStatus });
-      // Timeout, network, 5xx or an unreadable 200: hub may have rotated and
-      // burned `sent`. A replay inside hub's 60 s window only gets invalid_grant
-      // (no pair), and one after it ends the user's sign-in — so `sent` is never
-      // sent again: the grant ends here and the client reconnects.
-      // Only our own messages: a JSON parse error would quote the response body.
-      logError(
-        `grant ${grantId}: hub refresh outcome unknown ` +
-          `(${error instanceof XyteError ? error.message : 'unreadable hub response'}); ending the grant`
-      );
-      await this.store.revokeGrant(grantId);
-      this.unsaved.delete(grantId);
-      logEvent('revoke', { ...whoOf(grantId, hub), reason: 'refresh_unknown' });
-      throw signInGone();
+      if (posted || error instanceof XyteError) throw error;
+      // No lock (another refresh holds it past lock_timeout, no connection, a
+      // failed BEGIN): nothing was sent to hub, so the call may simply retry.
+      logError(`grant ${grantId}: could not lock the grant for a hub refresh (${errorCodeOf(error)})`);
+      throw new XyteError('network', 'Another request is refreshing this connection.', [
+        'Retry in a few seconds.'
+      ]);
     }
-    if (next === 'invalid_grant') {
-      const current = await this.liveHub(grantId);
-      if (current && current.hub.refreshToken !== sent) {
-        logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'already_rotated', hub_status: 400 });
-        return current.hub.accessToken; // Someone else rotated; theirs is good.
-      }
-      logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'invalid_grant', hub_status: 400 });
-      await this.store.revokeGrant(grantId);
-      this.unsaved.delete(grantId);
-      // Undefined: the grant was ended meanwhile (the operator's SQL cut-off),
-      // so this refresh did not end it.
-      if (current) logEvent('revoke', { ...whoOf(grantId, hub), reason: 'invalid_grant' });
-      throw signInGone();
+    if (answered.next) {
+      if (answered.saved) this.unsaved.delete(grantId);
+      else await this.lostHubTokenSave(grantId, answered.hub!, answered.next);
     }
-    logEvent('hub_refresh', { ...whoOf(grantId, hub), outcome: 'ok' });
-    await this.saveHubTokens(grantId, hub, stored, next);
-    return next.accessToken;
+    return accessToken;
   }
 
   /**
@@ -488,35 +513,43 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         return;
       }
       this.unsaved.delete(grantId);
-      if (rotated) return;
-      let sibling: boolean;
-      try {
-        if (await this.liveHub(grantId)) {
-          logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
-          return;
-        }
-        // Same rule as a disconnect: hub's revoke ends the sign-in for every client.
-        sibling = await this.store.hasLiveHubSibling(signIn.sub, signIn.tenantId, grantId);
-      } catch (error) {
-        // Whether a sibling rides the new pair is unknown, so hub is not asked to
-        // revoke it; unused, it expires on its own.
-        logError(
-          `grant ${grantId}: could not check the grant after a lost hub token save ` +
-            `(${errorCodeOf(error)}); not revoking the new hub pair`
-        );
-        throw signInGone();
+      if (!rotated) await this.lostHubTokenSave(grantId, signIn, next);
+      return;
+    }
+  }
+
+  /**
+   * The compare-and-set found another pair stored: keep that one; or, the
+   * grant was revoked meanwhile, revoke `next` at hub and throw signInGone.
+   */
+  private async lostHubTokenSave(grantId: string, signIn: HubSignIn, next: HubTokens): Promise<void> {
+    let sibling: boolean;
+    try {
+      if (await this.liveHub(grantId)) {
+        logError(`grant ${grantId}: stored hub tokens changed during refresh; not overwritten`);
+        return;
       }
+      // Same rule as a disconnect: hub's revoke ends the sign-in for every client.
+      sibling = await this.store.hasLiveHubSibling(signIn.sub, signIn.tenantId, grantId);
+    } catch (error) {
+      // Whether a sibling rides the new pair is unknown, so hub is not asked to
+      // revoke it; unused, it expires on its own.
       logError(
-        `grant ${grantId}: revoked during the hub refresh; ` +
-          (sibling ? 'a live sibling shares the hub sign-in, so the new hub pair is kept' : 'revoking the new hub pair')
+        `grant ${grantId}: could not check the grant after a lost hub token save ` +
+          `(${errorCodeOf(error)}); not revoking the new hub pair`
       );
-      if (!sibling) {
-        await this.hub
-          .revoke(next.refreshToken)
-          .catch(() => logError(`grant ${grantId}: hub revoke failed`));
-      }
       throw signInGone();
     }
+    logError(
+      `grant ${grantId}: revoked during the hub refresh; ` +
+        (sibling ? 'a live sibling shares the hub sign-in, so the new hub pair is kept' : 'revoking the new hub pair')
+    );
+    if (!sibling) {
+      await this.hub
+        .revoke(next.refreshToken)
+        .catch(() => logError(`grant ${grantId}: hub revoke failed`));
+    }
+    throw signInGone();
   }
 
   /**
@@ -641,21 +674,19 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       const grant = await this.store.getGrant(record.grantId);
       // Spec: revoking someone else's token is a silent no-op, not an oracle.
       if (grant && grant.clientId === client.client_id && !grant.revoked) {
-        // Let an in-flight hub refresh land first, and start no new one until
-        // the grant is revoked: either would rotate the pair just after we read
-        // it, and hub would be sent the already-burned token.
-        this.ending.add(grant.id);
-        try {
-          await this.refreshing.get(grant.id)?.catch(() => undefined);
-          const hub = (await this.liveHub(grant.id))?.hub;
-          await this.store.revokeGrant(grant.id);
-          this.unsaved.delete(grant.id);
-          logEvent('revoke', { ...whoOf(grant.id, hub), reason: 'client' });
-          if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
-            await this.hub.revoke(hub.refreshToken);
-          }
-        } finally {
-          this.ending.delete(grant.id);
+        // Under the grant lock: a hub refresh in any process lands first, and
+        // none starts until the revoke commits — either would rotate the pair
+        // just after we read it, and hub would be sent the already-burned token.
+        const hub = await this.store.withGrantLock(grant.id, async (locked) => {
+          await locked.revoke();
+          return locked.grant?.hub && !locked.grant.revoked
+            ? { ...locked.grant.hub, ...this.unsaved.get(grant.id) }
+            : undefined;
+        });
+        this.unsaved.delete(grant.id);
+        logEvent('revoke', { ...whoOf(grant.id, hub), reason: 'client' });
+        if (hub && !(await this.store.hasLiveHubSibling(hub.sub, hub.tenantId, grant.id))) {
+          await this.hub.revoke(hub.refreshToken);
         }
       }
       return;

@@ -72,6 +72,15 @@ export const ABANDONED_GRANT_RETENTION_SECONDS = 97 * 24 * 60 * 60;
  */
 export const UNUSED_CLIENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
+/** A grant as read under its lock, and the writes that commit with the lock's release. */
+export interface LockedGrant {
+  grant: GrantRecord | undefined;
+  /** rotateHubTokens, inside the lock. */
+  rotate(previousRefreshToken: string, next: HubTokens): Promise<boolean>;
+  /** revokeGrant, inside the lock. */
+  revoke(): Promise<void>;
+}
+
 /** Rows one cleanup run deleted, per table. */
 export interface DeletedOAuthRowCounts {
   tokens: number;
@@ -101,6 +110,15 @@ export interface OAuthStore {
    * revoked, and holding an unexpired access or refresh token.
    */
   hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean>;
+  /**
+   * Runs `fn` holding the grant's lock, across every process on the store: the
+   * hub refresh and the revoke of one grant take turns, so a single-use hub
+   * refresh token is never sent twice. `fn` gets the grant read under the lock;
+   * its writes and the release are one commit (Postgres), and a throw rolls
+   * them back. Inside `fn`, read and write the grant only through `locked`:
+   * getGrant or revokeGrant there would wait on the lock `fn` holds.
+   */
+  withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T>;
 
   saveToken(token: NewToken): Promise<void>;
   getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined>;
@@ -148,6 +166,8 @@ export class MemoryOAuthStore implements OAuthStore {
   /** Seconds since epoch of each grant's first revoke; kept out of GrantRecord. */
   private readonly grantRevokedAt = new Map<string, number>();
   private readonly tokens = new Map<string, TokenRecord>();
+  /** Per grant, the tail of its lock holders' queue. */
+  private readonly grantLocks = new Map<string, Promise<unknown>>();
   private nextGrantId = 1;
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
@@ -209,6 +229,23 @@ export class MemoryOAuthStore implements OAuthStore {
         grant.hub?.sub === sub &&
         grant.hub.tenantId === tenantId
     );
+  }
+
+  /** One process: a per-grant queue. No rollback, so a throw keeps what `fn` wrote. */
+  async withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T> {
+    const run = (this.grantLocks.get(grantId) ?? Promise.resolve()).then(async () =>
+      fn({
+        grant: await this.getGrant(grantId),
+        rotate: (previous, next) => this.rotateHubTokens(grantId, previous, next),
+        revoke: () => this.revokeGrant(grantId)
+      })
+    );
+    const tail = run.catch(() => undefined);
+    this.grantLocks.set(grantId, tail);
+    void tail.then(() => {
+      if (this.grantLocks.get(grantId) === tail) this.grantLocks.delete(grantId);
+    });
+    return run;
   }
 
   async saveToken({ token, ...record }: NewToken): Promise<void> {

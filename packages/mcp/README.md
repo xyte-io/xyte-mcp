@@ -148,7 +148,7 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`packages/mcp/src/catalog/endpoints.generated.json` holds 78 endpoints (64 organization, 14 partner). It
+`packages/mcp/src/catalog/endpoints.generated.json` holds 88 endpoints (74 organization, 14 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.

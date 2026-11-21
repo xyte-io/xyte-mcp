@@ -85,10 +85,15 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   private readonly pending = new Map<string, PendingAuthorization>();
   /** This process's hub refresh per grant; across processes, the store's grant lock serializes them. */
   private readonly refreshing = new Map<string, Promise<string>>();
-  /** Rotated hub pairs the store failed to save, used in place of the stored ones. */
+  /**
+   * Rotated hub pairs the store failed to save, used in place of the stored ones.
+   * Only when revoking the grant failed too: this process alone knows the pair.
+   */
   private readonly unsaved = new Map<string, HubTokens>();
   /** Set by drain(): no new hub refresh may start, so its snapshot is final. */
   private draining = false;
+  /** Grants whose flight here has passed the draining check: only these can still reach hub. */
+  private readonly posting = new Set<string>();
 
   constructor(
     private readonly store: OAuthStore,
@@ -382,6 +387,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       }
       flight = this.doRefresh(grantId, staleAccessToken).finally(() => {
         this.refreshing.delete(grantId);
+        this.posting.delete(grantId);
       });
       this.refreshing.set(grantId, flight);
     }
@@ -422,6 +428,7 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         }
         // Sent once, never retried: once hub answers, it is burned.
         posted = true;
+        this.posting.add(grantId);
         let next: HubTokens | 'invalid_grant';
         try {
           next = await this.hub.refresh(hub.refreshToken);
@@ -470,7 +477,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       if (ended.reason) {
         // The revoke or its commit failed and rolled back: the stored refresh
         // token may be burned at hub, so the grant must still end.
-        await this.revokeAfterRollback(grantId);
+        if (!(await this.revokeGrantWithRetries(grantId))) {
+          logError(
+            `ERROR grant ${grantId}: could not revoke the grant after a failed hub refresh; ` +
+              'its next refresh may replay a burned hub token'
+          );
+        }
         this.unsaved.delete(grantId);
         logEvent('revoke', { ...whoOf(grantId, ended.hub), reason: ended.reason });
         throw signInGone();
@@ -493,22 +505,15 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     return accessToken;
   }
 
-  /** Revokes on the main pool, retried like saveHubTokens; a last failure is logged. */
-  private async revokeAfterRollback(grantId: string): Promise<void> {
+  /** Revokes on the main pool, retried like saveHubTokens. False when every try failed. */
+  private async revokeGrantWithRetries(grantId: string): Promise<boolean> {
     for (let attempt = 1; ; attempt += 1) {
       try {
         await this.store.revokeGrant(grantId);
-        return;
-      } catch (error) {
-        if (attempt < HUB_SAVE_ATTEMPTS) {
-          await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
-          continue;
-        }
-        logError(
-          `ERROR grant ${grantId}: could not revoke the grant after a failed hub refresh ` +
-            `(${errorCodeOf(error)}); its next refresh may replay a burned hub token`
-        );
-        return;
+        return true;
+      } catch {
+        if (attempt >= HUB_SAVE_ATTEMPTS) return false;
+        await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
       }
     }
   }
@@ -516,10 +521,12 @@ export class XyteOAuthProvider implements OAuthServerProvider {
   /**
    * Hub has already burned the old refresh token, so losing `next` would leave
    * a replay-on-next-refresh that hub answers by ending the user's sign-in.
-   * The DB write is retried; if it still fails, the pair lives in memory for
-   * this process (a restart before the next successful save loses it). A grant
-   * revoked meanwhile throws signInGone, after revoking `next` at hub: nothing
-   * would ever use or revoke that pair otherwise.
+   * The DB write is retried; if it still fails, the grant is revoked and this
+   * throws signInGone (fail closed: another process would replay the stored,
+   * burned token). Only if that revoke fails too does the pair live in memory
+   * for this process (a restart before the next successful save loses it). A
+   * grant revoked meanwhile throws signInGone, after revoking `next` at hub:
+   * nothing would ever use or revoke that pair otherwise.
    */
   private async saveHubTokens(
     grantId: string,
@@ -536,14 +543,26 @@ export class XyteOAuthProvider implements OAuthServerProvider {
           await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
           continue;
         }
+        if (await this.revokeGrantWithRetries(grantId)) {
+          // `next` is not revoked at hub: the sibling check needs the database
+          // that just failed, and unused, the pair expires on its own.
+          this.unsaved.delete(grantId);
+          logError(
+            `grant ${grantId}: could not save rotated hub tokens after ${attempt} attempts ` +
+              `(${errorCodeOf(error)}); revoked the grant`
+          );
+          logEvent('revoke', { ...whoOf(grantId, signIn), reason: 'hub_save_failed' });
+          throw signInGone();
+        }
         // Known limit: a grant revoked outside the provider (operator cut-off, revoke-on-read)
         // drops an unsaved pair without a hub revoke; it expires on its own.
         this.unsaved.set(grantId, next);
         const detail = error instanceof Error ? error.message : String(error);
         logError(
           `ERROR grant ${grantId}: could not save rotated hub tokens after ${attempt} attempts ` +
-            `(${redactText(detail, [stored, next.accessToken, next.refreshToken])}); ` +
-            'holding them in memory until a later refresh saves'
+            `(${redactText(detail, [stored, next.accessToken, next.refreshToken])}), nor revoke the grant; ` +
+            'holding them in memory until a later refresh saves; ' +
+            'another instance may replay the stored hub token until the save lands'
         );
         return;
       }
@@ -589,13 +608,18 @@ export class XyteOAuthProvider implements OAuthServerProvider {
 
   /**
    * For shutdown: lets in-flight hub refreshes land, then makes a last attempt
-   * at saving every rotated pair held only in memory. Losing either leaves the
-   * store with a refresh token hub has burned; the next refresh replays it, and
-   * hub ends the user's sign-in on that organization.
+   * at saving every rotated pair held only in memory (a save that fails again
+   * revokes the grant, if the revoke lands). Losing either leaves the store
+   * with a refresh token hub has burned; the next refresh replays it, and hub
+   * ends the user's sign-in on that organization.
    */
   async drain(): Promise<void> {
     this.draining = true;
-    await Promise.allSettled(this.refreshing.values());
+    // Only flights already past the draining check: one still queued on the
+    // grant lock sends nothing, and waiting for it could outlast the deadline.
+    await Promise.allSettled(
+      [...this.refreshing].filter(([grantId]) => this.posting.has(grantId)).map(([, flight]) => flight)
+    );
     for (const grantId of [...this.unsaved.keys()]) {
       try {
         const live = await this.liveHub(grantId);
@@ -603,7 +627,8 @@ export class XyteOAuthProvider implements OAuthServerProvider {
         if (live && next) await this.saveHubTokens(grantId, live.hub, live.stored, next);
       } catch {
         // The grant read failed (the pair is still unsaved), or the grant was
-        // revoked mid-save: saveHubTokens threw signInGone and dropped the pair.
+        // revoked (meanwhile, or by saveHubTokens after the save failed again):
+        // saveHubTokens threw signInGone and dropped the pair.
       }
       if (this.unsaved.has(grantId)) {
         logError(`ERROR grant ${grantId}: rotated hub tokens lost at shutdown`);

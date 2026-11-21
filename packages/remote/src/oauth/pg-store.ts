@@ -637,7 +637,10 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   /**
-   * A row lock (SELECT ... FOR UPDATE) in one transaction on lockPool. A
+   * A row lock (SELECT ... FOR NO KEY UPDATE) in one transaction on lockPool:
+   * it serializes refreshes, revokes and other UPDATEs of the row, but not a
+   * token INSERT's foreign-key check (FOR KEY SHARE), so a /token exchange
+   * never waits for a hub refresh. A
    * waiter gives up after lock_timeout (SQLSTATE 55P03), sized past one hub
    * refresh; a holder whose process hangs is ended by
    * idle_in_transaction_session_timeout, and one that dies (kill -9) by
@@ -654,7 +657,7 @@ export class PgOAuthStore implements OAuthStore {
           `SET LOCAL idle_in_transaction_session_timeout = ${this.hubTimeoutMs + 15_000}`
         );
         const { rows } = await client.query<GrantRow>(
-          'SELECT * FROM oauth_grants WHERE id = $1 FOR UPDATE',
+          'SELECT * FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE',
           [grantId]
         );
         const result = await fn({

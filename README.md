@@ -273,6 +273,11 @@ rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). T
 Deploy this release with preboot off (`heroku features:disable preboot -a <app>`), so the old
 and new process overlap only for the shutdown drain.
 
+Upgrading to the build that serializes hub token refreshes across processes (a Postgres row
+lock): keep one dyno and preboot off for that deploy. The old build takes no lock, so in the
+short overlap a refresh on each process can race; the loser gets `invalid_grant` from hub
+and that connection has to sign in again. That window is accepted.
+
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
 unless `XYTE_MCP_ALLOW_WRITES=1`, so `XYTE_MCP_READ_ONLY=1` is no longer needed there.

@@ -735,6 +735,32 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect((await row(id)).hub_refresh_token).toBeNull();
   });
 
+  // A token INSERT takes FOR KEY SHARE on its grant (the foreign key): a /token
+  // exchange during a hub refresh must not wait for the refresh.
+  it('saves a token for a grant while another holds that grant\'s lock', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    let release!: () => void;
+    let locked!: () => void;
+    const inside = new Promise<void>((resolve) => (locked = resolve));
+    const holder = store.withGrantLock(id, () => {
+      locked();
+      return new Promise<void>((resolve) => (release = resolve));
+    });
+    await inside;
+    try {
+      const saved = store.saveToken({ token: 'during', kind: 'access', grantId: id, expiresAt: NOW() + 600 });
+      const outcome = await Promise.race([
+        saved.then(() => 'saved'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 2_000))
+      ]);
+      expect(outcome).toBe('saved');
+    } finally {
+      release();
+      await holder;
+    }
+  });
+
   it('rolls back what the grant lock holder wrote when it throws', async () => {
     const store = await open(KEY_A);
     const id = await store.createGrant('c1', signIn());

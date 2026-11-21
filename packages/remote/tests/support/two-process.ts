@@ -70,7 +70,7 @@ export async function lockWaiters(admin: pg.Pool): Promise<number> {
   const { rows } = await admin.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM pg_stat_activity
       WHERE wait_event_type = 'Lock' AND application_name = current_setting('application_name')
-        AND query LIKE '%FOR UPDATE%'`
+        AND query LIKE '%FOR NO KEY UPDATE%'`
   );
   return rows[0]!.n;
 }

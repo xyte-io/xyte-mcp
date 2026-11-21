@@ -231,7 +231,7 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: two instances on one database', () 
     const holder = await schema.admin.connect();
     try {
       await holder.query('BEGIN');
-      await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE', [grantId]);
+      await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [grantId]);
       await expect(get(b.provider, grantId)).rejects.toMatchObject({
         kind: 'network',
         message: 'This connection is busy.'

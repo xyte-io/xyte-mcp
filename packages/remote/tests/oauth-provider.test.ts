@@ -995,19 +995,70 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     }
   );
 
-  it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
+  // `unsaved` is this process's only: another one would replay the burned stored
+  // token. So when the save fails for good, the grant ends (fail closed).
+  it('revokes the grant when saving a rotated hub pair keeps failing: signed out, and no instance refreshes again', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(
+      Object.assign(new Error('db down at db.internal'), { code: '57P01' })
+    );
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    save.mockRestore();
+    expect(upstream.calls).toHaveLength(0); // the new access token is never used
+    expect(eventsIn(stderr)).toContainEqual({
+      event: 'revoke', connection: grantId, organization: 'org-1', user: 'user-1', reason: 'hub_save_failed'
+    });
+    expect(stderr).toContain(`grant ${grantId}: could not save rotated hub tokens after 3 attempts (57P01); revoked the grant`);
+    expect(stderr).not.toContain('db.internal');
+    expect(stderr).not.toContain('xort_2');
+    expect(hub.revokes()).toEqual([]); // the new pair expires on its own
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+
+    // Another instance on the same store: nothing left to refresh with.
+    const other = new XyteOAuthProvider(
+      store,
+      createHubOAuth({
+        hubUrl: HUB,
+        clientId: 'mcp-client',
+        clientSecret: 's3cret',
+        redirectUri: `${ISSUER}/oauth/callback`,
+        timeoutMs: 1000,
+        fetchImpl: hub.fetchImpl
+      }),
+      ISSUER
+    );
+    await expect(
+      other.hubHttp(grantId, upstreamOk()).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes()).toHaveLength(1);
+  });
+
+  it('keeps a rotated hub pair in memory when saving it and revoking the grant both keep failing, and saves it later', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
     const http = provider.hubHttp(grantId, upstreamOk());
     const get = () => http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
 
-    await get();
+    const stderr = await captureStderr(get);
     expect(save).toHaveBeenCalledTimes(4); // the DB write under the lock, retried 3 times after it...
+    expect(revoke).toHaveBeenCalledTimes(3);
     expect(hub.refreshes()).toHaveLength(1); // ...the hub POST is not
+    expect(stderr).toContain('another instance may replay the stored hub token until the save lands');
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
 
     // Later calls use the unsaved pair instead of refreshing (or replaying xort_1).
@@ -1016,6 +1067,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
 
     // The next refresh sends the in-memory token and saves over the stored one.
     save.mockRestore();
+    revoke.mockRestore();
     const upstream = stubHttp((request) =>
       request.headers.Authorization === 'Bearer xoat_2'
         ? tokenRejected()
@@ -1144,12 +1196,16 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
-    await provider
-      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
 
     save.mockRestore();
+    revoke.mockRestore();
     await provider.drain();
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_2');
     expect(hub.refreshes()).toHaveLength(1); // saved, not refreshed again
@@ -1162,9 +1218,12 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
-    await provider
-      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
 
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     try {
@@ -1175,6 +1234,28 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     } finally {
       stderr.mockRestore();
     }
+  });
+
+  it('revokes, and does not report as lost, a held pair whose last save at shutdown fails while the revoke lands', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
+
+    revoke.mockRestore(); // the save still fails at shutdown, the revoke lands
+    const stderr = await captureStderr(() => provider.drain());
+    vi.restoreAllMocks();
+    expect(stderr).not.toContain('lost at shutdown');
+    expect(eventsIn(stderr)).toContainEqual(expect.objectContaining({ event: 'revoke', reason: 'hub_save_failed' }));
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
   });
 
   it('starts no hub refresh once draining: the call fails retryably, hub is never asked', async () => {
@@ -1196,7 +1277,7 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
 // A flight queued on the grant lock (another process refreshing) must not reach hub
 // after drain started: its POST could outlast the shutdown deadline.
 describe('XyteOAuthProvider: drain while a refresh waits on the grant lock', () => {
-  it('sends nothing once it gets the lock: the call fails retryably and the grant is kept', async () => {
+  it('drain does not wait for it, and it sends nothing once it gets the lock: the call fails retryably, the grant is kept', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
@@ -1209,10 +1290,10 @@ describe('XyteOAuthProvider: drain while a refresh waits on the grant lock', () 
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
     call.catch(() => undefined);
     await tick();
-    const drain = provider.drain();
+    // drain() does not wait for a flight still queued on the lock: it sends nothing.
+    await provider.drain();
     release();
     await holder;
-    await drain;
 
     await expect(call).rejects.toMatchObject({ kind: 'network', message: 'The server is restarting.' });
     expect(hub.refreshes()).toHaveLength(0);

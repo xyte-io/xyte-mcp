@@ -126,7 +126,17 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       hubVerifier: randomBytes(32).toString('base64url'),
       expiresAt: now + PENDING_TTL_SECONDS
     };
-    if (!(await this.store.createPendingSignIn(pendingId, entry, MAX_PENDING, now))) {
+    // The SDK turns a throw here into a server_error redirect without a log
+    // line, so on-call would not see the sign-ins failing.
+    let created: boolean;
+    try {
+      created = await this.store.createPendingSignIn(pendingId, entry, MAX_PENDING, now);
+    } catch (error) {
+      logError(`authorize: saving the pending sign-in failed (${errorCodeOf(error)})`);
+      logEvent('sign_in', { outcome: 'failed', reason: 'store', client: client.client_id });
+      throw error;
+    }
+    if (!created) {
       res.status(503).type('html').send(errorPage('Too many sign-ins in progress. Try again shortly.'));
       return;
     }
@@ -134,12 +144,18 @@ export class XyteOAuthProvider implements OAuthServerProvider {
     // enough abandoned flows grow the Cookie header past the server's limit.
     const flowCookies = cookieNames(res.req);
     if (flowCookies.length) {
-      const live = await this.store.livePendingSignInIds(
-        flowCookies.map((name) => name.slice(COOKIE_PREFIX.length)),
-        now
-      );
+      // Housekeeping only: on a failed lookup the old cookies wait for the next /authorize.
+      const live = await this.store
+        .livePendingSignInIds(
+          flowCookies.map((name) => name.slice(COOKIE_PREFIX.length)),
+          now
+        )
+        .catch((error: unknown) => {
+          logError(`authorize: flow-cookie lookup failed (${errorCodeOf(error)}); cookies kept`);
+          return undefined;
+        });
       for (const name of flowCookies) {
-        if (!live.has(name.slice(COOKIE_PREFIX.length))) clearBrowserCookie(res, name);
+        if (live && !live.has(name.slice(COOKIE_PREFIX.length))) clearBrowserCookie(res, name);
       }
     }
 

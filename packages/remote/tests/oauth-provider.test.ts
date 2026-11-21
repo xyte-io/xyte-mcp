@@ -344,6 +344,49 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.cookies.other).toBeUndefined();
   });
 
+  it('still serves the consent page when the flow-cookie lookup fails, keeping the old cookies', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    vi.spyOn(store, 'livePendingSignInIds').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+    (res as unknown as { req: Request }).req = fakeReq({ cookie: '__Host-xmcp_gone=v' });
+
+    const stderr = await captureStderr(() =>
+      provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+    );
+    expect(out.status).toBe(200);
+    expect(out.html).toContain('name="pending"');
+    expect(out.cookies['__Host-xmcp_gone']).toBeUndefined();
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([]);
+  });
+
+  it('logs a store failure on /authorize and rethrows it for the SDK to redirect', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    vi.spyOn(store, 'createPendingSignIn').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+
+    let thrown: unknown;
+    const stderr = await captureStderr(() =>
+      provider
+        .authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+        .catch((error: unknown) => (thrown = error))
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    expect(out.cookies).toEqual({});
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'failed', reason: 'store', client: 'client-1' }
+    ]);
+  });
+
   it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
     const { provider } = makeProvider();
     const client = await registeredClient(provider);

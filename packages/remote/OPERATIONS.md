@@ -99,6 +99,8 @@ argument. A field without a value is left out.
 - `hub_error`: the hub answered with an error other than `access_denied`.
 - `exchange`: the hub code exchange or saving the connection failed (an `[xyte-mcp] error:
   hub sign-in failed` line has the detail).
+- `store`: `/authorize` could not save the new sign-in (the database is down or slow); the
+  client gets a `server_error` redirect. An `[xyte-mcp] error: authorize:` line has the error code.
 - `error`: an unexpected failure (a stack trace is on the line above).
 
 When the hub rejects a tool call's token and the token refresh that follows fails, the

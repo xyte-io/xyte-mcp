@@ -470,16 +470,13 @@ export class PgOAuthStore implements OAuthStore {
       migrationPool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));
       await migrateOAuthSchema(migrationPool);
       await checkAndSweepHubTokens(migrationPool, cipher);
-      pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000 });
+      // lock_timeout, a startup parameter: query_timeout only abandons a
+      // statement client-side, so lock waits are bounded server-side below it
+      // and an abandoned UPDATE does not land later.
+      pool = new pg.Pool({ ...connection, max: 5, query_timeout: 10_000, lock_timeout: 9_000 });
       // An idle client dropped server-side (maintenance, failover) is emitted here;
       // unhandled, it exits the process. The pool replaces the client on its own.
       pool.on('error', (error) => logError(`postgres pool: ${errorCodeOf(error)}`));
-      // query_timeout only abandons a statement client-side: bound lock waits
-      // server-side below it, so an abandoned UPDATE does not land later. Set
-      // per connection, as a DSN's own `options` would override a pool option.
-      pool.on('connect', (client) => {
-        client.query('SET lock_timeout = 9000').catch(() => {});
-      });
       // No query_timeout: a lock holder's transaction spans a hub refresh, and
       // a waiter is bounded server-side by lock_timeout (see withGrantLock).
       // ponytail: 3 grants refreshing at once per process; more wait for a

@@ -270,8 +270,13 @@ Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
 `XYTE_MCP_TOKEN_KEY` before deploying this version; every connection then signs in once; then
 rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
 (schema version 2) cannot be rolled back: an older build refuses to boot against it.
-Deploy this release with preboot off (`heroku features:disable preboot -a <app>`), so the old
-and new process overlap only for the shutdown drain.
+
+Deploy with preboot off (`heroku features:disable preboot -a <app>`), and keep it off while
+sign-in state is in memory (see "One dyno" under [OAuth 2.1](#oauth-21)):
+old and new process then overlap only for the shutdown drain. Upgrading from a build without
+the cross-process refresh lock, a refresh on each process in that overlap can race; the loser
+gets `invalid_grant` from hub and that connection has to sign in again. That window is
+accepted.
 
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
@@ -506,9 +511,10 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
   one-off dyno (`heroku run`) needs it as a config var
   (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
-- **One dyno.** The pending consent state, the refresh single-flight and the rate-limit
-  counters are in memory, so the app must run on a single dyno (a second one doubles every
-  budget).
+- **One dyno.** The pending consent state and the rate-limit counters are in memory, so the
+  app must run on a single dyno (a second one doubles every budget). The hub token refresh is
+  already safe across processes: a Postgres row lock lets one process at a time refresh a
+  connection.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of

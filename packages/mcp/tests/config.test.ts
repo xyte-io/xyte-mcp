@@ -173,15 +173,15 @@ describe('resolveHttpConfig', () => {
   };
   const hubClient = { id: 'hub-id', secret: 'hub-secret' };
 
-  it('enables OAuth from the issuer URL, with and without a database', () => {
+  it('enables OAuth from the issuer URL, with a database, or without one on localhost', () => {
     const issuer = 'https://mcp.example.com';
     // Normalized as the SDK normalizes the resource clients send back.
     expect(
-      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'https://MCP.example.com:443' }).oauth
-        ?.issuerUrl
+      resolveHttpConfig({ ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.issuerUrl]: 'https://MCP.example.com:443' })
+        .oauth?.issuerUrl
     ).toBe(issuer);
-    expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: `${issuer}/` }).oauth).toEqual({
-      issuerUrl: issuer,
+    expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'http://localhost:3000/' }).oauth).toEqual({
+      issuerUrl: 'http://localhost:3000',
       hubClient
     });
     expect(
@@ -208,6 +208,8 @@ describe('resolveHttpConfig', () => {
     [ENV.issuerUrl]: 'https://mcp.example.com',
     [ENV.databaseUrl]: 'postgres://x'
   };
+  /** The in-memory store: a local run only. */
+  const localMemoryOAuthEnv = { ...hubClientEnv, [ENV.issuerUrl]: 'http://127.0.0.1:8080' };
 
   // The stored hub tokens are encrypted under it; without one they would sit in plain text.
   it('refuses a Postgres token store without a valid token key, never echoing the value', () => {
@@ -280,8 +282,7 @@ describe('resolveHttpConfig', () => {
 
   it('ignores the previous token key for the in-memory store, even an invalid one', () => {
     const oauth = resolveHttpConfig({
-      ...pgOAuthEnv,
-      [ENV.databaseUrl]: '',
+      ...localMemoryOAuthEnv,
       [ENV.previousTokenKey]: 'not-a-key'
     }).oauth;
     expect(oauth).not.toHaveProperty('previousTokenKey');
@@ -289,17 +290,30 @@ describe('resolveHttpConfig', () => {
   });
 
   it('needs no token key for the in-memory store, and ignores an invalid one', () => {
-    expect(resolveHttpConfig({ ...pgOAuthEnv, [ENV.databaseUrl]: '' }).oauth).toEqual({
-      issuerUrl: 'https://mcp.example.com',
+    expect(resolveHttpConfig(localMemoryOAuthEnv).oauth).toEqual({
+      issuerUrl: 'http://127.0.0.1:8080',
       hubClient
     });
     expect(
-      resolveHttpConfig({
-        ...hubClientEnv,
-        [ENV.issuerUrl]: 'https://mcp.example.com',
-        [ENV.tokenKey]: 'not-a-key'
-      }).oauth
-    ).toEqual({ issuerUrl: 'https://mcp.example.com', hubClient });
+      resolveHttpConfig({ ...localMemoryOAuthEnv, [ENV.tokenKey]: 'not-a-key' }).oauth
+    ).toEqual({ issuerUrl: 'http://127.0.0.1:8080', hubClient });
+  });
+
+  // The in-memory store loses every sign-in on a restart and shares none
+  // between instances: only a local run may use it.
+  it('refuses a public issuer without DATABASE_URL, and allows localhost and 127.0.0.1', () => {
+    for (const blank of [{}, { [ENV.databaseUrl]: '' }, { [ENV.databaseUrl]: '  ' }]) {
+      const env = { ...hubClientEnv, [ENV.issuerUrl]: 'https://mcp.example.com', ...blank };
+      expect(() => resolveHttpConfig(env)).toThrow(XyteError);
+      expect(() => resolveHttpConfig(env)).toThrow(
+        new RegExp(`${ENV.issuerUrl} is not local, so ${ENV.databaseUrl} is required`)
+      );
+    }
+    for (const local of ['http://localhost:3000', 'https://localhost', 'http://127.0.0.1:8080']) {
+      expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: local }).oauth).not.toHaveProperty(
+        'databaseUrl'
+      );
+    }
   });
 
   it('refuses OAuth without the hub client credentials', () => {

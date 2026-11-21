@@ -181,7 +181,7 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
 
   let oauth: OAuthConfig | undefined;
   if (issuerUrl) {
-    validateIssuerUrl(issuerUrl);
+    const localIssuer = validateIssuerUrl(issuerUrl);
     const id = trimmed(env[ENV.hubOAuthClientId]);
     const secret = trimmed(env[ENV.hubOAuthClientSecret]);
     if (!id || !secret) {
@@ -196,6 +196,18 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
       );
     }
     const databaseUrl = trimmed(env[ENV.databaseUrl]);
+    // The in-memory store loses every sign-in and token on a restart, and a
+    // sign-in started on one instance cannot finish on another: a local run only.
+    if (!databaseUrl && !localIssuer) {
+      throw new XyteError(
+        'config',
+        `${ENV.issuerUrl} is not local, so ${ENV.databaseUrl} is required: without it OAuth state is held in memory, lost on every restart and not shared between instances.`,
+        [
+          `Set ${ENV.databaseUrl} to a Postgres DSN, with ${ENV.tokenKey}.`,
+          `For a local run, use an http://localhost or http://127.0.0.1 issuer.`
+        ]
+      );
+    }
     // ponytail: the in-memory store holds nothing at rest, so it takes no key.
     const tokenKey = databaseUrl ? parseTokenKey(env, ENV.tokenKey) : undefined;
     const previousTokenKey =
@@ -230,9 +242,10 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
  * Fail at boot, not on the first /authorize: tokens minted under an http or
  * malformed issuer would be rejected by clients after a working-looking start.
  * Localhost is exempt so tests and local runs don't need TLS (the SDK's
- * metadata router applies the same exemption).
+ * metadata router applies the same exemption). Returns whether the issuer is
+ * that local host.
  */
-function validateIssuerUrl(value: string): void {
+function validateIssuerUrl(value: string): boolean {
   let url: URL;
   try {
     url = new URL(value);
@@ -252,6 +265,7 @@ function validateIssuerUrl(value: string): void {
   if (url.pathname !== '/') {
     throw new XyteError('config', `${ENV.issuerUrl} must not have a path (got ${url.pathname}).`);
   }
+  return localhost;
 }
 
 /**

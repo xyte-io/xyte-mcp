@@ -107,17 +107,17 @@ of the same `connection` just before it.
 
 ### Cleanup of old rows
 
-At boot and then every hour the server deletes expired tokens, revoked connections with no
-token left 7 days after the revoke, connections left without a client (a sign-in still in
+At boot and then every hour the server deletes sign-ins in progress past their 10 minutes,
+expired tokens, revoked connections with no token left 7 days after the revoke, connections left without a client (a sign-in still in
 progress when its client was deleted), connections with no token left 97 days after the sign-in
 (a sign-in never completed, or a user idle past the refresh lifetime: [the 90-day
 end](#the-90-day-end) has passed, plus a week), and registered clients with no connection 30
 days after registration. When it deletes anything it writes one line:
 `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended grant(s), <n>
-unused client(s)`. Every dyno runs the cleanup; a run at the same time as another deletes
+unused client(s), <n> expired pending sign-in(s)`. Every dyno runs the cleanup; a run at the same time as another deletes
 nothing more, so the counts are not doubled and a dyno may log nothing. A failed run writes
 `[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: the
-<tokens|grants|clients> step failed: <code>`, and the next run tries again. `<code>` is the error code, as in `healthz: token store check failed: <code>`; a
+<pendingSignIns|tokens|grants|clients> step failed: <code>`, and the next run tries again. `<code>` is the error code, as in `healthz: token store check failed: <code>`; a
 plain `Error` is usually a pg timeout (query or connect, 10 s). A query timeout stops only
 the wait: the delete may still finish in Postgres, so the next run's counts are lower.
 

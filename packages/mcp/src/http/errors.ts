@@ -10,7 +10,7 @@ export type ErrorKind =
   | 'write-blocked'
   | 'unknown-endpoint'
   | 'http'
-  /** The hub sign-in behind an OAuth grant is gone; the client has to reconnect. */
+  /** Hub rejected the OAuth sign-in or its refresh; the hints say whether to reconnect or just retry later. */
   | 'auth'
   | 'network'
   | 'timeout';

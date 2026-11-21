@@ -745,6 +745,43 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     );
   });
 
+  it('a hub 403 application_paused on a call is returned unchanged, no refresh', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const paused = new XyteHttpError(
+      403,
+      'Forbidden',
+      { error: 'paused', error_code: 'application_paused' },
+      'k'
+    );
+    const upstream = stubHttp(() => paused);
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstream)
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toBe(paused);
+    expect(hub.refreshes()).toHaveLength(0);
+  });
+
+  it.each([
+    [403, 'unauthorized_client'],
+    [401, 'application_paused']
+  ])('a refresh %i %s carries no paused hint', async (status, error) => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => json(status, { error });
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstreamOk())
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'auth', hints: [] });
+  });
+
   it('a hub 401 without invalid_token (record not in the org) is returned unchanged, no refresh', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
@@ -1104,7 +1141,8 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     await expect(call).rejects.toBeInstanceOf(XyteError);
     await expect(call).rejects.toMatchObject({
       kind: 'auth',
-      message: expect.stringMatching(/refresh failed: 401/)
+      message: expect.stringMatching(/refresh failed: 401/),
+      hints: []
     });
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
@@ -1119,8 +1157,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     hub.onRefresh = () =>
       json(403, {
         error: 'application_paused',
-        error_description: 'This application is temporarily paused. Try again later.',
-        error_code: 'application_paused'
+        error_description: 'This application is temporarily paused. Try again later.'
       });
     const get = () =>
       provider
@@ -1138,6 +1175,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     // Once unpaused, the same refresh token works: the paused answer burned nothing.
     hub.onRefresh = undefined;
     await get();
+    expect(hub.refreshes()).toHaveLength(sentBefore + 2);
     const [paused, resumed] = hub
       .refreshes()
       .slice(-2)

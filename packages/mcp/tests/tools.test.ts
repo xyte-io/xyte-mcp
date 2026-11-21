@@ -161,7 +161,7 @@ describe('xyte_api_call', () => {
     'You have no access to this item. Ask an organization administrator for access.';
   const SIGN_IN_HINT =
     'The Xyte sign-in behind this connection has ended. Reconnect the Xyte connector to sign in again.';
-  const SIGNED_IN_HINTS = [IDS_HINT, ADMIN_HINT, NO_ACCESS_HINT, SIGN_IN_HINT];
+  const SIGNED_IN_HINTS = [IDS_HINT, ADMIN_HINT, NO_ACCESS_HINT, SIGN_IN_HINT, APPLICATION_PAUSED_HINT];
 
   it.each([401, 403])('keeps the API-key hint on %i in API-key mode', async (status) => {
     const http = stubHttp(() => new XyteHttpError(status, 'Denied', { error: 'nope' }, READ_KEY));
@@ -171,6 +171,7 @@ describe('xyte_api_call', () => {
 
   it.each([
     [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined],
+    [403, { error_code: 'application_paused', error: 'x' }, undefined],
     [401, { error: 'x' }, 'Bearer error="invalid_token"']
   ])(
     'gives only the API-key hint on %i %j %s in API-key mode',

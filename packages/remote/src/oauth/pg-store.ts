@@ -150,6 +150,21 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
   -- The expired-row deletes and the live count on every /authorize.
   CREATE INDEX IF NOT EXISTS oauth_pending_sign_ins_expires_at ON oauth_pending_sign_ins (expires_at);
 `
+  },
+  // The per-grant /mcp rate-limit counters, shared by every instance. UNLOGGED:
+  // a crash that loses the counts only reopens one window. An older build keeps
+  // its in-memory counters and ignores the table.
+  {
+    version: 4,
+    name: 'rate_limit_counters',
+    breaksRollback: false,
+    sql: `
+  CREATE UNLOGGED TABLE IF NOT EXISTS mcp_rate_limit_counters (
+    key      text PRIMARY KEY,
+    hits     integer NOT NULL,
+    reset_at timestamptz NOT NULL
+  );
+`
   }
 ];
 
@@ -187,7 +202,7 @@ export async function migrateOAuthSchema(
   const misplaced = migrations.findIndex((migration, index) => migration.version !== index + 1);
   if (misplaced !== -1) {
     throw new Error(
-      `OAuth store migration at position ${misplaced + 1} says version ${migrations[misplaced]!.version}; versions must run 1, 2, 3 in order`
+      `OAuth store migration at position ${misplaced + 1} says version ${migrations[misplaced]!.version}; versions must equal their position, starting at 1`
     );
   }
   const client = await pool.connect();
@@ -901,6 +916,36 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   /**
+   * One hit on `key` in a fixed window of `windowMs`, timed by the database
+   * clock so every instance agrees; the window restarts at the first hit after
+   * it ends, or once it ends more than one window ahead (the database clock
+   * stepped back), so a grant is never locked out longer than one window.
+   * resetTime is the time left added to this process's clock, the clock the
+   * Retry-After header and the 'retry in N s' text are computed against.
+   * The express-rate-limit store of the per-grant /mcp limit.
+   *
+   * pg's query_timeout is client-side, so an upsert that timed out may still
+   * commit and count a hit the caller got a 503 for (accepted).
+   */
+  async countRateLimitHit(key: string, windowMs: number): Promise<{ totalHits: number; resetTime: Date }> {
+    const result = await this.pool.query<{ hits: number; remaining_ms: number }>(
+      `INSERT INTO mcp_rate_limit_counters (key, hits, reset_at)
+       VALUES ($1, 1, now() + $2 * interval '1 millisecond')
+       ON CONFLICT (key) DO UPDATE SET
+         hits = CASE WHEN mcp_rate_limit_counters.reset_at <= now()
+                       OR mcp_rate_limit_counters.reset_at > EXCLUDED.reset_at THEN 1
+                     ELSE mcp_rate_limit_counters.hits + 1 END,
+         reset_at = CASE WHEN mcp_rate_limit_counters.reset_at <= now()
+                           OR mcp_rate_limit_counters.reset_at > EXCLUDED.reset_at THEN EXCLUDED.reset_at
+                         ELSE mcp_rate_limit_counters.reset_at END
+       RETURNING hits, (extract(epoch FROM reset_at - now()) * 1000)::float8 AS remaining_ms`,
+      [key, windowMs]
+    );
+    const row = result.rows[0]!;
+    return { totalHits: row.hits, resetTime: new Date(Date.now() + row.remaining_ms) };
+  }
+
+  /**
    * Undefined for no row, and for one whose verifier this instance cannot
    * decrypt (written under a key it lacks): that sign-in cannot finish, so it
    * reads as gone and the user restarts the connection.
@@ -930,8 +975,9 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   /**
-   * Four autocommit DELETEs: expired pending sign-ins, then the rest in
-   * foreign-key order (a token references its grant, without cascade). Each
+   * Five autocommit DELETEs: expired pending sign-ins, then the rest in
+   * foreign-key order (a token references its grant, without cascade), then
+   * ended rate-limit windows (on the database clock, not counted). Each
    * locks only the rows it deletes, which no request uses any more, so requests
    * keep being served.
    *
@@ -954,7 +1000,7 @@ export class PgOAuthStore implements OAuthStore {
    */
   async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
     const deleted = { tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 };
-    const steps: Array<[keyof DeletedOAuthRowCounts, string, number[]]> = [
+    const steps: Array<[keyof DeletedOAuthRowCounts | 'rateLimitCounters', string, number[]]> = [
       ['pendingSignIns', 'DELETE FROM oauth_pending_sign_ins WHERE expires_at <= to_timestamp($1)', [now]],
       ['tokens', 'DELETE FROM oauth_tokens WHERE expires_at <= to_timestamp($1)', [now]],
       [
@@ -979,13 +1025,15 @@ export class PgOAuthStore implements OAuthStore {
           WHERE c.created_at < to_timestamp($1)
             AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id)`,
         [now - UNUSED_CLIENT_RETENTION_SECONDS]
-      ]
+      ],
+      ['rateLimitCounters', 'DELETE FROM mcp_rate_limit_counters WHERE reset_at <= now()', []]
     ];
     for (const [step, sql, cutoffs] of steps) {
       // Shutdown waits for the statement in flight, not for the whole run.
       if (this.closing) break;
       try {
-        deleted[step] = (await this.pool.query(sql, cutoffs)).rowCount ?? 0;
+        const rowCount = (await this.pool.query(sql, cutoffs)).rowCount ?? 0;
+        if (step !== 'rateLimitCounters') deleted[step] = rowCount;
       } catch (error) {
         // The code only: a pg message can name the database host and role.
         throw new Error(`the ${step} step failed: ${errorCodeOf(error)}`, { cause: error });

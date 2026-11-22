@@ -15,6 +15,7 @@ const PG_URL = process.env.TEST_DATABASE_URL;
 const BASELINE = { version: 1, name: 'baseline', breaks_rollback: false };
 const ENCRYPT = { version: 2, name: 'encrypt_hub_tokens', breaks_rollback: true };
 const PENDING = { version: 3, name: 'pending_sign_ins', breaks_rollback: false };
+const RATE_LIMITS = { version: 4, name: 'rate_limit_counters', breaks_rollback: false };
 /** A build that only knew the baseline. */
 const V1 = [MIGRATIONS[0]!];
 
@@ -71,16 +72,25 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     await migrateOAuthSchema(poolForSchema());
 
     expect(await tablesIn()).toEqual([
+      'mcp_rate_limit_counters',
       'oauth_clients',
       'oauth_grants',
       'oauth_pending_sign_ins',
       'oauth_schema_migrations',
       'oauth_tokens'
     ]);
-    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain('OAuth store schema migrated to version 1 (baseline)');
     expect(logText()).toContain('OAuth store schema migrated to version 2 (encrypt_hub_tokens)');
     expect(logText()).toContain('OAuth store schema migrated to version 3 (pending_sign_ins)');
+    expect(logText()).toContain('OAuth store schema migrated to version 4 (rate_limit_counters)');
+    // Unlogged: the counters are hot, short-lived writes that need no WAL or crash safety.
+    const persistence = await admin.query<{ relpersistence: string }>(
+      `SELECT c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'mcp_rate_limit_counters' AND n.nspname = $1`,
+      [schema]
+    );
+    expect(persistence.rows).toEqual([{ relpersistence: 'u' }]);
   });
 
   it('adopts a database created before versioning as version 1, keeping its rows', async () => {
@@ -95,7 +105,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     const logText = captureLog();
     await migrateOAuthSchema(pool);
 
-    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain('adopted the existing schema as version 1 (baseline)');
     expect((await pool.query('SELECT client_id FROM oauth_clients')).rows).toEqual([
       { client_id: 'c1' }
@@ -122,7 +132,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     captureLog();
     await migrateOAuthSchema(pool);
 
-    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     const grants = await pool.query(
       `SELECT revoked_at IS NOT NULL AS revoked, revoked_at < '2021-01-01' AS revoked_earlier,
               hub_access_token, hub_refresh_token, hub_refresh_token_hash
@@ -140,18 +150,18 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     ]);
   });
 
-  // The previous release (up to version 2) keeps serving during the rollout,
-  // and may be rolled back to: it must still boot against version 3.
-  it('lets a build that only knows versions 1 and 2 boot against version 3', async () => {
+  // Older releases keep serving during the rollout, and may be rolled back to:
+  // the v3 build (the one a rollback lands on) and the v1-2 build must still boot against version 4.
+  it.each([2, 3])('lets a build that only knows versions 1 to %i boot against version 4', async (known) => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
 
     const logText = captureLog();
-    await expect(migrateOAuthSchema(pool, MIGRATIONS.slice(0, 2))).resolves.toBeUndefined();
+    await expect(migrateOAuthSchema(pool, MIGRATIONS.slice(0, known))).resolves.toBeUndefined();
 
-    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain(
-      "OAuth store schema is at version 3, newer than this build's 2; those versions are rollback-safe, booting"
+      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, booting`
     );
   });
 
@@ -170,7 +180,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
   it('lets two boots migrate an empty database at once without racing', async () => {
     await Promise.all([migrateOAuthSchema(poolForSchema()), migrateOAuthSchema(poolForSchema())]);
 
-    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING]);
+    expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
   });
 
   it('records whether a migration breaks rollback', async () => {
@@ -185,13 +195,15 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     ]);
   });
 
-  it('refuses a migration list whose versions do not run 1, 2, 3 in order', async () => {
+  it('refuses a migration list whose versions do not equal their position', async () => {
     await expect(
       migrateOAuthSchema(poolForSchema(), [
         MIGRATIONS[0]!,
         { version: 3, name: 'skipped', sql: 'SELECT 1', breaksRollback: false }
       ])
-    ).rejects.toThrow(/^OAuth store migration at position 2 says version 3/);
+    ).rejects.toThrow(
+      'OAuth store migration at position 2 says version 3; versions must equal their position, starting at 1'
+    );
     expect(await tablesIn()).toEqual([]);
   });
 

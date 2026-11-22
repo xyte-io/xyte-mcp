@@ -147,6 +147,58 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     }
   });
 
+  it('limits one connection to 60 calls a minute over both processes, and answers 503 when the counter fails', async () => {
+    const { accessToken } = await signIn(proxy.base);
+    const from = proxy.routed.length;
+    const statuses: number[] = [];
+    for (let i = 0; i < 60; i += 1) {
+      const answer = await listDevices(proxy.base, accessToken);
+      await answer.arrayBuffer();
+      statuses.push(answer.status);
+    }
+    expect(statuses).toEqual(Array(60).fill(200));
+    const limited = await listDevices(proxy.base, accessToken);
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({
+      error: { code: -32000, message: expect.stringMatching(/^rate limit exceeded, retry in ([1-9]|[1-5]\d|60) s$/) }
+    });
+    expect(new Set(proxy.routed.slice(from).map((request) => request.backend)).size).toBe(2);
+
+    await schema.admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
+    try {
+      const answer = await listDevices(proxy.base, accessToken);
+      expect(answer.status).toBe(503);
+      expect(await answer.json()).toMatchObject({ error: { code: -32603, message: 'temporarily unavailable, retry' } });
+    } finally {
+      await schema.admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
+    }
+  });
+
+  it('counts 405 GETs over both processes against the same connection budget as POSTs', async () => {
+    const { accessToken } = await signIn(proxy.base);
+    const from = proxy.routed.length;
+    for (let i = 0; i < 60; i += 1) {
+      const answer = await fetch(`${proxy.base}/mcp`, { headers: { Authorization: `Bearer ${accessToken}` } });
+      await answer.arrayBuffer();
+      expect(answer.status).toBe(405);
+    }
+    expect(new Set(proxy.routed.slice(from).map((request) => request.backend)).size).toBe(2);
+    expect((await listDevices(proxy.base, accessToken)).status).toBe(429);
+  });
+
+  it('answers a POST with no token 401 and writes no rate-limit counter', async () => {
+    const counters = async () =>
+      (await schema.admin.query<{ n: string }>('SELECT count(*) AS n FROM mcp_rate_limit_counters')).rows[0]!.n;
+    const before = await counters();
+    const answer = await fetch(`${proxy.base}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })
+    });
+    expect(answer.status).toBe(401);
+    expect(await counters()).toBe(before);
+  });
+
   // Last: it kills a process and starts it again.
   it('kill -9 of the refreshing process frees the lock and keeps the stored pair; the next call refreshes', async () => {
     const { accessToken } = await expiringSignIn();

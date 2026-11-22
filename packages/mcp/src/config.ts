@@ -12,7 +12,7 @@ export const ENV = {
   httpToken: 'XYTE_MCP_HTTP_TOKEN',
   /** Public base URL of this deployment; setting it turns OAuth on. */
   issuerUrl: 'XYTE_MCP_ISSUER_URL',
-  /** Set by Heroku Postgres; the OAuth token store. Absent → in-memory store. */
+  /** Set by Heroku Postgres; the OAuth token store. Required with OAuth unless the issuer is localhost/127.0.0.1, where absent → in-memory store. */
   databaseUrl: 'DATABASE_URL',
   /** This server's confidential-client credentials at hub's OAuth server; required with OAuth. */
   hubOAuthClientId: 'XYTE_MCP_HUB_OAUTH_CLIENT_ID',
@@ -54,7 +54,7 @@ export interface Credentials {
 export interface OAuthConfig {
   /** Public https base URL of this deployment (RFC 8414 issuer). */
   issuerUrl: string;
-  /** Postgres DSN for the token store; absent → in-memory (dev only). */
+  /** Postgres DSN for the token store; absent only for a localhost/127.0.0.1 issuer → in-memory. */
   databaseUrl?: string;
   /** xyte-mcp's own client registration at hub's OAuth server (client_secret_basic). */
   hubClient: { id: string; secret: string };
@@ -181,7 +181,7 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
 
   let oauth: OAuthConfig | undefined;
   if (issuerUrl) {
-    validateIssuerUrl(issuerUrl);
+    const localIssuer = validateIssuerUrl(issuerUrl);
     const id = trimmed(env[ENV.hubOAuthClientId]);
     const secret = trimmed(env[ENV.hubOAuthClientSecret]);
     if (!id || !secret) {
@@ -196,6 +196,19 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
       );
     }
     const databaseUrl = trimmed(env[ENV.databaseUrl]);
+    // The in-memory store loses every sign-in and token on a restart, and a
+    // sign-in started on one instance cannot finish on another: a local run
+    // only.
+    if (!databaseUrl && !localIssuer) {
+      throw new XyteError(
+        'config',
+        `${ENV.issuerUrl} is not local, so ${ENV.databaseUrl} is required: without it OAuth state is held in memory, lost on every restart and not shared between instances.`,
+        [
+          `Set ${ENV.databaseUrl} to a Postgres DSN, with ${ENV.tokenKey}.`,
+          `For a local run, use an http://localhost or http://127.0.0.1 issuer.`
+        ]
+      );
+    }
     // ponytail: the in-memory store holds nothing at rest, so it takes no key.
     const tokenKey = databaseUrl ? parseTokenKey(env, ENV.tokenKey) : undefined;
     const previousTokenKey =
@@ -230,9 +243,10 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
  * Fail at boot, not on the first /authorize: tokens minted under an http or
  * malformed issuer would be rejected by clients after a working-looking start.
  * Localhost is exempt so tests and local runs don't need TLS (the SDK's
- * metadata router applies the same exemption).
+ * metadata router applies the same exemption). Returns whether the issuer is
+ * that local host.
  */
-function validateIssuerUrl(value: string): void {
+function validateIssuerUrl(value: string): boolean {
   let url: URL;
   try {
     url = new URL(value);
@@ -252,6 +266,7 @@ function validateIssuerUrl(value: string): void {
   if (url.pathname !== '/') {
     throw new XyteError('config', `${ENV.issuerUrl} must not have a path (got ${url.pathname}).`);
   }
+  return localhost;
 }
 
 /**

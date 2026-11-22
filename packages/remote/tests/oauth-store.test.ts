@@ -10,14 +10,16 @@ import {
   ABANDONED_GRANT_RETENTION_SECONDS,
   REVOKED_GRANT_RETENTION_SECONDS,
   UNUSED_CLIENT_RETENTION_SECONDS,
-  type OAuthStore
+  type OAuthStore,
+  type PendingSignIn
 } from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
+import { lockWaiters } from './support/two-process.js';
 
 /**
  * The store guarantees the provider relies on, run against both stores: always
  * the in-memory one, and Postgres when TEST_DATABASE_URL names a throwaway
- * database (its three tables are truncated before every test).
+ * database (its tables are truncated before every test).
  */
 
 const PG_URL = process.env.TEST_DATABASE_URL;
@@ -33,6 +35,22 @@ function signIn(overrides: Partial<HubSignIn> = {}): HubSignIn {
     sub: 'user-1',
     tenantId: 'org-1',
     email: 'user@example.com',
+    ...overrides
+  };
+}
+
+function pendingSignIn(overrides: Partial<PendingSignIn> = {}): PendingSignIn {
+  return {
+    clientId: 'c1',
+    redirectUri: 'https://a/cb',
+    codeChallenge: 'client-challenge',
+    state: 'st4te',
+    resource: 'https://mcp/mcp',
+    csrfHash: hashToken('csrf'),
+    browserKeyHash: hashToken('browser-key'),
+    approved: false,
+    hubVerifier: 'v'.repeat(43),
+    expiresAt: NOW() + 600,
     ...overrides
   };
 }
@@ -62,12 +80,12 @@ if (PG_URL) {
   harnesses.push([
     'postgres',
     async () => {
-      const store = await PgOAuthStore.connect(PG_URL, new TokenCipher(KEY_A));
+      const store = await PgOAuthStore.connect(PG_URL, new TokenCipher(KEY_A), 15_000);
       const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
       return {
         store,
         reset: async () => {
-          await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+          await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
         },
         close: async () => {
           await store.close();
@@ -206,6 +224,143 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     expect((await store().getGrant(id))?.hub).toBeUndefined();
   });
 
+  describe('pending sign-ins', () => {
+    const MAX = 10_000;
+
+    it('round-trips a pending sign-in, with and without its optional fields, until it expires', async () => {
+      const now = NOW();
+      const full = pendingSignIn({ expiresAt: now + 600 });
+      const bare = pendingSignIn({ expiresAt: now + 600 });
+      delete bare.state;
+      delete bare.resource;
+      expect(await store().createPendingSignIn('p1', full, MAX, now)).toBe(true);
+      expect(await store().createPendingSignIn('p2', bare, MAX, now)).toBe(true);
+
+      expect(await store().getPendingSignIn('p1', now)).toEqual(full);
+      expect(await store().getPendingSignIn('p2', now)).toEqual(bare);
+      expect(await store().getPendingSignIn('nope', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('p1', now + 600)).toBeUndefined();
+    });
+
+    it('approves only a live one, and a second approve (a double click) still succeeds', async () => {
+      const now = NOW();
+      // Starts unapproved whatever the caller passed: only Approve sets it.
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600, approved: true }), MAX, now);
+      expect((await store().getPendingSignIn('p1', now))?.approved).toBe(false);
+
+      expect(await store().approvePendingSignIn('p1', now)).toBe(true);
+      expect(await store().approvePendingSignIn('p1', now)).toBe(true);
+      expect((await store().getPendingSignIn('p1', now))?.approved).toBe(true);
+      expect(await store().approvePendingSignIn('nope', now)).toBe(false);
+      expect(await store().approvePendingSignIn('p1', now + 600)).toBe(false);
+    });
+
+    it('lets exactly one of two concurrent takes have it, approved flag included', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      await store().approvePendingSignIn('p1', now);
+
+      const taken = await Promise.all([
+        store().takePendingSignIn('p1', now),
+        store().takePendingSignIn('p1', now)
+      ]);
+      expect(taken.filter(Boolean)).toEqual([pendingSignIn({ expiresAt: now + 600, approved: true })]);
+      expect(await store().getPendingSignIn('p1', now)).toBeUndefined();
+    });
+
+    it('takes no expired one', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      expect(await store().takePendingSignIn('p1', now + 600)).toBeUndefined();
+    });
+
+    it('refuses a new one at the cap, counting only live ones, and deletes expired ones on insert', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('old', pendingSignIn({ expiresAt: now + 10 }), 2, now);
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), 2, now);
+      expect(await store().createPendingSignIn('p2', pendingSignIn({ expiresAt: now + 600 }), 2, now)).toBe(false);
+
+      // `old` has expired by now + 10: it no longer counts, and goes with the insert.
+      expect(await store().createPendingSignIn('p2', pendingSignIn({ expiresAt: now + 610 }), 2, now + 10)).toBe(true);
+      expect(await store().getPendingSignIn('old', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('p1', now)).toBeDefined();
+      expect(await store().createPendingSignIn('p3', pendingSignIn({ expiresAt: now + 610 }), 2, now + 10)).toBe(false);
+    });
+
+    it('names which of the given ids are still live', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('live', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      await store().createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), MAX, now);
+
+      expect(await store().livePendingSignInIds(['live', 'expired', 'unknown'], now + 5)).toEqual(
+        new Set(['live'])
+      );
+      expect(await store().livePendingSignInIds([], now)).toEqual(new Set());
+    });
+
+    it('the cleanup deletes expired ones and counts them', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), MAX, now);
+      await store().createPendingSignIn('live', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+
+      expect(await store().sweepExpiredOAuthRows(now + 5)).toEqual({
+        tokens: 0,
+        grants: 0,
+        clients: 0,
+        pendingSignIns: 1
+      });
+      expect(await store().getPendingSignIn('expired', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('live', now)).toBeDefined();
+    });
+  });
+
+  // The hub refresh single-flight across processes: one holder per grant, each
+  // reading what the previous holder saved.
+  it('runs grant lock holders one at a time, each reading the last one\'s save under the lock', async () => {
+    const id = await store().createGrant('c1', signIn());
+    const other = await store().createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    const order: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+
+    const first = store().withGrantLock(id, async (locked) => {
+      order.push('first');
+      expect(await locked.rotate('xort_1', next)).toBe(true);
+      await held;
+    });
+    await vi.waitFor(() => expect(order).toEqual(['first']));
+    const second = store().withGrantLock(id, async (locked) => {
+      order.push('second');
+      return locked.grant?.hub?.refreshToken;
+    });
+    // Another grant is not queued behind this one.
+    expect(await store().withGrantLock(other, async (locked) => locked.grant?.id)).toBe(other);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual(['first']);
+
+    release();
+    await first;
+    expect(await second).toBe('xort_2');
+    expect(order).toEqual(['first', 'second']);
+  });
+
+  it('frees the grant lock when the holder throws, and revokes through it', async () => {
+    const id = await store().createGrant('c1', signIn());
+    await expect(
+      store().withGrantLock(id, async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    await store().withGrantLock(id, (locked) => locked.revoke());
+    expect(await store().withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    expect(await store().withGrantLock('999999', async (locked) => locked.grant)).toBeUndefined();
+  });
+
   describe('sweepExpiredOAuthRows', () => {
     const DAY = 24 * 60 * 60;
     const client = (id: string) =>
@@ -224,7 +379,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       }
       await token(id, 'access', now); // expires at `now`: already unusable
 
-      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0, pendingSignIns: 0 });
       for (const kind of ['code', 'access', 'refresh'] as const) {
         expect(await hasToken(id, kind, now - 1)).toBe(false);
         expect(await hasToken(id, kind, now + 600)).toBe(true);
@@ -238,9 +393,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
@@ -250,9 +405,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
       expect(await store().getClient('c1')).toBeDefined();
     });
@@ -265,7 +420,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       const later = NOW() + 96 * DAY; // below ABANDONED_GRANT_RETENTION_SECONDS
       await token(revoked, 'refresh', later + 600);
 
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(revoked)).toBeDefined();
       expect(await store().getGrant(unrevoked)).toBeDefined();
     });
@@ -275,22 +430,22 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       const id = await store().createGrant('gone', signIn());
       await token(id, 'code', NOW() + 600);
 
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
     // The real path to that orphan: the client is swept, then the hub callback creates the grant.
     it('deletes the grant a callback created for a client swept during the sign-in, once its code expires', async () => {
       await store().saveClient(client('c1'));
-      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1, pendingSignIns: 0 });
       const id = await store().createGrant('c1', signIn());
       const codeExpiresAt = NOW() + 600;
       await token(id, 'code', codeExpiresAt);
 
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
-      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
@@ -300,10 +455,10 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().saveClient(client('c1'));
       const id = await store().createGrant('c1', signIn());
 
-      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
       // The client, past its own retention, loses its last grant and goes in the same run.
-      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
       expect(await store().getClient('c1')).toBeUndefined();
     });
@@ -319,9 +474,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       // Keeps the revoked grant (and so its client) past both retentions.
       await token(revoked, 'refresh', due + 600);
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getClient('unused')).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1, pendingSignIns: 0 });
       expect(await store().getClient('unused')).toBeUndefined();
       expect(await store().getClient('revoked')).toBeDefined();
       expect(await store().getClient('live')).toBeDefined();
@@ -336,7 +491,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(NOW() + 365 * DAY)).toEqual({
         tokens: 1,
         grants: 1,
-        clients: 1
+        clients: 1,
+        pendingSignIns: 0
       });
       expect(await store().getClient('c1')).toBeUndefined();
     });
@@ -350,8 +506,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
 
       // A young grant, and the latest run before ABANDONED_GRANT_RETENTION_SECONDS: both keep it.
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
-      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       await token(id, 'refresh', expiresAt + 600);
       expect((await store().getGrant(id))?.revoked).toBe(false);
       expect(await store().getClient('c1')).toBeDefined();
@@ -364,8 +520,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const later = NOW() + 365 * DAY;
 
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
     });
 
     // A second save or revoke must not restart a retention, or a junk client or ended grant lives on.
@@ -382,12 +538,14 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(first + 1 + REVOKED_GRANT_RETENTION_SECONDS)).toEqual({
         tokens: 0,
         grants: 1,
-        clients: 0
+        clients: 0,
+        pendingSignIns: 0
       });
       expect(await store().sweepExpiredOAuthRows(first + 1 + UNUSED_CLIENT_RETENTION_SECONDS)).toEqual({
         tokens: 0,
         grants: 0,
-        clients: 1
+        clients: 1,
+        pendingSignIns: 0
       });
     });
   });
@@ -397,7 +555,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 // role), and the steps after it are not issued.
 describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
   it('throws "the <step> step failed: <code>" with the cause, and issues no later step', async () => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     const pool = (store as unknown as { pool: pg.Pool }).pool;
     const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
     const issued: string[] = [];
@@ -431,30 +589,75 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
     admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
   });
   beforeEach(async () => {
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
   });
   afterAll(async () => {
     await admin.end();
   });
 
+  // A grant held by a hub refresh (the grant lock) is skipped, not waited on: with
+  // the main pool's 9 s lock_timeout the step would fail and skip the clients step.
+  it('skips a grant held by the grant lock, and still deletes the rest and runs the clients step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const held = await store.createGrant('c1', signIn());
+    const free = await store.createGrant('c1', signIn());
+    await store.revokeGrant(held);
+    await store.revokeGrant(free);
+    await store.saveClient({ client_id: 'unused', redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
+    const holder = await admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [held]);
+      const started = Date.now();
+      expect(await store.sweepExpiredOAuthRows(NOW() + 365 * 24 * 60 * 60)).toEqual({ tokens: 0, grants: 1, clients: 1, pendingSignIns: 0 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await store.close();
+    }
+  });
+
+  // Another deleter (a concurrent /authorize or the cleanup) holding an expired
+  // row must not make a sign-in start wait on the main pool's 9 s lock_timeout.
+  it('starts a pending sign-in without waiting on an expired row another deleter holds', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const now = NOW();
+    await store.createPendingSignIn('old', pendingSignIn({ expiresAt: now + 5 }), 10_000, now);
+    const holder = await admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_pending_sign_ins WHERE id_hash = $1 FOR UPDATE', [hashToken('old')]);
+      const started = Date.now();
+      expect(await store.createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 610 }), 10_000, now + 10)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await store.close();
+    }
+  });
+
   // Every dyno runs its own cleanup: a concurrent run deletes nothing the other one did.
   it('two concurrent runs on two pools delete each row once between them', async () => {
-    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
-    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     try {
       for (let i = 0; i < 3; i += 1) {
         await a.saveClient({ client_id: `c${i}`, redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
         const id = await a.createGrant(`c${i}`, signIn());
         await a.saveToken({ token: `t${i}`, kind: 'access', grantId: id, expiresAt: NOW() + 600 });
         await a.revokeGrant(id);
+        await a.createPendingSignIn(`p${i}`, pendingSignIn(), 10_000, NOW());
       }
       const later = NOW() + 365 * 24 * 60 * 60;
       const [fromA, fromB] = await Promise.all([a.sweepExpiredOAuthRows(later), b.sweepExpiredOAuthRows(later)]);
       expect({
         tokens: fromA.tokens + fromB.tokens,
         grants: fromA.grants + fromB.grants,
-        clients: fromA.clients + fromB.clients
-      }).toEqual({ tokens: 3, grants: 3, clients: 3 });
+        clients: fromA.clients + fromB.clients,
+        pendingSignIns: fromA.pendingSignIns + fromB.pendingSignIns
+      }).toEqual({ tokens: 3, grants: 3, clients: 3, pendingSignIns: 3 });
     } finally {
       await Promise.all([a.close(), b.close()]);
     }
@@ -462,7 +665,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
 
   // Else the next step would query an ended pool and the run would fail at shutdown.
   it('close() during a run lets the step in flight finish and issues no later step', async () => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     const pool = (store as unknown as { pool: pg.Pool }).pool;
     const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
     const issued: string[] = [];
@@ -479,11 +682,106 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
       await vi.waitFor(() => expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true));
       const closed = store.close();
       release();
-      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0 });
+      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       await closed;
       expect(issued.some((sql) => /DELETE FROM oauth_(grants|clients)/.test(sql))).toBe(false);
     } finally {
       vi.restoreAllMocks();
+    }
+  });
+});
+
+// The per-grant /mcp limit is shared by every process through this counter.
+describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
+  let admin: pg.Pool;
+  let a: PgOAuthStore;
+  let b: PgOAuthStore;
+  beforeAll(async () => {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+    a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+  });
+  beforeEach(async () => {
+    await admin.query('TRUNCATE mcp_rate_limit_counters');
+  });
+  afterAll(async () => {
+    await Promise.all([a.close(), b.close()]);
+    await admin.end();
+  });
+  const backdate = (key: string) =>
+    admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() - interval '1 second' WHERE key = $1`, [key]);
+
+  it('counts hits in a fixed window, and starts again at 1 once the window has ended', async () => {
+    const first = await a.countRateLimitHit('grant:1', 60_000);
+    expect(first.totalHits).toBe(1);
+    expect(first.resetTime.getTime()).toBeGreaterThan(Date.now() + 55_000);
+    expect(first.resetTime.getTime()).toBeLessThan(Date.now() + 65_000);
+    expect((await a.countRateLimitHit('grant:1', 60_000)).totalHits).toBe(2);
+    const third = await a.countRateLimitHit('grant:1', 60_000);
+    expect(third.totalHits).toBe(3);
+    // Same window end; rebuilt on the process clock per call, so within the calls' gap.
+    expect(Math.abs(third.resetTime.getTime() - first.resetTime.getTime())).toBeLessThan(1_000);
+    expect((await a.countRateLimitHit('grant:2', 60_000)).totalHits).toBe(1);
+
+    await backdate('grant:1');
+    const restarted = await a.countRateLimitHit('grant:1', 60_000);
+    expect(restarted.totalHits).toBe(1);
+    expect(restarted.resetTime.getTime()).toBeGreaterThan(Date.now() + 55_000);
+  });
+
+  it('restarts a window that ends more than one window ahead (the database clock stepped back)', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await a.countRateLimitHit('grant:1', 60_000);
+    await admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() + interval '1 hour' WHERE key = 'grant:1'`);
+    const restarted = await a.countRateLimitHit('grant:1', 60_000);
+    expect(restarted.totalHits).toBe(1);
+    expect(restarted.resetTime.getTime()).toBeLessThan(Date.now() + 65_000);
+  });
+
+  it('builds resetTime on the process clock from the time left, so a skewed database clock does not shift it', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() + interval '30 seconds' WHERE key = 'grant:1'`);
+    const processNow = Date.now() + 3_600_000;
+    vi.useFakeTimers({ toFake: ['Date'], now: processNow });
+    try {
+      const { resetTime } = await a.countRateLimitHit('grant:1', 60_000);
+      expect(resetTime.getTime()).toBeGreaterThan(processNow + 25_000);
+      expect(resetTime.getTime()).toBeLessThanOrEqual(processNow + 30_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shares one count between two stores on one database', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await b.countRateLimitHit('grant:1', 60_000);
+    const hits = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => (i % 2 ? a : b).countRateLimitHit('grant:1', 60_000))
+    );
+    expect(hits.map((hit) => hit.totalHits).sort((x, y) => x - y)).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  it('the cleanup deletes a counter whose window has ended and keeps a live one, reporting no count', async () => {
+    await a.countRateLimitHit('grant:stale', 60_000);
+    await a.countRateLimitHit('grant:live', 60_000);
+    await backdate('grant:stale');
+
+    expect(await a.sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+    const keys = (await admin.query<{ key: string }>('SELECT key FROM mcp_rate_limit_counters')).rows;
+    expect(keys).toEqual([{ key: 'grant:live' }]);
+  });
+
+  it('the cleanup names the rateLimitCounters step and its code only when that step fails', async () => {
+    await admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
+    try {
+      const error = await a.sweepExpiredOAuthRows(NOW()).then(
+        () => undefined,
+        (rejected: unknown) => rejected as Error
+      );
+      expect(error?.message).toBe('the rateLimitCounters step failed: 42P01');
+      expect((error?.cause as { code?: string } | undefined)?.code).toBe('42P01');
+    } finally {
+      await admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
     }
   });
 });
@@ -493,7 +791,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   let admin: pg.Pool;
   const stores: PgOAuthStore[] = [];
   const open = async (current: Buffer, previous?: Buffer) => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(current, previous));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(current, previous), 15_000);
     stores.push(store);
     return store;
   };
@@ -518,14 +816,46 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
   });
   beforeEach(async () => {
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
   });
   afterAll(async () => {
     vi.restoreAllMocks();
     await Promise.all(stores.map((store) => store.close()));
     // Live rows under this run's random keys would stop the next run's boots.
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
     await admin.end();
+  });
+
+  it('stores a pending sign-in with its id, csrf and browser key hashed and its hub verifier encrypted', async () => {
+    const store = await open(KEY_A);
+    await store.createPendingSignIn('pending-id', pendingSignIn(), 10_000, NOW());
+
+    const { rows } = await admin.query('SELECT * FROM oauth_pending_sign_ins');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id_hash: hashToken('pending-id'),
+      csrf_hash: hashToken('csrf'),
+      browser_key_hash: hashToken('browser-key'),
+      hub_pkce_verifier: expect.stringMatching(new RegExp(`^v1\\.${new TokenCipher(KEY_A).currentKeyId}\\.`))
+    });
+    expect(JSON.stringify(rows)).not.toContain('pending-id');
+    expect(JSON.stringify(rows)).not.toContain('v'.repeat(43));
+  });
+
+  // A pending sign-in written under a key this instance lacks (a rotation
+  // without the previous key) cannot finish; it reads as gone, never a crash.
+  it('reads a pending sign-in whose verifier it cannot decrypt as gone, logging the reason', async () => {
+    const writer = await open(KEY_A);
+    const reader = await open(KEY_B);
+    await writer.createPendingSignIn('p1', pendingSignIn(), 10_000, NOW());
+
+    const logText = captureLog();
+    expect(await reader.getPendingSignIn('p1', NOW())).toBeUndefined();
+    expect(await reader.takePendingSignIn('p1', NOW())).toBeUndefined();
+    // The take deleted the row before its decrypt failed: gone for every instance.
+    expect(await writer.getPendingSignIn('p1', NOW())).toBeUndefined();
+    expect(logText()).toContain('pending sign-in unreadable: unknown key id');
+    expect(logText()).not.toContain('v'.repeat(43));
   });
 
   it('logs the key ids at boot, and never a key', async () => {
@@ -669,6 +999,150 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(await store.hasLiveHubSibling('user-1', 'org-1', next)).toBe(false);
   });
 
+  // getGrant's revoke runs on the main pool and would wait on the row the lock holds.
+  it('revokes an unreadable grant read under the grant lock on the locked connection', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    expect(await store.withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    vi.restoreAllMocks();
+    expect(logText()).toContain('"reason":"unreadable_token"');
+    expect((await row(id)).hub_refresh_token).toBeNull();
+  });
+
+  // A token INSERT takes FOR KEY SHARE on its grant (the foreign key): a /token
+  // exchange during a hub refresh must not wait for the refresh.
+  it('saves a token for a grant while another holds that grant\'s lock', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    let release!: () => void;
+    let locked!: () => void;
+    const inside = new Promise<void>((resolve) => (locked = resolve));
+    const holder = store.withGrantLock(id, () => {
+      locked();
+      return new Promise<void>((resolve) => (release = resolve));
+    });
+    await inside;
+    try {
+      const saved = store.saveToken({ token: 'during', kind: 'access', grantId: id, expiresAt: NOW() + 600 });
+      const outcome = await Promise.race([
+        saved.then(() => 'saved'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 2_000))
+      ]);
+      expect(outcome).toBe('saved');
+    } finally {
+      release();
+      await holder;
+    }
+  });
+
+  // Without a client timeout, a statement on a half-open connection hangs for
+  // minutes, and the refresh flight with every call joined to it.
+  it('bounds each grant lock statement client-side above the lock wait, with TCP keepalive', async () => {
+    const store = await open(KEY_A);
+    const { options } = (store as unknown as { lockPool: pg.Pool & { options: Record<string, unknown> } }).lockPool;
+    expect(options).toMatchObject({ query_timeout: 25_000, keepAlive: true });
+  });
+
+  // The revoke of an unreadable grant read under the lock commits with the lock:
+  // rolled back, it did not happen, so it must not be logged.
+  it('logs the unreadable-token revoke under the grant lock only once it has committed', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    await expect(
+      store.withGrantLock(id, async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    vi.restoreAllMocks();
+    expect(logText()).not.toContain('"event":"revoke"');
+    expect((await row(id)).hub_refresh_token).toBe('xort_plain'); // rolled back
+  });
+
+  // close() between the closing check and the checkout: the pool is already ended.
+  it('answers a grant lock attempt that meets an ended pool as restarting', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const id = await store.createGrant('c1', signIn());
+    const lockPool = (store as unknown as { lockPool: pg.Pool }).lockPool;
+    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
+    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
+      await store.close();
+      return connect();
+    }) as never);
+    await expect(store.withGrantLock(id, async () => undefined)).rejects.toMatchObject({
+      kind: 'network',
+      message: 'The server is restarting.'
+    });
+    vi.restoreAllMocks();
+  });
+
+  // Shutdown: a waiter queued on another process's lock sends nothing, so it must
+  // not hold close() until its lock_timeout.
+  it('close() does not wait for a grant lock waiter, and refuses new lock attempts', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const id = await store.createGrant('c1', signIn());
+    const holder = await admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [id]);
+    const waiter = store.withGrantLock(id, async () => undefined).catch(() => undefined);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    try {
+      await vi.waitFor(async () => expect(await lockWaiters(pool)).toBe(1), { timeout: 5_000 });
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await expect(store.withGrantLock(id, async () => undefined)).rejects.toMatchObject({
+        kind: 'network',
+        message: 'The server is restarting.'
+      });
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await waiter;
+    }
+  });
+
+  // Server-side, under the pool's 10 s query_timeout: a statement the client gave
+  // up on must not wait on, then apply, an UPDATE later.
+  it('bounds the main pool\'s lock waits server-side below its query timeout', async () => {
+    const store = await open(KEY_A);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    expect((await pool.query<{ lock_timeout: string }>('SHOW lock_timeout')).rows[0]!.lock_timeout).toBe('9s');
+  });
+
+  it('clamps an out-of-range hub timeout, so the grant lock still sets valid limits', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 1e21);
+    stores.push(store);
+    const id = await store.createGrant('c1', signIn());
+    expect(await store.withGrantLock(id, async (locked) => locked.grant?.id)).toBe(id);
+  });
+
+  it('rolls back what the grant lock holder wrote when it throws', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    await expect(
+      store.withGrantLock(id, async (locked) => {
+        await locked.rotate('xort_1', next);
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    expect((await row(id)).hub_refresh_token_hash).toBe(hashToken('xort_1'));
+  });
+
   // An old dyno still serving during the deploy writes plain text.
   it('revokes a plaintext row on read, without logging the token', async () => {
     const store = await open(KEY_A);
@@ -712,7 +1186,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   // Only a TokenDecryptError means "unreadable": any other failure is a bug, not a reason to sign out.
   it('rejects, and revokes nothing, when decrypting fails with a plain error', async () => {
     const cipher = new TokenCipher(KEY_A);
-    const store = await PgOAuthStore.connect(PG_URL!, cipher);
+    const store = await PgOAuthStore.connect(PG_URL!, cipher, 15_000);
     stores.push(store);
     const id = await store.createGrant('c1', signIn());
     vi.spyOn(cipher, 'decrypt').mockImplementation(() => {

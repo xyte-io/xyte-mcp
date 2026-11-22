@@ -632,7 +632,7 @@ describe('oauth over http, in order', () => {
     ]);
   });
 
-  it.skipIf(!PG_URL)('deletes expired tokens and old unused clients at boot, logging the counts', async () => {
+  it.skipIf(!PG_URL)('deletes expired tokens, pending sign-ins and old unused clients at boot, logging the counts', async () => {
     const grant = await admin!.query<{ id: string }>(
       `SELECT id FROM ${PG_SCHEMA}.oauth_grants WHERE revoked_at IS NULL LIMIT 1`
     );
@@ -645,6 +645,11 @@ describe('oauth over http, in order', () => {
        VALUES ('expired-token', 'access', $1, now() - interval '1 hour')`,
       [grant.rows[0]!.id]
     );
+    await admin!.query(
+      `INSERT INTO ${PG_SCHEMA}.oauth_pending_sign_ins
+         (id_hash, client_id, redirect_uri, code_challenge, csrf_hash, browser_key_hash, hub_pkce_verifier, expires_at)
+       VALUES ('expired-pending', 'c', 'https://a/cb', 'ch', 'x', 'y', 'v', now() - interval '1 hour')`
+    );
     const exited = new Promise((resolve) => child!.once('exit', resolve));
     child!.kill('SIGTERM');
     await exited;
@@ -654,13 +659,14 @@ describe('oauth over http, in order', () => {
     await vi.waitFor(
       () =>
         expect(stderr.slice(logged).join('')).toMatch(
-          /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\)/
+          /OAuth store cleanup: deleted [1-9]\d* expired token\(s\), \d+ ended grant\(s\), 1 unused client\(s\), 1 expired pending sign-in\(s\)/
         ),
       { timeout: 10_000 }
     );
     const left = await admin!.query(
       `SELECT 1 FROM ${PG_SCHEMA}.oauth_clients WHERE client_id = 'unused-client'
-       UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_tokens WHERE token_hash = 'expired-token'`
+       UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_tokens WHERE token_hash = 'expired-token'
+       UNION ALL SELECT 1 FROM ${PG_SCHEMA}.oauth_pending_sign_ins WHERE id_hash = 'expired-pending'`
     );
     expect(left.rowCount).toBe(0);
   });

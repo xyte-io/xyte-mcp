@@ -48,9 +48,10 @@ import { errorCodeOf, logEvent } from '../log-event.js';
  *   consent page, delegates sign-in to hub's OAuth server, and every verified
  *   token resolves to its grant's hub token — built into a per-request
  *   `createToolContext`, exactly as `context.ts` promised. Client tokens are
- *   never forwarded to the hub (confused-deputy). Tokens live in Postgres
- *   (`DATABASE_URL`) so they survive a dyno restart; without it, an in-memory
- *   store that loudly warns.
+ *   never forwarded to the hub (confused-deputy). Tokens and sign-ins in
+ *   progress live in Postgres (`DATABASE_URL`), so they survive a dyno restart
+ *   and any instance serves any step; without it (config allows that only for
+ *   a localhost issuer), an in-memory store that loudly warns.
  *
  * Read-only unless `XYTE_MCP_ALLOW_WRITES=1`: unlike stdio, writes are opt-in.
  */
@@ -64,7 +65,8 @@ const CALLBACK_PATH = '/oauth/callback';
 /** Caller-controlled strings are capped before they reach the log stream. */
 const MAX_LOGGED_PATH = 64;
 
-// In-memory limits: one dyno today; a shared store comes with the multi-dyno work.
+// The per-grant /mcp limit is shared by every instance through Postgres (when
+// there is a database); the per-IP limits are in memory, per instance.
 const RATE_LIMIT_WINDOW_MS = 60_000;
 /** Per OAuth grant (one connection), not per IP: claude.ai and ChatGPT call from shared backend IPs. */
 const MCP_CALLS_PER_GRANT_PER_MINUTE = 60;
@@ -109,6 +111,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   app.set('trust proxy', 1);
 
   let store: OAuthStore | undefined;
+  let pgStore: PgOAuthStore | undefined;
   let provider: XyteOAuthProvider | undefined;
 
   // Before the auth check: a platform health probe carries no credentials, and
@@ -148,10 +151,11 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   });
   if (oauth) {
     if (oauth.databaseUrl) {
-      store = await PgOAuthStore.connect(
+      store = pgStore = await PgOAuthStore.connect(
         oauth.databaseUrl,
         // resolveHttpConfig refuses a database without a key.
-        new TokenCipher(oauth.tokenKey!, oauth.previousTokenKey)
+        new TokenCipher(oauth.tokenKey!, oauth.previousTokenKey),
+        config.timeoutMs
       );
     } else {
       store = new MemoryOAuthStore();
@@ -229,37 +233,59 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     );
   };
   const identityOf = (res: Response) => res.locals.identity as Caller | undefined;
-  const mcpRateLimit = rateLimit({
+  // A flooded IP sees this instead of the 401 until its window ends.
+  const refuseRateLimited = (req: Request, res: Response) => {
+    const { used, limit, resetTime } = (req as Request & { rateLimit: RateLimitInfo }).rateLimit;
+    // Only the first refusal per key per window: a flood would otherwise log every call.
+    if (used === limit + 1) {
+      const grantId = identityOf(res)?.who.connection;
+      logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
+    }
+    // Clients surface the message, not Retry-After, so the wait goes in the text too.
+    const resetMs = resetTime ? resetTime.getTime() - Date.now() : RATE_LIMIT_WINDOW_MS;
+    const waitSeconds = Math.max(1, Math.ceil(resetMs / 1000));
+    respondJsonRpcError(res, 429, -32000, `rate limit exceeded, retry in ${waitSeconds} s`);
+  };
+  const mcpIpRateLimit = rateLimit({
     windowMs: RATE_LIMIT_WINDOW_MS,
-    limit: (_req, res) =>
-      identityOf(res)
-        ? MCP_CALLS_PER_GRANT_PER_MINUTE
-        : MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE,
-    keyGenerator: (req, res) => {
-      const identity = identityOf(res);
-      return identity ? `grant:${identity.who.connection}` : ipKeyGenerator(req.ip ?? '');
-    },
+    limit: MCP_UNAUTHENTICATED_CALLS_PER_IP_PER_MINUTE,
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    skip: (_req, res) => identityOf(res) !== undefined,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    handler: refuseRateLimited
+  });
+  const sharedCounters = pgStore;
+  const grantRateLimit = rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: MCP_CALLS_PER_GRANT_PER_MINUTE,
+    keyGenerator: (_req, res) => `grant:${identityOf(res)!.who.connection}`,
     // The static bearer is one shared dev/CI identity, so it is not limited.
-    skip: (_req, res) => {
-      const identity = identityOf(res);
-      return identity !== undefined && identity.who.connection === undefined;
+    skip: (_req, res) => identityOf(res)?.who.connection === undefined,
+    // Without a database (localhost only), the library's in-memory store.
+    store: sharedCounters && {
+      localKeys: false,
+      increment: (key) => sharedCounters.countRateLimitHit(key, RATE_LIMIT_WINDOW_MS),
+      // ponytail: no-ops, nothing calls them. Add real queries if
+      // skipFailedRequests or skipSuccessfulRequests is ever turned on.
+      decrement: async () => {},
+      resetKey: async () => {}
     },
     standardHeaders: 'draft-8',
     legacyHeaders: false,
-    // A flooded IP sees this instead of the 401 until its window ends.
-    handler: (req, res) => {
-      const { used, limit, resetTime } = (req as Request & { rateLimit: RateLimitInfo }).rateLimit;
-      // Only the first refusal per key per window: a flood would otherwise log every call.
-      if (used === limit + 1) {
-        const grantId = identityOf(res)?.who.connection;
-        logError(`429 ${req.method} ${MCP_PATH} — rate limited (${grantId ? `grant ${grantId}` : 'per IP'})`);
-      }
-      // Clients surface the message, not Retry-After, so the wait goes in the text too.
-      const resetMs = resetTime ? resetTime.getTime() - Date.now() : RATE_LIMIT_WINDOW_MS;
-      const waitSeconds = Math.max(1, Math.ceil(resetMs / 1000));
-      respondJsonRpcError(res, 429, -32000, `rate limit exceeded, retry in ${waitSeconds} s`);
-    }
+    handler: refuseRateLimited
   });
+  // express-rate-limit passes a store error to next(error); a database outage is
+  // a retryable 503, the same answer as a failed token check.
+  const mcpGrantRateLimit = (req: Request, res: Response, next: NextFunction) => {
+    void grantRateLimit(req, res, (error?: unknown) => {
+      if (error) {
+        logError(`rate limit check failed: ${errorCodeOf(error)}`);
+        return respondJsonRpcError(res, 503, -32603, 'temporarily unavailable, retry');
+      }
+      next();
+    });
+  };
 
   // Parsed here, after auth, only to refuse JSON-RPC batches: the SDK runs up to 100
   // messages of one POST in parallel, which would multiply the per-grant limit (and
@@ -270,7 +296,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     inflate: false,
     type: (req) => isJsonContentType(req.headers['content-type'])
   });
-  app.post(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+  app.post(MCP_PATH, resolveCaller, mcpIpRateLimit, mcpGrantRateLimit, (req, res) => {
     const identity = identityOf(res);
     if (!identity) return respondUnauthorized(req, res, mcpAuth);
     parseMcpBody(req, res, (error?: unknown) => {
@@ -312,7 +338,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // parks an idle stream on the dyno until Heroku's 55s router timeout kills
   // it, and reconnects. DELETE is the same kind of lie: it reports 200 for
   // terminating a session that was never created.
-  app.all(MCP_PATH, resolveCaller, mcpRateLimit, (req, res) => {
+  app.all(MCP_PATH, resolveCaller, mcpIpRateLimit, mcpGrantRateLimit, (req, res) => {
     // Auth first, as on POST: an unauthenticated caller learns nothing about
     // the endpoint, not even which methods it supports.
     if (!identityOf(res)) return respondUnauthorized(req, res, mcpAuth);
@@ -339,9 +365,9 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     logError(`http listener failed: ${error.message}`);
     process.exit(1);
   });
-  // OAuth mode: expired tokens, and grants and clients nothing uses any more,
-  // are deleted now and then hourly. One run at a time; the next tick retries
-  // a failed run.
+  // OAuth mode: expired pending sign-ins and tokens, and grants and clients
+  // nothing uses any more, are deleted now and then hourly. One run at a time;
+  // the next tick retries a failed run.
   let oauthCleanup: NodeJS.Timeout | undefined;
   if (store) {
     const cleanupStore = store;
@@ -351,10 +377,11 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       cleaning = true;
       try {
         const deleted = await cleanupStore.sweepExpiredOAuthRows(Math.floor(Date.now() / 1000));
-        if (deleted.tokens || deleted.grants || deleted.clients) {
+        if (deleted.tokens || deleted.grants || deleted.clients || deleted.pendingSignIns) {
           log(
             `OAuth store cleanup: deleted ${deleted.tokens} expired token(s), ` +
-              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s)`
+              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s), ` +
+              `${deleted.pendingSignIns} expired pending sign-in(s)`
           );
         }
       } catch (error) {

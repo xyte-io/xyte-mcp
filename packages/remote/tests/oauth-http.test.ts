@@ -589,7 +589,8 @@ describe('oauth over http, in order', () => {
     expect(client.client_secret).toBeTruthy();
     expect(client.client_secret_expires_at).toBe(0);
 
-    // The stored client authenticates at /token: past client auth, the bogus refresh token fails.
+    // The stored client authenticates with its secret at /token (past client auth, the bogus
+    // refresh token fails). This does not pin the stored expiry; the registration answer does.
     const refresh = (secret: string) =>
       fetch(`${base}/token`, {
         method: 'POST',
@@ -605,6 +606,7 @@ describe('oauth over http, in order', () => {
     expect(accepted.status).toBe(400);
     expect(((await accepted.json()) as { error: string }).error).toBe('invalid_grant');
     const refused = await refresh('wrong-secret');
+    expect(refused.status).toBe(400);
     expect(((await refused.json()) as { error: string }).error).toBe('invalid_client');
   });
 

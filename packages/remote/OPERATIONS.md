@@ -191,10 +191,12 @@ reaches it together, 90 days later.
 
 On an OAuth app (`XYTE_MCP_ISSUER_URL` set) with `DATABASE_URL`, the Procfile's release phase
 applies the schema migrations once per release (and Heroku runs it again on a config-var change
-and a rollback); otherwise it logs `nothing to migrate` and passes. It first checks the config
-the way a web dyno's boot does. When it fails, the release log
+and a rollback); otherwise it logs `nothing to migrate` and passes. It first resolves the HTTP config
+as a web dyno's boot does; it does not check the token key against the stored hub tokens, so a
+key the live connections were not written with passes the release and is refused only at boot
+(see the README's key rotation steps). When it fails, the release log
 (`heroku releases:output <version> -a <app>`) ends with `[xyte-mcp] error: OAuth store
-migration failed: <reason>`, or with the config error for a config the web dynos would refuse,
+migration failed: <reason>`, or with the config error,
 possibly followed by hints, and `heroku releases -a <app>` shows that release as failed. No new
 dyno starts: the old build keeps serving, and the database is unchanged (a config error stops
 the release before any migration; all pending migrations run in one transaction).

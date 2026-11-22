@@ -161,7 +161,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
     expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain(
-      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, booting`
+      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, continuing`
     );
   });
 
@@ -275,7 +275,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
     expect(await appliedVersions()).toEqual([BASELINE, { version: 2, name: 'newer', breaks_rollback: false }]);
     expect(logText()).toContain(
-      "OAuth store schema is at version 2, newer than this build's 1; those versions are rollback-safe, booting"
+      "OAuth store schema is at version 2, newer than this build's 1; those versions are rollback-safe, continuing"
     );
     expect(logText()).not.toContain('migrated to version');
   });

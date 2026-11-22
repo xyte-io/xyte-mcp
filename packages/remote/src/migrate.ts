@@ -5,9 +5,11 @@
  * fails the release, so the running dynos keep serving the old build. The web
  * boot still calls migrateOAuthSchema, which then finds nothing to apply.
  *
- * It resolves the config the web boot does first, so a config the new dynos
- * would refuse fails the release before a migration (perhaps one that breaks
- * rollback) is applied. resolveHttpConfig is pure (no log, no I/O) and needs no
+ * It resolves the HTTP config first (resolveHttpConfig, as the web boot does),
+ * so a config error fails the release before a migration (perhaps one that
+ * breaks rollback) is applied. It does not run the boot's hub token key-id
+ * check: a token key the live grants were not written with passes the release
+ * and is refused only at boot (README, key rotation). resolveHttpConfig is pure (no log, no I/O) and needs no
  * PORT: unset, it defaults (a release dyno gets none); set but invalid, the web
  * boot would refuse it too.
  */

@@ -274,9 +274,11 @@ rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). T
 
 On an OAuth app (`XYTE_MCP_ISSUER_URL` set) with `DATABASE_URL`, the Procfile's release phase
 applies the schema migrations once per release, before any new dyno starts; a failed migration
-fails the release, and the running dynos keep serving the old build. It first checks the config
-the way a web dyno's boot does: a config error (say `XYTE_MCP_TOKEN_KEY` missing) fails the
-release before any migration runs. Heroku also runs the
+fails the release, and the running dynos keep serving the old build. It first resolves the HTTP config
+as a web dyno's boot does: a config error (say `XYTE_MCP_TOKEN_KEY` missing) fails the
+release before any migration runs. It does not check the token key against the stored hub
+tokens: a key the live connections were not written with passes the release and is refused
+only when the new dynos boot (see the key rotation steps). Heroku also runs the
 release phase on a config-var change and on a rollback: a rollback to an older build that has
 the release phase (this one onward) against a newer breaking schema fails there (the older
 build refuses it), so the rollback stops before any dyno restarts. A rollback to an earlier

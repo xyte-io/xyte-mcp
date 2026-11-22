@@ -218,8 +218,8 @@ export async function migrateOAuthSchema(
       let adopting: boolean;
       try {
         // Server-side, unlike pg's client-side query_timeout: waiting longer
-        // than this for another boot's lock, or for a table a running query
-        // holds, fails the boot instead of hanging it.
+        // than this for another run's lock, or for a table a running query
+        // holds, fails the run (release or boot) instead of hanging it.
         await client.query(`SET LOCAL lock_timeout = '10s'`);
         await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
         await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
@@ -257,7 +257,7 @@ export async function migrateOAuthSchema(
       }
       if (newer.length) {
         log(
-          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, booting`
+          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, continuing`
         );
       }
       const appliedVersions = new Set(applied.map((row) => row.version));

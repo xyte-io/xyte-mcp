@@ -44,9 +44,10 @@ async function runMigrate(vars: Record<string, string | undefined>): Promise<{ c
 describe('migrate entry without a database', () => {
   it('is the entry the Procfile release line runs', () => {
     const procfile = readFileSync(path.resolve(import.meta.dirname, '..', '..', '..', 'Procfile'), 'utf8');
-    const release = procfile.split('\n').find((line) => line.startsWith('release:'));
+    // A Windows checkout has CRLF line ends and backslash paths.
+    const release = procfile.split(/\r?\n/).find((line) => line.startsWith('release:'));
     expect(release).toMatch(/ node packages\/remote\/dist\/migrate\.js$/);
-    expect(path.relative(path.resolve(import.meta.dirname, '..', '..', '..'), MIGRATE_ENTRY)).toBe(
+    expect(path.relative(path.resolve(import.meta.dirname, '..', '..', '..'), MIGRATE_ENTRY).split(path.sep).join('/')).toBe(
       'packages/remote/dist/migrate.js'
     );
   });

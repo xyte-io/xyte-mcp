@@ -45,8 +45,10 @@ if (!config) {
       connectionString: databaseUrl,
       ...sslOption(databaseUrl),
       connectionTimeoutMillis: 10_000,
-      // A half-open connection during a failover then errors instead of hanging the release.
+      // A half-open connection during a failover then errors instead of hanging the
+      // release. pg's initial delay defaults to 0, which leaves the OS default (hours).
       keepAlive: true,
+      keepAliveInitialDelayMillis: 10_000,
       max: 1
     });
     pool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));

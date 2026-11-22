@@ -279,7 +279,8 @@ as a web dyno's boot does: a config error (say `XYTE_MCP_TOKEN_KEY` missing) fai
 release before any migration runs. It does not check the token key against the stored hub
 tokens: a key the live connections were not written with passes the release and is refused
 only when the new dynos boot (see the key rotation steps). Heroku also runs the
-release phase on a config-var change and on a rollback: a rollback to an older build that has
+release phase on a config-var change you make (not on an add-on's own change, such as a
+Postgres credential rotation of `DATABASE_URL`) and on a rollback: a rollback to an older build that has
 the release phase (this one onward) against a newer breaking schema fails there (the older
 build refuses it), so the rollback stops before any dyno restarts. A rollback to an earlier
 build has no release phase: its dynos restart and refuse to boot, so never roll back past a
@@ -287,7 +288,9 @@ breaking migration. Preboot, rolling deploys and several web dynos are
 allowed (see **Several dynos** below). The exception is a release that contains a
 `breaksRollback: true` migration: turn preboot off for that release
 (`heroku features:disable preboot -a <app>`; `strategy: Recreate` on EKS), so no new process
-serves next to an old one longer than the shutdown drain.
+serves next to an old one longer than the shutdown drain. Off Heroku (EKS, a local run) there is
+no release phase and the migrations run at boot, so with `Recreate` a failed migration means
+downtime until a fixed build ships.
 
 Upgrading from a build without the cross-process refresh lock, a refresh on an old and a new
 process while they overlap can race; the loser gets `invalid_grant` from hub and that
@@ -541,11 +544,15 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Several dynos.** Sign-ins in progress, the hub token refresh lock (a Postgres row lock lets
   one process at a time refresh a connection) and the per-connection `/mcp` counter are shared
   through Postgres, so a sign-in started on one process finishes on any other. The per-IP
-  limits stay per process by design: N processes allow N times the per-IP budget. Each process
+  limits stay per process by design: N processes allow N times the per-IP budget. One other
+  piece is per process: after a database error during a hub refresh, the rotated hub token
+  pair may live only in that process's memory; another dyno serving that connection then
+  sends the stored, already-used refresh token, and the user has to sign in again. Each process
   holds up to 8 Postgres connections (5 for requests, 3 for the refresh lock), plus 1 briefly at
   boot for the schema check; the release phase holds 1 while it runs. During a preboot or
   rolling deploy old and new dynos overlap, so the peak is about 2 × dynos × 8 + 1. Check that
-  against the Postgres plan's connection limit before scaling.
+  against the Postgres plan's connection limit before scaling: the release's 1 connection must
+  fit under it while all old dynos hold theirs.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of

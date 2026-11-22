@@ -65,9 +65,10 @@ export interface Migration {
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
  * Postgres) is not allowed here. They run in the release phase (src/migrate.ts),
  * before any new dyno starts; the boot call then finds nothing to apply and only
- * refuses a newer breaking schema. Statements have no time limit, but a release
- * without a release phase (a local run, another platform) migrates at boot,
- * where a long data rewrite counts against the boot timeout — keep those out.
+ * refuses a newer breaking schema. Statements have no time limit, yet no long
+ * rewrites or long lock holds, on either path: old dynos keep serving during the
+ * release phase, and a run without one (a local run, another platform) migrates
+ * at boot, where it counts against the boot timeout.
  */
 export const MIGRATIONS: ReadonlyArray<Migration> = [
   // IF NOT EXISTS, so a database created before versioning is adopted as
@@ -173,12 +174,20 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
 /** Arbitrary, constant: the advisory lock serializing schema migrations. */
 const SCHEMA_LOCK_ID = 674_601;
 
+/**
+ * pg's detail, except for an integrity constraint error (SQLSTATE class 23):
+ * its detail is "Failing row contains (...)", row data with emails and tokens.
+ */
+function loggableDetail(error: { code?: string; detail?: string }): string | undefined {
+  return error.code?.startsWith('23') ? undefined : error.detail;
+}
+
 /** The error a failed schema step throws, with the pg fields that locate it. */
 function schemaError(step: string, error: unknown): Error {
   const pgError = error as Partial<pg.DatabaseError>;
   const details = [
     pgError.code && `code ${pgError.code}`,
-    pgError.detail,
+    loggableDetail(pgError),
     pgError.hint,
     pgError.position && `at character ${pgError.position}`
   ]
@@ -375,9 +384,9 @@ export function bootConnectionHints(error: unknown): string[] {
 }
 
 /**
- * The boot failure in one line. pg's own code and detail are kept, and a Node 22
- * multi-address connect failure (an AggregateError with an empty message) shows
- * its inner errors.
+ * The boot failure in one line. pg's own code and detail (loggableDetail) are
+ * kept, and a Node 22 multi-address connect failure (an AggregateError with an
+ * empty message) shows its inner errors.
  */
 export function bootFailureMessage(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -385,8 +394,10 @@ export function bootFailureMessage(error: unknown): string {
     error instanceof AggregateError
       ? error.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
       : [];
-  const { code, detail } = error as Error & { code?: string; detail?: string };
-  return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
+  const pgError = error as Error & { code?: string; detail?: string };
+  return [error.message || inner.join('; '), pgError.code && `[${pgError.code}]`, loggableDetail(pgError)]
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**

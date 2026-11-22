@@ -221,6 +221,14 @@ describe('bootFailureMessage', () => {
     expect(bootFailureMessage(error)).toBe('relation exists [42P07] Key (x)=(1).');
   });
 
+  it('drops the detail of an integrity constraint error (class 23), which holds row data', () => {
+    const error = Object.assign(new Error('null value in column "client_id" violates not-null constraint'), {
+      code: '23502',
+      detail: 'Failing row contains (1, null, user@example.com, v1.secret).'
+    });
+    expect(bootFailureMessage(error)).toBe('null value in column "client_id" violates not-null constraint [23502]');
+  });
+
   it('shows the inner errors of an AggregateError with no message', () => {
     const error = Object.assign(
       new AggregateError(

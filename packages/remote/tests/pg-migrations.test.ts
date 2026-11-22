@@ -245,6 +245,20 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     expect(await tablesIn()).toEqual([]);
   });
 
+  it('names the code but not the row data of a migration that fails an integrity constraint', async () => {
+    const failing: Migration[] = [
+      {
+        version: 1,
+        name: 'not_null',
+        sql: `CREATE TABLE secrets (a int NOT NULL, b text); INSERT INTO secrets VALUES (NULL, 'row-secret');`,
+        breaksRollback: false
+      }
+    ];
+    const error = (await migrateOAuthSchema(poolForSchema(), failing).catch((e: unknown) => e)) as Error;
+    expect(error.message).toContain('(code 23502');
+    expect(error.message).not.toContain('row-secret');
+  });
+
   it('leaves an already-migrated database at its version when a later migration fails', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool, V1);

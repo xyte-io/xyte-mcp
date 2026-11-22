@@ -583,6 +583,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
       );
       expect(logged).not.toContain('secret');
       expect(issued.some((sql) => sql.includes('DELETE FROM oauth_clients'))).toBe(false);
+      expect(issued.some((sql) => sql.includes('DELETE FROM mcp_rate_limit_counters'))).toBe(false);
     } finally {
       vi.restoreAllMocks();
       await store.close();
@@ -779,10 +780,13 @@ describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
   });
 
   it('the cleanup logs the rateLimitCounters step and its code only when that step fails, and still returns the counts', async () => {
+    await admin.query('TRUNCATE oauth_pending_sign_ins');
+    const now = NOW();
+    await a.createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), 10_000, now);
     await admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
     const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      expect(await a.sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+      expect(await a.sweepExpiredOAuthRows(now + 10)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 1 });
       expect(write.mock.calls.map((call) => String(call[0])).join('')).toContain(
         '[xyte-mcp] error: OAuth store cleanup: the rateLimitCounters step failed, retried within an hour: 42P01'
       );

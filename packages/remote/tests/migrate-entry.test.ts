@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { MIGRATIONS } from '../src/oauth/pg-store.js';
 import { createTestSchema, newTokenKey, type TestSchema } from './support/two-process.js';
 
 /**
@@ -41,6 +42,30 @@ async function runMigrate(vars: Record<string, string | undefined>): Promise<{ c
 }
 
 describe('migrate entry without a database', () => {
+  it('is the entry the Procfile release line runs', () => {
+    const procfile = readFileSync(path.resolve(import.meta.dirname, '..', '..', '..', 'Procfile'), 'utf8');
+    const release = procfile.split('\n').find((line) => line.startsWith('release:'));
+    expect(release).toMatch(/ node packages\/remote\/dist\/migrate\.js$/);
+    expect(path.relative(path.resolve(import.meta.dirname, '..', '..', '..'), MIGRATE_ENTRY)).toBe(
+      'packages/remote/dist/migrate.js'
+    );
+  });
+
+  it('exits 1 with a migration failure when the database is unreachable', async () => {
+    const { code, stderr } = await runMigrate(oauthEnv(UNREACHABLE_DSN));
+    expect(code).toBe(1);
+    expect(stderr).toContain('[xyte-mcp] error: OAuth store migration failed:');
+  });
+
+  it('exits 1 with a migration failure, and no stack trace, when the sslrootcert file is missing', async () => {
+    const { code, stderr } = await runMigrate(
+      oauthEnv('postgres://127.0.0.1:1/x?sslmode=verify-full&sslrootcert=/nonexistent')
+    );
+    expect(code).toBe(1);
+    expect(stderr).toContain('[xyte-mcp] error: OAuth store migration failed:');
+    expect(stderr).not.toMatch(/^\s+at /m);
+  });
+
   it('exits 0 and says there is nothing to migrate for a local issuer without a database', async () => {
     const { code, stderr } = await runMigrate({
       ...oauthEnv(undefined),
@@ -99,10 +124,13 @@ describe.skipIf(!PG_URL)('migrate entry against Postgres', () => {
     const first = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(first.code, first.stderr).toBe(0);
     const { rows } = await schema.admin.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_schema_migrations');
-    expect(rows[0]!.n).toBeGreaterThan(0);
+    expect(rows[0]!.n).toBe(MIGRATIONS.length);
 
     const second = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(second.code, second.stderr).toBe(0);
+    expect(second.stderr).not.toContain('migrated to version');
+    const again = await schema.admin.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_schema_migrations');
+    expect(again.rows[0]!.n).toBe(MIGRATIONS.length);
   });
 
   it('exits 1 and names the version when the database holds a newer version that breaks rollback', async () => {

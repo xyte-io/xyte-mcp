@@ -24,9 +24,9 @@ import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * This service owns its whole schema: the tables built at boot by the
- * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
- * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
+ * This service owns its whole schema: the tables built by the ordered
+ * MIGRATIONS below (in the release phase, see migrateOAuthSchema), plus the
+ * oauth_schema_migrations ledger that migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
  * server never queries inside it — it goes back to the SDK exactly as
  * registered. The hub tokens are encrypted (TokenCipher); the refresh token's
  * hash sits next to them, so a rotation compares without decrypting.
@@ -55,17 +55,19 @@ export interface Migration {
  * tightening anything an older build reads is not (`true`), and an older build
  * then refuses to boot instead of running against a schema it does not know.
  *
- * The flag guards a later boot of an older build, not the rollout itself:
- * during a deploy the old dyno keeps serving against the new schema until it
+ * The flag guards a later release or boot of an older build, not the rollout
+ * itself: during a deploy the old dyno keeps serving against the new schema until it
  * stops. So a breaking migration may only drop or rewrite what the previous
  * release already stopped reading — ship the reader change one release ahead.
  * Version 2 is a deliberate pre-launch exception (README, "Deploy it").
  *
  * All pending migrations run in one transaction, so a statement that cannot
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
- * Postgres) is not allowed here. Statements have no time limit, but they run
- * before the server listens, so a long data rewrite still counts against the
- * platform's boot timeout — keep those out of the boot path.
+ * Postgres) is not allowed here. They run in the release phase (src/migrate.ts),
+ * before any new dyno starts; the boot call then finds nothing to apply and only
+ * refuses a newer breaking schema. Statements have no time limit, but a release
+ * without a release phase (a local run, another platform) migrates at boot,
+ * where a long data rewrite counts against the boot timeout — keep those out.
  */
 export const MIGRATIONS: ReadonlyArray<Migration> = [
   // IF NOT EXISTS, so a database created before versioning is adopted as
@@ -190,10 +192,12 @@ function schemaError(step: string, error: unknown): Error {
 
 /**
  * Brings the schema up to the newest migration this build knows, once per
- * version, under a transaction-scoped advisory lock: two boots on one database
- * (preboot, a one-off dyno) take turns, and the second finds nothing left to
- * apply. Everything runs in one transaction, so a failure leaves the database
- * exactly as it was and throws, which stops the boot.
+ * version, under a transaction-scoped advisory lock: two runs on one database
+ * (the release phase and a boot, preboot, a one-off dyno) take turns, and the
+ * second finds nothing left to apply. Everything runs in one transaction, so a
+ * failure leaves the database exactly as it was and throws. The release phase
+ * (src/migrate.ts) runs it first, where a failure stops the release; the boot
+ * call is then a no-op that still refuses a newer breaking schema.
  */
 export async function migrateOAuthSchema(
   pool: pg.Pool,
@@ -979,7 +983,9 @@ export class PgOAuthStore implements OAuthStore {
    * foreign-key order (a token references its grant, without cascade), then
    * ended rate-limit windows (on the database clock, not counted). Each
    * locks only the rows it deletes, which no request uses any more, so requests
-   * keep being served.
+   * keep being served. A failing step is logged (its name and error code) and
+   * ends the run; the counts of the steps before it are returned, and the next
+   * run retries.
    *
    * Token expiries come from this app's clock, created_at and revoked_at from
    * Postgres now(); a skew between the two is harmless at day-scale retentions.
@@ -1035,8 +1041,10 @@ export class PgOAuthStore implements OAuthStore {
         const rowCount = (await this.pool.query(sql, cutoffs)).rowCount ?? 0;
         if (step !== 'rateLimitCounters') deleted[step] = rowCount;
       } catch (error) {
-        // The code only: a pg message can name the database host and role.
-        throw new Error(`the ${step} step failed: ${errorCodeOf(error)}`, { cause: error });
+        // The code only: a pg message can name the database host and role. The
+        // steps already run have committed, so their counts are still returned.
+        logError(`OAuth store cleanup: the ${step} step failed, retried within an hour: ${errorCodeOf(error)}`);
+        break;
       }
     }
     return deleted;

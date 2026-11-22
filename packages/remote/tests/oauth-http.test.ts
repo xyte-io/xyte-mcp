@@ -723,7 +723,7 @@ describe('oauth over http, in order', () => {
       await vi.waitFor(
         () =>
           expect(stderr.slice(logged).join('')).toContain(
-            '[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: the clients step failed: 57014\n'
+            '[xyte-mcp] error: OAuth store cleanup: the clients step failed, retried within an hour: 57014\n'
           ),
         { timeout: 10_000 }
       );

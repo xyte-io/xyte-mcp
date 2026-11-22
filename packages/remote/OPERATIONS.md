@@ -147,8 +147,9 @@ tokens could not be saved, and the database refused the revoke too), and
 `rotated hub tokens lost at shutdown` (new tokens held in memory were never saved).
 
 Each server process holds up to 8 Postgres connections: 5 for requests and 3 for the refresh
-lock, plus one more briefly at boot for the schema migration. Size the Postgres plan's
-connection limit for that many per process before running more than one.
+lock, plus 1 briefly at boot for the schema check; the release phase holds 1 while it runs.
+During a preboot or rolling deploy old and new dynos overlap, so the peak is about
+2 × dynos × 8 + 1. Check that against the Postgres plan's connection limit before scaling.
 
 ### Cleanup of old rows
 
@@ -162,9 +163,10 @@ rate-limit windows. When it deletes any counted row it writes one line (a run th
 only ended rate-limit windows writes none): `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended
 grant(s), <n> unused client(s), <n> expired pending sign-in(s)`. Every dyno runs the
 cleanup; a run at the same time as another deletes nothing more, so the counts are not
-doubled and a dyno may log nothing. A failed run writes `[xyte-mcp] error: OAuth store
-cleanup failed, retried within an hour: the <pendingSignIns|tokens|grants|clients|rateLimitCounters> step
-failed: <code>`, and the next run tries again. `<code>` is the error code, as in `healthz:
+doubled and a dyno may log nothing. A failed step writes `[xyte-mcp] error: OAuth store
+cleanup: the <pendingSignIns|tokens|grants|clients|rateLimitCounters> step failed, retried within
+an hour: <code>` and ends that run; the steps before it are kept and still logged in the
+`deleted` line, and the next run tries again. `<code>` is the error code, as in `healthz:
 token store check failed: <code>`; a plain `Error` is usually a pg timeout (query or
 connect, 10 s). A query timeout stops only the wait: the delete may still finish in
 Postgres, so the next run's counts are lower.
@@ -184,6 +186,23 @@ hands out a new token with the expiry of the first sign-in. The first hub refres
 day logs `hub_refresh` `invalid_grant`, then `revoke` `invalid_grant`, and the user has to sign
 in again. This is expected. Everyone who signed in on the same day (launch day, for example)
 reaches it together, 90 days later.
+
+## A failed release
+
+The Procfile's release phase applies the schema migrations once per release (and Heroku runs it
+again on a config-var change and a rollback). When it fails, the release log
+(`heroku releases:output <version> -a <app>`) ends with `[xyte-mcp] error: OAuth store
+migration failed: <reason>`, possibly followed by hints, and `heroku releases -a <app>` shows
+that release as failed. No new dyno starts: the old build keeps serving, and the database is
+unchanged (all pending migrations run in one transaction).
+
+- A connection or certificate error: fix the config var it names (`DATABASE_URL`,
+  `NODE_EXTRA_CA_CERTS`, `PGSSLMODE`), which starts a new release.
+- `… which this build … does not know and which breaks rollback`: a rollback or an older build
+  against a newer breaking schema. Release a build at that version or later instead.
+- A migration's database error (or `lock_timeout`, another run holding the lock): fix the
+  migration in a new build, or for a lock wait run the release again
+  (`heroku releases:retry -a <app>`).
 
 ## Alerts
 

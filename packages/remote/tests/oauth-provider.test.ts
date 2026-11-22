@@ -138,6 +138,16 @@ function makeProvider(store: OAuthStore = new MemoryOAuthStore(), hub = fakeHub(
   return { provider, store, hub };
 }
 
+/** Every pending sign-in row in the store, live or not. */
+async function pendingRowCount(store: OAuthStore): Promise<number> {
+  if (store instanceof MemoryOAuthStore) {
+    return (store as unknown as { pendingSignIns: Map<string, unknown> }).pendingSignIns.size;
+  }
+  const { pool } = store as unknown as { pool: pg.Pool };
+  const { rows } = await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_pending_sign_ins');
+  return rows[0]!.n;
+}
+
 async function registeredClient(
   provider: XyteOAuthProvider,
   clientId = 'client-1'
@@ -310,8 +320,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('code_challenge')).not.toBe('client-challenge');
   });
 
-  it('refuses an approve without the browser cookie or with a wrong CSRF token', async () => {
-    const { provider } = makeProvider();
+  it('refuses an approve without the browser cookie or with a wrong CSRF token, leaving the sign-in', async () => {
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     for (const tamper of [{ cookie: undefined }, { csrf: 'forged' }]) {
       const consent = await openConsent(provider, client);
@@ -325,6 +335,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       );
       expect(out.status).toBe(400);
       expect(out.location).toBe('');
+      expect(await store.getPendingSignIn(consent.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+      expect((await submitApprove(provider, consent)).out.status).toBe(302);
     }
   });
 
@@ -448,17 +460,19 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
   });
 
   it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
-    const { provider } = makeProvider();
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
-    const start = () => {
+    const start = async () => {
       const { out, res } = fakeRes();
-      return provider
-        .authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
-        .then(() => out.status);
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+      return out;
     };
     for (let i = 0; i < 10_000; i += 1) await start();
 
-    expect(await start()).toBe(503);
+    const out = await start();
+    expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
+    expect(await pendingRowCount(store)).toBe(10_000);
   });
 
   it('callback mints a code bound to the client challenge and stores the hub sign-in', async () => {
@@ -486,7 +500,7 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
   });
 
   it('callback without, or with the wrong, browser cookie issues nothing', async () => {
-    const { provider, hub } = makeProvider();
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
 
     const missing = await approve(provider, client);
@@ -498,6 +512,11 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.status).toBe(400);
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+
+    // ...and leaves the sign-in for its own browser to finish.
+    expect(await store.getPendingSignIn(wrong.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const real = await callback(provider, { state: wrong.pending, code: 'hub-code' }, wrong.cookie);
+    expect(new URL(real.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
   });
 
   // The state is in hub's URL (history, logs): knowing it must not cancel a login.
@@ -686,10 +705,13 @@ async function pgSchema() {
   };
 }
 
-/** Two stores on one database, as two server instances have; the memory pair shares one store. */
+/**
+ * Two stores on one database, as two server instances have. The memory pair is
+ * one shared store: only the Postgres pair proves cross-instance behaviour.
+ */
 const storePairs: Array<[string, () => Promise<{ stores: [OAuthStore, OAuthStore]; drop(): Promise<void> }>]> = [
   [
-    'memory',
+    'memory, one shared store',
     async () => {
       const store = new MemoryOAuthStore();
       return { stores: [store, store], drop: async () => {} };
@@ -807,6 +829,35 @@ describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', 
     expect(out.location).toBe('');
   });
 
+  it('a callback whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const out = await callback(instances[1], { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a wrong-cookie callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const forged = `${cookie.split('=')[0]}=attacker-value`;
+    expect((await callback(instances[1], { state: pending, code: 'c' }, forged)).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
   it('a cookieless callback on one instance leaves the sign-in for the other to finish', async () => {
     const client = await registeredClient(instances[0]);
     const { pending, cookie } = await approve(instances[0], client);
@@ -829,7 +880,9 @@ describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', 
     const { out, res } = fakeRes();
     await instances[0].authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
     expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
     expect(out.cookies).toEqual({});
+    expect(await pendingRowCount(pair.stores[0])).toBe(2);
   });
 });
 
@@ -858,6 +911,14 @@ describe.skipIf(!PG_URL)('XyteOAuthProvider: pending sign-ins on Postgres', () =
     expect(out.html).toContain('Authorization expired or invalid');
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+    const logged = vi.mocked(process.stderr.write).mock.calls.map(([line]) => String(line)).join('');
+    expect(logged).toContain('pending sign-in unreadable: unknown key id');
+
+    // An Approve there reads the same row: the expired page too.
+    const approved = await submitApprove(reader, await openConsent(writer, client));
+    expect(approved.out.status).toBe(400);
+    expect(approved.out.html).toContain('Authorization expired or invalid');
+    expect(approved.out.location).toBe('');
   });
 
   // The SDK's authorize handler turns the rejection into a server_error

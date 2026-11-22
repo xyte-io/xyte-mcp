@@ -618,6 +618,26 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
     }
   });
 
+  // Another deleter (a concurrent /authorize or the cleanup) holding an expired
+  // row must not make a sign-in start wait on the main pool's 9 s lock_timeout.
+  it('starts a pending sign-in without waiting on an expired row another deleter holds', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const now = NOW();
+    await store.createPendingSignIn('old', pendingSignIn({ expiresAt: now + 5 }), 10_000, now);
+    const holder = await admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_pending_sign_ins WHERE id_hash = $1 FOR UPDATE', [hashToken('old')]);
+      const started = Date.now();
+      expect(await store.createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 610 }), 10_000, now + 10)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await store.close();
+    }
+  });
+
   // Every dyno runs its own cleanup: a concurrent run deletes nothing the other one did.
   it('two concurrent runs on two pools delete each row once between them', async () => {
     const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
@@ -737,6 +757,8 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     const logText = captureLog();
     expect(await reader.getPendingSignIn('p1', NOW())).toBeUndefined();
     expect(await reader.takePendingSignIn('p1', NOW())).toBeUndefined();
+    // The take deleted the row before its decrypt failed: gone for every instance.
+    expect(await writer.getPendingSignIn('p1', NOW())).toBeUndefined();
     expect(logText()).toContain('pending sign-in unreadable: unknown key id');
     expect(logText()).not.toContain('v'.repeat(43));
   });

@@ -310,10 +310,15 @@ describe('resolveHttpConfig', () => {
       );
     }
     for (const local of ['http://localhost:3000', 'https://localhost', 'http://127.0.0.1:8080']) {
-      expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: local }).oauth).not.toHaveProperty(
-        'databaseUrl'
-      );
+      expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: local }).oauth).toEqual({
+        issuerUrl: local,
+        hubClient
+      });
     }
+    // A local issuer with a database still needs the key.
+    expect(() =>
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'https://localhost', [ENV.databaseUrl]: 'postgres://x' })
+    ).toThrow(new RegExp(`${ENV.tokenKey} must be the base64`));
   });
 
   it('refuses OAuth without the hub client credentials', () => {

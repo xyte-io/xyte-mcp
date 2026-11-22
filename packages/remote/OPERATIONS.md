@@ -94,7 +94,12 @@ argument. A field without a value is left out.
 `sign_in` `failed` reasons:
 
 - `expired`: the sign-in link is unknown or older than 10 minutes, or was already used (a
-  replayed hub callback). The user sees "Authorization expired".
+  replayed hub callback). Also an Approve or Deny on a sign-in used or expired between the
+  consent page and the click, a hub callback that lost the race for the sign-in to another
+  instance, and a sign-in whose hub PKCE verifier this instance cannot decrypt, logged as
+  `[xyte-mcp] error: pending sign-in unreadable: <reason> (key id …)` (`XYTE_MCP_TOKEN_KEY`
+  changed mid-sign-in without the old key as `XYTE_MCP_TOKEN_KEY_PREVIOUS`; the user starts
+  the sign-in again). The user sees "Authorization expired".
 - `csrf`, `cookie`: the consent form or the hub callback did not come from the browser that
   opened the consent page. One-off: a user switched browsers. Many: someone is forging them.
 - `not_approved`: the hub callback came for a sign-in nobody approved on our consent page.
@@ -103,7 +108,9 @@ argument. A field without a value is left out.
   hub sign-in failed` line has the detail).
 - `store`: `/authorize` could not save the new sign-in (the database is down or slow); the
   client gets a `server_error` redirect. An `[xyte-mcp] error: authorize:` line has the
-  error code.
+  error code. Not to be confused with the cap: 10,000 sign-ins in progress, counted across
+  all instances, answer `/authorize` with `503` "Too many sign-ins in progress" and write no
+  `sign_in` event.
 - `error`: an unexpected failure (a stack trace is on the line above).
 
 When the hub rejects a tool call's token and the token refresh that follows fails, the
@@ -200,6 +207,10 @@ it from production data**.
   or `live grants use hub token key id(s) …` (a live connection uses a key the server has
   neither as `XYTE_MCP_TOKEN_KEY` nor as `XYTE_MCP_TOKEN_KEY_PREVIOUS`). See the key, rotation
   and lost-key notes under [Security notes](../../README.md#security-notes).
+- **Server down, boot stopped on `DATABASE_URL`:** `XYTE_MCP_ISSUER_URL is not local, so
+  DATABASE_URL is required: without it OAuth state is held in memory, lost on every restart
+  and not shared between instances.` The Postgres add-on or its config var is missing: set
+  `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`.
 - **5xx rate:** the router `code=` (`H10` crashed, `H12` timeout, `H80` maintenance mode) and
   the `[xyte-mcp] error:` lines at the same time. `token check failed` means the database.
 - **Hub refresh failures:** the `outcome` and `hub_status`. Many `unknown` or `5xx` at once

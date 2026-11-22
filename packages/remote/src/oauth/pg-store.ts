@@ -132,7 +132,7 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
     name: 'pending_sign_ins',
     breaksRollback: false,
     sql: `
-  CREATE TABLE oauth_pending_sign_ins (
+  CREATE TABLE IF NOT EXISTS oauth_pending_sign_ins (
     id_hash           text PRIMARY KEY,
     client_id         text NOT NULL,
     redirect_uri      text NOT NULL,
@@ -148,7 +148,7 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
     created_at        timestamptz NOT NULL DEFAULT now()
   );
   -- The expired-row deletes and the live count on every /authorize.
-  CREATE INDEX oauth_pending_sign_ins_expires_at ON oauth_pending_sign_ins (expires_at);
+  CREATE INDEX IF NOT EXISTS oauth_pending_sign_ins_expires_at ON oauth_pending_sign_ins (expires_at);
 `
   }
 ];
@@ -821,7 +821,9 @@ export class PgOAuthStore implements OAuthStore {
    * One statement: the expired rows go, and the insert happens only while
    * fewer than `max` live rows remain (≤ 10 000 rows, counted on the
    * expires_at index). Both parts read the same snapshot, so the count skips
-   * the expired rows rather than waiting for their delete.
+   * the expired rows rather than waiting for their delete. SKIP LOCKED: an
+   * expired row another deleter (a concurrent /authorize, the cleanup) holds
+   * is left to it, not waited on up to the pool's lock_timeout.
    */
   async createPendingSignIn(
     id: string,
@@ -831,7 +833,10 @@ export class PgOAuthStore implements OAuthStore {
   ): Promise<boolean> {
     const result = await this.pool.query(
       `WITH expired AS (
-         DELETE FROM oauth_pending_sign_ins WHERE expires_at <= to_timestamp($11)
+         DELETE FROM oauth_pending_sign_ins WHERE id_hash IN (
+           SELECT id_hash FROM oauth_pending_sign_ins
+            WHERE expires_at <= to_timestamp($11) FOR UPDATE SKIP LOCKED
+         )
        )
        INSERT INTO oauth_pending_sign_ins
          (id_hash, client_id, redirect_uri, code_challenge, client_state, resource,

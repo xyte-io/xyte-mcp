@@ -86,7 +86,7 @@ Everything below is about running the server itself.
 | `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Required unless `XYTE_MCP_ISSUER_URL` is on `localhost` or `127.0.0.1` (the server refuses to boot); with a local issuer, absent → in-memory, tokens and sign-ins in progress die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
 | `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
-| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
+| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database, and the hub PKCE verifier of each sign-in in progress, are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
 | `XYTE_MCP_TOKEN_KEY_PREVIOUS` | **Hosted server + OAuth + `DATABASE_URL`, optional.** The key being rotated out, same format: only decrypts. See [Security notes](#security-notes) for rotation. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
@@ -271,8 +271,9 @@ Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
 rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
 (schema version 2) cannot be rolled back: an older build refuses to boot against it.
 
-Deploy this release with preboot off (`heroku features:disable preboot -a <app>`), so the old
-and new process overlap only for the shutdown drain. Upgrading from a build without
+Keep preboot off (`heroku features:disable preboot -a <app>`), so the old and new process
+overlap only for the shutdown drain: the rate-limit counters are in memory (see **One dyno**
+below), so a longer overlap doubles every budget. Upgrading from a build without
 the cross-process refresh lock, a refresh on each process in that overlap can race; the loser
 gets `invalid_grant` from hub and that connection has to sign in again. That window is
 accepted.
@@ -604,7 +605,8 @@ a public sign-in URL.
    WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
   ```
 
-  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0. After 30 days, the ones left have made
+  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0; a sign-in started under the old key in
+  the 10 minutes before ends on the expired page, and its user starts it again. After 30 days, the ones left have made
   no tool call in that time; revoke them first (their users connect again once):
 
   ```sql

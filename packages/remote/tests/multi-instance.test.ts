@@ -125,17 +125,26 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
   });
 
   it('a sign-in alternates over both processes at every step, and its connection works on either', async () => {
+    const from = proxy.routed.length;
     const { accessToken } = await signIn(proxy.base);
+    const servedBy = (path: string) => proxy.routed.slice(from).find((request) => request.path === path)!.backend;
+    expect(servedBy('/authorize')).not.toBe(servedBy('/oauth/consent'));
+    expect(servedBy('/oauth/consent')).not.toBe(servedBy('/oauth/callback'));
     for (const server of servers) expect((await listDevices(server.base, accessToken)).status).toBe(200);
   });
 
   it('a sign-in whose process gets SIGTERM after consent finishes on the other process', async () => {
-    const { accessToken } = await signIn(servers[0]!.base, async () => {
-      await servers[0]!.kill('SIGTERM');
-      return servers[1]!.base;
-    });
-    expect((await listDevices(servers[1]!.base, accessToken)).status).toBe(200);
-    servers[0] = await startServer(envs[0]!);
+    try {
+      const { accessToken } = await signIn(servers[0]!.base, async () => {
+        await servers[0]!.kill('SIGTERM');
+        return servers[1]!.base;
+      });
+      expect((await listDevices(servers[1]!.base, accessToken)).status).toBe(200);
+    } finally {
+      // Else the next test runs with a dead servers[0] and hides this failure.
+      await servers[0]!.kill();
+      servers[0] = await startServer(envs[0]!);
+    }
   });
 
   // Last: it kills a process and starts it again.

@@ -258,10 +258,14 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
 export async function startAlternatingProxy(
   port: number,
   backends: string[]
-): Promise<{ base: string; close(): Promise<void> }> {
+): Promise<{ base: string; routed: Array<{ path: string; backend: string }>; close(): Promise<void> }> {
   let next = 0;
+  // Which backend served each request, in arrival order.
+  const routed: Array<{ path: string; backend: string }> = [];
   const server = createServer((req, res) => {
-    const target = new URL(req.url ?? '/', backends[next++ % backends.length]);
+    const backend = backends[next++ % backends.length]!;
+    const target = new URL(req.url ?? '/', backend);
+    routed.push({ path: target.pathname, backend });
     const upstream = httpRequest(target, { method: req.method, headers: req.headers }, (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);
@@ -275,6 +279,7 @@ export async function startAlternatingProxy(
   await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
   return {
     base: `http://127.0.0.1:${port}`,
+    routed,
     close: () => {
       server.closeAllConnections();
       return new Promise<void>((resolve) => server.close(() => resolve()));

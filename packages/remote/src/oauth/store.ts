@@ -86,6 +86,32 @@ export interface DeletedOAuthRowCounts {
   tokens: number;
   grants: number;
   clients: number;
+  pendingSignIns: number;
+}
+
+/**
+ * An /authorize request parked across our consent page and hub's sign-in. Any
+ * instance may serve each step, so it lives in the store. Its id (in the
+ * consent form and hub's state) is hashed by the store; the csrf token and
+ * the browser key arrive hashed already, so a leaked row cannot complete the
+ * sign-in. The hub verifier must be read back, so Postgres encrypts it.
+ */
+export interface PendingSignIn {
+  clientId: string;
+  redirectUri: string;
+  codeChallenge: string;
+  /** The MCP client's own state, echoed on its redirect. */
+  state?: string;
+  resource?: string;
+  /** SHA-256 (hashToken) of the token the consent form echoes. */
+  csrfHash: string;
+  /** SHA-256 (hashToken) of the key the consenting browser holds in a cookie. */
+  browserKeyHash: string;
+  approved: boolean;
+  /** Our PKCE verifier for the hub leg. */
+  hubVerifier: string;
+  /** Seconds since epoch. */
+  expiresAt: number;
 }
 
 export interface OAuthStore {
@@ -134,16 +160,34 @@ export interface OAuthStore {
   deleteToken(token: string, kind: TokenKind): Promise<boolean>;
 
   /**
-   * Deletes, as of `now` (seconds since epoch): expired tokens; grants with no
-   * token left that were revoked more than REVOKED_GRANT_RETENTION_SECONDS ago,
-   * or are unrevoked but whose client is gone (a sign-in still at the hub when
-   * a sweep deleted its client: nothing can use it, /token needs the client),
-   * or are unrevoked and created more than ABANDONED_GRANT_RETENTION_SECONDS
-   * ago; clients with no grant, registered more than
-   * UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger unrevoked grant whose
-   * client exists: a refresh exchange deletes the old refresh token before it
-   * saves the new pair, so a live grant can briefly have none (and a client
-   * with a grant is never deleted).
+   * Parks a sign-in unless `max` live ones are parked already (false then).
+   * Deletes the expired ones on the way. The cap is soft across instances: two
+   * concurrent inserts at max - 1 can both pass.
+   */
+  createPendingSignIn(id: string, entry: PendingSignIn, max: number, now: number): Promise<boolean>;
+  /** Live only (expiresAt > now). One the store cannot read back counts as gone. */
+  getPendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined>;
+  /** True while it is live, also when it was approved already (a double-clicked Approve). */
+  approvePendingSignIn(id: string, now: number): Promise<boolean>;
+  /**
+   * Removes a live one and returns it: of two concurrent takes, only one gets
+   * it, so a sign-in completes (or is denied) once.
+   */
+  takePendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined>;
+  /** Which of `ids` are live, for expiring the cookies of flows that are gone. */
+  livePendingSignInIds(ids: string[], now: number): Promise<Set<string>>;
+
+  /**
+   * Deletes, as of `now` (seconds since epoch): expired pending sign-ins;
+   * expired tokens; grants with no token left that were revoked more than
+   * REVOKED_GRANT_RETENTION_SECONDS ago, or are unrevoked but whose client is
+   * gone (a sign-in still at the hub when a sweep deleted its client: nothing
+   * can use it, /token needs the client), or are unrevoked and created more
+   * than ABANDONED_GRANT_RETENTION_SECONDS ago; clients with no grant,
+   * registered more than UNUSED_CLIENT_RETENTION_SECONDS ago. Never a younger
+   * unrevoked grant whose client exists: a refresh exchange deletes the old
+   * refresh token before it saves the new pair, so a live grant can briefly
+   * have none (and a client with a grant is never deleted).
    * An orphan's hub tokens are not revoked at hub: nobody holds them once the
    * row is gone, and hub ends the chain by itself.
    * Safe while requests are served; a second run deletes nothing more.
@@ -171,6 +215,7 @@ export class MemoryOAuthStore implements OAuthStore {
   /** Seconds since epoch of each grant's first revoke; kept out of GrantRecord. */
   private readonly grantRevokedAt = new Map<string, number>();
   private readonly tokens = new Map<string, TokenRecord>();
+  private readonly pendingSignIns = new Map<string, PendingSignIn>();
   /** Per grant, the tail of its lock holders' queue. */
   private readonly grantLocks = new Map<string, Promise<unknown>>();
   private nextGrantId = 1;
@@ -268,8 +313,54 @@ export class MemoryOAuthStore implements OAuthStore {
     return this.tokens.delete(`${kind}:${hashToken(token)}`);
   }
 
+  async createPendingSignIn(
+    id: string,
+    entry: PendingSignIn,
+    max: number,
+    now: number
+  ): Promise<boolean> {
+    this.deleteExpiredPendingSignIns(now);
+    if (this.pendingSignIns.size >= max) return false;
+    // Like the Postgres column's default: only Approve sets it.
+    this.pendingSignIns.set(id, { ...entry, approved: false });
+    return true;
+  }
+
+  async getPendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined> {
+    // A copy, like a row read from Postgres.
+    const entry = this.pendingSignIns.get(id);
+    return entry && entry.expiresAt > now ? { ...entry } : undefined;
+  }
+
+  async approvePendingSignIn(id: string, now: number): Promise<boolean> {
+    const entry = this.pendingSignIns.get(id);
+    if (!entry || entry.expiresAt <= now) return false;
+    entry.approved = true;
+    return true;
+  }
+
+  async takePendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined> {
+    // No await before the delete: a concurrent take must find it gone.
+    const entry = this.pendingSignIns.get(id);
+    if (!entry || entry.expiresAt <= now) return undefined;
+    this.pendingSignIns.delete(id);
+    return entry;
+  }
+
+  async livePendingSignInIds(ids: string[], now: number): Promise<Set<string>> {
+    return new Set(ids.filter((id) => (this.pendingSignIns.get(id)?.expiresAt ?? 0) > now));
+  }
+
+  private deleteExpiredPendingSignIns(now: number): number {
+    let deleted = 0;
+    for (const [id, entry] of this.pendingSignIns) {
+      if (entry.expiresAt <= now && this.pendingSignIns.delete(id)) deleted += 1;
+    }
+    return deleted;
+  }
+
   async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
-    const deleted = { tokens: 0, grants: 0, clients: 0 };
+    const deleted = { tokens: 0, grants: 0, clients: 0, pendingSignIns: this.deleteExpiredPendingSignIns(now) };
     for (const [key, token] of this.tokens) {
       if (token.expiresAt <= now && this.tokens.delete(key)) deleted.tokens += 1;
     }

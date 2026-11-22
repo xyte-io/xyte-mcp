@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { randomBytes, randomUUID } from 'node:crypto';
+import pg from 'pg';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
@@ -6,7 +8,9 @@ import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
-import { MemoryOAuthStore } from '../src/oauth/store.js';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
+import { MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
 import { stubHttp } from '../../mcp/tests/support/context.js';
 import { hubAcceptsPkce } from './support/pkce.js';
 
@@ -106,20 +110,18 @@ let currentHub: ReturnType<typeof fakeHub> | undefined;
  * it wrote rolls back (here: its save writes nothing), and the provider saves
  * the new pair outside the lock (saveHubTokens).
  */
-function failGrantLockCommitOnce(store: MemoryOAuthStore): void {
+function failGrantLockCommitOnce(store: OAuthStore): void {
   const withLock = store.withGrantLock.bind(store);
   vi.spyOn(store, 'withGrantLock').mockImplementationOnce((async (
     id: string,
-    fn: Parameters<MemoryOAuthStore['withGrantLock']>[1]
+    fn: Parameters<OAuthStore['withGrantLock']>[1]
   ) => {
     await withLock(id, (locked) => fn({ ...locked, rotate: async () => true }));
     throw Object.assign(new Error('connection lost'), { code: '08006' });
   }) as never);
 }
 
-function makeProvider() {
-  const store = new MemoryOAuthStore();
-  const hub = fakeHub();
+function makeProvider(store: OAuthStore = new MemoryOAuthStore(), hub = fakeHub()) {
   currentHub = hub;
   const provider = new XyteOAuthProvider(
     store,
@@ -134,6 +136,16 @@ function makeProvider() {
     ISSUER
   );
   return { provider, store, hub };
+}
+
+/** Every pending sign-in row in the store, live or not. */
+async function pendingRowCount(store: OAuthStore): Promise<number> {
+  if (store instanceof MemoryOAuthStore) {
+    return (store as unknown as { pendingSignIns: Map<string, unknown> }).pendingSignIns.size;
+  }
+  const { pool } = store as unknown as { pool: pg.Pool };
+  const { rows } = await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_pending_sign_ins');
+  return rows[0]!.n;
 }
 
 async function registeredClient(
@@ -200,7 +212,18 @@ async function openConsent(provider: XyteOAuthProvider, client: OAuthClientInfor
 
 /** Approve on the consent page; returns the hub redirect and the rotated cookie. */
 async function approve(provider: XyteOAuthProvider, client: OAuthClientInformationFull) {
-  const consent = await openConsent(provider, client);
+  const approved = await submitApprove(provider, await openConsent(provider, client));
+  // Specs built on this would otherwise pass on a refused Approve.
+  expect(approved.out.status).toBe(302);
+  expect(approved.cookie).not.toBe('');
+  return approved;
+}
+
+/** Approve a consent page opened earlier, possibly on another instance. */
+async function submitApprove(
+  provider: XyteOAuthProvider,
+  consent: { pending: string; csrf: string; cookie: string }
+) {
   const { out, res } = fakeRes();
   await provider.consent(
     fakeReq({
@@ -209,9 +232,9 @@ async function approve(provider: XyteOAuthProvider, client: OAuthClientInformati
     }),
     res
   );
-  const [cookieName, cookie] = Object.entries(out.cookies)[0]!;
-  currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
-  return { out, pending: consent.pending, cookie: `${cookieName}=${cookie.value}` };
+  const [cookieName, cookie] = Object.entries(out.cookies)[0] ?? [];
+  if (out.location) currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
+  return { out, pending: consent.pending, cookie: cookieName ? `${cookieName}=${cookie!.value}` : '' };
 }
 
 async function callback(
@@ -297,8 +320,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('code_challenge')).not.toBe('client-challenge');
   });
 
-  it('refuses an approve without the browser cookie or with a wrong CSRF token', async () => {
-    const { provider } = makeProvider();
+  it('refuses an approve without the browser cookie or with a wrong CSRF token, leaving the sign-in', async () => {
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     for (const tamper of [{ cookie: undefined }, { csrf: 'forged' }]) {
       const consent = await openConsent(provider, client);
@@ -312,6 +335,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       );
       expect(out.status).toBe(400);
       expect(out.location).toBe('');
+      expect(await store.getPendingSignIn(consent.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+      expect((await submitApprove(provider, consent)).out.status).toBe(302);
     }
   });
 
@@ -335,6 +360,45 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(hub.calls).toHaveLength(0);
     // The flow is over, so its cookie goes too.
     expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    // ...and a callback on it, even with that cookie, finds nothing.
+    const late = await callback(provider, { state: consent.pending, code: 'hub-code' }, consent.cookie);
+    expect(late.status).toBe(400);
+    expect(late.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('refuses an Approve once the sign-in has expired, asking hub nothing', async () => {
+    const { provider, hub } = makeProvider();
+    const consent = await openConsent(provider, await registeredClient(provider));
+    vi.useFakeTimers({ now: Date.now() + 11 * 60 * 1000 });
+    try {
+      const { out } = await submitApprove(provider, consent);
+      expect(out.status).toBe(400);
+      expect(out.html).toContain('Authorization expired or invalid');
+      expect(out.location).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  // Saved for ten minutes from an unauthenticated request, so it is bounded.
+  it('refuses an /authorize whose state is over 1024 characters, saving nothing', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const create = vi.spyOn(store, 'createPendingSignIn');
+    const start = async (state: string) => {
+      const { out, res } = fakeRes();
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT, state }, res);
+      return out;
+    };
+
+    const long = await start('x'.repeat(1025));
+    expect(long.status).toBe(400);
+    expect(long.location).toBe('');
+    expect(long.cookies).toEqual({});
+    expect(create).not.toHaveBeenCalled();
+    expect((await start('x'.repeat(1024))).status).toBe(200);
   });
 
   it('expires flow cookies whose flow is gone when a new /authorize starts', async () => {
@@ -352,18 +416,63 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.cookies.other).toBeUndefined();
   });
 
-  it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
-    const { provider } = makeProvider();
+  it('still serves the consent page when the flow-cookie lookup fails, keeping the old cookies', async () => {
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
-    const start = () => {
-      const { out, res } = fakeRes();
-      return provider
+    vi.spyOn(store, 'livePendingSignInIds').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+    (res as unknown as { req: Request }).req = fakeReq({ cookie: '__Host-xmcp_gone=v' });
+
+    const stderr = await captureStderr(() =>
+      provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+    );
+    expect(out.status).toBe(200);
+    expect(out.html).toContain('name="pending"');
+    expect(out.cookies['__Host-xmcp_gone']).toBeUndefined();
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([]);
+  });
+
+  it('logs a store failure on /authorize and rethrows it for the SDK to redirect', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    vi.spyOn(store, 'createPendingSignIn').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+
+    let thrown: unknown;
+    const stderr = await captureStderr(() =>
+      provider
         .authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
-        .then(() => out.status);
+        .catch((error: unknown) => (thrown = error))
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    expect(out.cookies).toEqual({});
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'failed', reason: 'store', client: 'client-1' }
+    ]);
+  });
+
+  it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const start = async () => {
+      const { out, res } = fakeRes();
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+      return out;
     };
     for (let i = 0; i < 10_000; i += 1) await start();
 
-    expect(await start()).toBe(503);
+    const out = await start();
+    expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
+    expect(await pendingRowCount(store)).toBe(10_000);
   });
 
   it('callback mints a code bound to the client challenge and stores the hub sign-in', async () => {
@@ -391,7 +500,7 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
   });
 
   it('callback without, or with the wrong, browser cookie issues nothing', async () => {
-    const { provider, hub } = makeProvider();
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
 
     const missing = await approve(provider, client);
@@ -403,15 +512,21 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.status).toBe(400);
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+
+    // ...and leaves the sign-in for its own browser to finish.
+    expect(await store.getPendingSignIn(wrong.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const real = await callback(provider, { state: wrong.pending, code: 'hub-code' }, wrong.cookie);
+    expect(new URL(real.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
   });
 
   // The state is in hub's URL (history, logs): knowing it must not cancel a login.
   it('a cookieless callback leaves the login for its own browser to finish', async () => {
-    const { provider } = makeProvider();
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     const { pending, cookie } = await approve(provider, client);
 
     expect((await callback(provider, { state: pending, code: 'c' })).status).toBe(400);
+    expect(await store.getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
     const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
     expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
     // ...once: the replay is refused.
@@ -561,6 +676,274 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       res
     );
     expect(out.status).toBe(400);
+  });
+});
+
+const PG_URL = process.env.TEST_DATABASE_URL;
+const KEY_A = randomBytes(32);
+const KEY_B = randomBytes(32);
+
+/** A Postgres schema of its own, so oauth-store.test.ts's truncates never meet these rows. */
+async function pgSchema() {
+  const schema = `provider_test_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(PG_URL!);
+  url.searchParams.set('options', `-c search_path=${schema}`);
+  const stores: PgOAuthStore[] = [];
+  return {
+    connect: async (key: Buffer) => {
+      const store = await PgOAuthStore.connect(url.toString(), new TokenCipher(key), 15_000);
+      stores.push(store);
+      return store;
+    },
+    drop: async () => {
+      await Promise.all(stores.map((store) => store.close().catch(() => undefined)));
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  };
+}
+
+/**
+ * Two stores on one database, as two server instances have. The memory pair is
+ * one shared store: only the Postgres pair proves cross-instance behaviour.
+ */
+const storePairs: Array<[string, () => Promise<{ stores: [OAuthStore, OAuthStore]; drop(): Promise<void> }>]> = [
+  [
+    'memory, one shared store',
+    async () => {
+      const store = new MemoryOAuthStore();
+      return { stores: [store, store], drop: async () => {} };
+    }
+  ]
+];
+if (PG_URL) {
+  storePairs.push([
+    'postgres',
+    async () => {
+      const db = await pgSchema();
+      return { stores: [await db.connect(KEY_A), await db.connect(KEY_A)], drop: db.drop };
+    }
+  ]);
+}
+
+describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', (_name, makeStores) => {
+  let pair: Awaited<ReturnType<typeof makeStores>>;
+  let instances: [XyteOAuthProvider, XyteOAuthProvider];
+  let hub: ReturnType<typeof fakeHub>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    pair = await makeStores();
+    hub = fakeHub();
+    instances = [makeProvider(pair.stores[0], hub).provider, makeProvider(pair.stores[1], hub).provider];
+  });
+  afterEach(async () => {
+    await pair.drop();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    [0, 1, 0],
+    [1, 0, 1],
+    [0, 0, 1],
+    [0, 1, 1]
+  ])('authorize on %i, consent on %i, callback on %i mints a working code', async (authorizeOn, consentOn, callbackOn) => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[authorizeOn]!, client);
+    const approved = await submitApprove(instances[consentOn]!, consent);
+    expect(approved.out.status).toBe(302);
+
+    const out = await callback(instances[callbackOn]!, { state: consent.pending, code: 'hub-code' }, approved.cookie);
+    const code = new URL(out.location).searchParams.get('code')!;
+    expect(code).toMatch(/^xmcp_ac_/);
+    const tokens = await instances[1 - callbackOn]!.exchangeAuthorizationCode(client, code);
+    expect(hubIdentityOf(await instances[authorizeOn]!.verifyAccessToken(tokens.access_token)).accessToken).toBe(
+      'xoat_1'
+    );
+  });
+
+  it('a replayed callback, and two concurrent ones on both instances, mint one code', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const outs = await Promise.all(
+      instances.map((instance) => callback(instance, { state: pending, code: 'hub-code' }, cookie))
+    );
+    expect(outs.map((out) => out.status).sort()).toEqual([302, 400]);
+    expect(outs.filter((out) => out.location.includes('code=xmcp_ac_'))).toHaveLength(1);
+    expect((await callback(instances[1], { state: pending, code: 'hub-code' }, cookie)).status).toBe(400);
+    expect(hub.calls.filter((call) => call.form.get('grant_type') === 'authorization_code')).toHaveLength(1);
+  });
+
+  it('a double-clicked Approve, on either instance, still finishes the sign-in', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const first = await submitApprove(instances[0], consent);
+    const second = await submitApprove(instances[1], consent);
+
+    expect([first.out.status, second.out.status]).toEqual([302, 302]);
+    expect(second.out.location).toBe(first.out.location);
+    expect(second.cookie).toBe(consent.cookie);
+    const out = await callback(instances[0], { state: consent.pending, code: 'hub-code' }, second.cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('an Approve whose sign-in is taken between its read and its approve ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    // The other instance takes the row right after this consent has read it.
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out } = await submitApprove(instances[1], consent);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a Deny whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out, res } = fakeRes();
+    await instances[1].consent(
+      fakeReq({ body: { pending: consent.pending, csrf: consent.csrf, decision: 'deny' }, cookie: consent.cookie }),
+      res
+    );
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+  });
+
+  it('a callback whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const out = await callback(instances[1], { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a wrong-cookie callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const forged = `${cookie.split('=')[0]}=attacker-value`;
+    expect((await callback(instances[1], { state: pending, code: 'c' }, forged)).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('a cookieless callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    expect((await callback(instances[1], { state: pending, code: 'c' })).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('answers 503 once the store is at its cap', async () => {
+    const client = await registeredClient(instances[0]);
+    for (const store of new Set(pair.stores)) {
+      const create = store.createPendingSignIn.bind(store);
+      vi.spyOn(store, 'createPendingSignIn').mockImplementation((id, entry, _max, now) => create(id, entry, 2, now));
+    }
+    await openConsent(instances[0], client);
+    await openConsent(instances[1], client);
+
+    const { out, res } = fakeRes();
+    await instances[0].authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+    expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
+    expect(out.cookies).toEqual({});
+    expect(await pendingRowCount(pair.stores[0])).toBe(2);
+  });
+});
+
+describe.skipIf(!PG_URL)('XyteOAuthProvider: pending sign-ins on Postgres', () => {
+  let db: Awaited<ReturnType<typeof pgSchema>>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    db = await pgSchema();
+  });
+  afterEach(async () => {
+    await db.drop();
+    vi.restoreAllMocks();
+  });
+
+  // An instance without the key the sign-in was started under (a rotation
+  // without XYTE_MCP_TOKEN_KEY_PREVIOUS) cannot read its hub verifier.
+  it('a callback on an instance without the key of the hub verifier ends on the expired page, not a 500', async () => {
+    const hub = fakeHub();
+    const writer = makeProvider(await db.connect(KEY_A), hub).provider;
+    const reader = makeProvider(await db.connect(KEY_B), hub).provider;
+    const client = await registeredClient(writer);
+    const { pending, cookie } = await approve(writer, client);
+
+    const out = await callback(reader, { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+    const logged = vi.mocked(process.stderr.write).mock.calls.map(([line]) => String(line)).join('');
+    expect(logged).toContain('pending sign-in unreadable: unknown key id');
+
+    // An Approve there reads the same row: the expired page too.
+    const approved = await submitApprove(reader, await openConsent(writer, client));
+    expect(approved.out.status).toBe(400);
+    expect(approved.out.html).toContain('Authorization expired or invalid');
+    expect(approved.out.location).toBe('');
+  });
+
+  // The SDK's authorize handler turns the rejection into a server_error
+  // redirect to the client: a clean error, bounded by the pool's connect
+  // timeout.
+  it('rejects an /authorize promptly while Postgres is down, setting no cookie', async () => {
+    const store = await db.connect(KEY_A);
+    const { provider } = makeProvider(store);
+    const client = await registeredClient(provider);
+    const live = (store as unknown as { pool: pg.Pool }).pool;
+    const down = new pg.Pool({ connectionString: 'postgres://127.0.0.1:9/none', connectionTimeoutMillis: 2000 });
+    (store as unknown as { pool: pg.Pool }).pool = down;
+    try {
+      const { out, res } = fakeRes();
+      const started = Date.now();
+      await expect(
+        provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+      ).rejects.toThrow();
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(out.cookies).toEqual({});
+      expect(out.html).toBe('');
+    } finally {
+      (store as unknown as { pool: pg.Pool }).pool = live;
+      await down.end();
+    }
   });
 });
 

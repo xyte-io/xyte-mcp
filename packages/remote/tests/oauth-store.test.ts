@@ -10,7 +10,8 @@ import {
   ABANDONED_GRANT_RETENTION_SECONDS,
   REVOKED_GRANT_RETENTION_SECONDS,
   UNUSED_CLIENT_RETENTION_SECONDS,
-  type OAuthStore
+  type OAuthStore,
+  type PendingSignIn
 } from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
 import { lockWaiters } from './support/two-process.js';
@@ -18,7 +19,7 @@ import { lockWaiters } from './support/two-process.js';
 /**
  * The store guarantees the provider relies on, run against both stores: always
  * the in-memory one, and Postgres when TEST_DATABASE_URL names a throwaway
- * database (its three tables are truncated before every test).
+ * database (its tables are truncated before every test).
  */
 
 const PG_URL = process.env.TEST_DATABASE_URL;
@@ -34,6 +35,22 @@ function signIn(overrides: Partial<HubSignIn> = {}): HubSignIn {
     sub: 'user-1',
     tenantId: 'org-1',
     email: 'user@example.com',
+    ...overrides
+  };
+}
+
+function pendingSignIn(overrides: Partial<PendingSignIn> = {}): PendingSignIn {
+  return {
+    clientId: 'c1',
+    redirectUri: 'https://a/cb',
+    codeChallenge: 'client-challenge',
+    state: 'st4te',
+    resource: 'https://mcp/mcp',
+    csrfHash: hashToken('csrf'),
+    browserKeyHash: hashToken('browser-key'),
+    approved: false,
+    hubVerifier: 'v'.repeat(43),
+    expiresAt: NOW() + 600,
     ...overrides
   };
 }
@@ -68,7 +85,7 @@ if (PG_URL) {
       return {
         store,
         reset: async () => {
-          await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+          await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
         },
         close: async () => {
           await store.close();
@@ -207,6 +224,96 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     expect((await store().getGrant(id))?.hub).toBeUndefined();
   });
 
+  describe('pending sign-ins', () => {
+    const MAX = 10_000;
+
+    it('round-trips a pending sign-in, with and without its optional fields, until it expires', async () => {
+      const now = NOW();
+      const full = pendingSignIn({ expiresAt: now + 600 });
+      const bare = pendingSignIn({ expiresAt: now + 600 });
+      delete bare.state;
+      delete bare.resource;
+      expect(await store().createPendingSignIn('p1', full, MAX, now)).toBe(true);
+      expect(await store().createPendingSignIn('p2', bare, MAX, now)).toBe(true);
+
+      expect(await store().getPendingSignIn('p1', now)).toEqual(full);
+      expect(await store().getPendingSignIn('p2', now)).toEqual(bare);
+      expect(await store().getPendingSignIn('nope', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('p1', now + 600)).toBeUndefined();
+    });
+
+    it('approves only a live one, and a second approve (a double click) still succeeds', async () => {
+      const now = NOW();
+      // Starts unapproved whatever the caller passed: only Approve sets it.
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600, approved: true }), MAX, now);
+      expect((await store().getPendingSignIn('p1', now))?.approved).toBe(false);
+
+      expect(await store().approvePendingSignIn('p1', now)).toBe(true);
+      expect(await store().approvePendingSignIn('p1', now)).toBe(true);
+      expect((await store().getPendingSignIn('p1', now))?.approved).toBe(true);
+      expect(await store().approvePendingSignIn('nope', now)).toBe(false);
+      expect(await store().approvePendingSignIn('p1', now + 600)).toBe(false);
+    });
+
+    it('lets exactly one of two concurrent takes have it, approved flag included', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      await store().approvePendingSignIn('p1', now);
+
+      const taken = await Promise.all([
+        store().takePendingSignIn('p1', now),
+        store().takePendingSignIn('p1', now)
+      ]);
+      expect(taken.filter(Boolean)).toEqual([pendingSignIn({ expiresAt: now + 600, approved: true })]);
+      expect(await store().getPendingSignIn('p1', now)).toBeUndefined();
+    });
+
+    it('takes no expired one', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      expect(await store().takePendingSignIn('p1', now + 600)).toBeUndefined();
+    });
+
+    it('refuses a new one at the cap, counting only live ones, and deletes expired ones on insert', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('old', pendingSignIn({ expiresAt: now + 10 }), 2, now);
+      await store().createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 600 }), 2, now);
+      expect(await store().createPendingSignIn('p2', pendingSignIn({ expiresAt: now + 600 }), 2, now)).toBe(false);
+
+      // `old` has expired by now + 10: it no longer counts, and goes with the insert.
+      expect(await store().createPendingSignIn('p2', pendingSignIn({ expiresAt: now + 610 }), 2, now + 10)).toBe(true);
+      expect(await store().getPendingSignIn('old', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('p1', now)).toBeDefined();
+      expect(await store().createPendingSignIn('p3', pendingSignIn({ expiresAt: now + 610 }), 2, now + 10)).toBe(false);
+    });
+
+    it('names which of the given ids are still live', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('live', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+      await store().createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), MAX, now);
+
+      expect(await store().livePendingSignInIds(['live', 'expired', 'unknown'], now + 5)).toEqual(
+        new Set(['live'])
+      );
+      expect(await store().livePendingSignInIds([], now)).toEqual(new Set());
+    });
+
+    it('the cleanup deletes expired ones and counts them', async () => {
+      const now = NOW();
+      await store().createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), MAX, now);
+      await store().createPendingSignIn('live', pendingSignIn({ expiresAt: now + 600 }), MAX, now);
+
+      expect(await store().sweepExpiredOAuthRows(now + 5)).toEqual({
+        tokens: 0,
+        grants: 0,
+        clients: 0,
+        pendingSignIns: 1
+      });
+      expect(await store().getPendingSignIn('expired', now)).toBeUndefined();
+      expect(await store().getPendingSignIn('live', now)).toBeDefined();
+    });
+  });
+
   // The hub refresh single-flight across processes: one holder per grant, each
   // reading what the previous holder saved.
   it('runs grant lock holders one at a time, each reading the last one\'s save under the lock', async () => {
@@ -272,7 +379,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       }
       await token(id, 'access', now); // expires at `now`: already unusable
 
-      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(now)).toEqual({ tokens: 4, grants: 0, clients: 0, pendingSignIns: 0 });
       for (const kind of ['code', 'access', 'refresh'] as const) {
         expect(await hasToken(id, kind, now - 1)).toBe(false);
         expect(await hasToken(id, kind, now + 600)).toBe(true);
@@ -286,9 +393,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
@@ -298,9 +405,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const due = NOW() + REVOKED_GRANT_RETENTION_SECONDS;
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
       expect(await store().getClient('c1')).toBeDefined();
     });
@@ -313,7 +420,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       const later = NOW() + 96 * DAY; // below ABANDONED_GRANT_RETENTION_SECONDS
       await token(revoked, 'refresh', later + 600);
 
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(revoked)).toBeDefined();
       expect(await store().getGrant(unrevoked)).toBeDefined();
     });
@@ -323,22 +430,22 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       const id = await store().createGrant('gone', signIn());
       await token(id, 'code', NOW() + 600);
 
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 601)).toEqual({ tokens: 1, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
     // The real path to that orphan: the client is swept, then the hub callback creates the grant.
     it('deletes the grant a callback created for a client swept during the sign-in, once its code expires', async () => {
       await store().saveClient(client('c1'));
-      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 31 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 1, pendingSignIns: 0 });
       const id = await store().createGrant('c1', signIn());
       const codeExpiresAt = NOW() + 600;
       await token(id, 'code', codeExpiresAt);
 
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
-      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(codeExpiresAt + 1)).toEqual({ tokens: 1, grants: 1, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
     });
 
@@ -348,10 +455,10 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().saveClient(client('c1'));
       const id = await store().createGrant('c1', signIn());
 
-      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeDefined();
       // The client, past its own retention, loses its last grant and goes in the same run.
-      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 98 * DAY)).toEqual({ tokens: 0, grants: 1, clients: 1, pendingSignIns: 0 });
       expect(await store().getGrant(id)).toBeUndefined();
       expect(await store().getClient('c1')).toBeUndefined();
     });
@@ -367,9 +474,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       // Keeps the revoked grant (and so its client) past both retentions.
       await token(revoked, 'refresh', due + 600);
 
-      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(due - 60)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       expect(await store().getClient('unused')).toBeDefined();
-      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1 });
+      expect(await store().sweepExpiredOAuthRows(due + 60)).toEqual({ tokens: 0, grants: 0, clients: 1, pendingSignIns: 0 });
       expect(await store().getClient('unused')).toBeUndefined();
       expect(await store().getClient('revoked')).toBeDefined();
       expect(await store().getClient('live')).toBeDefined();
@@ -384,7 +491,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(NOW() + 365 * DAY)).toEqual({
         tokens: 1,
         grants: 1,
-        clients: 1
+        clients: 1,
+        pendingSignIns: 0
       });
       expect(await store().getClient('c1')).toBeUndefined();
     });
@@ -398,8 +506,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().deleteToken(`${id}-refresh-${expiresAt}`, 'refresh')).toBe(true);
 
       // A young grant, and the latest run before ABANDONED_GRANT_RETENTION_SECONDS: both keep it.
-      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0 });
-      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(NOW() + 96 * DAY)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       await token(id, 'refresh', expiresAt + 600);
       expect((await store().getGrant(id))?.revoked).toBe(false);
       expect(await store().getClient('c1')).toBeDefined();
@@ -412,8 +520,8 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       await store().revokeGrant(id);
       const later = NOW() + 365 * DAY;
 
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1 });
-      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 1, grants: 1, clients: 1, pendingSignIns: 0 });
+      expect(await store().sweepExpiredOAuthRows(later)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
     });
 
     // A second save or revoke must not restart a retention, or a junk client or ended grant lives on.
@@ -430,12 +538,14 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
       expect(await store().sweepExpiredOAuthRows(first + 1 + REVOKED_GRANT_RETENTION_SECONDS)).toEqual({
         tokens: 0,
         grants: 1,
-        clients: 0
+        clients: 0,
+        pendingSignIns: 0
       });
       expect(await store().sweepExpiredOAuthRows(first + 1 + UNUSED_CLIENT_RETENTION_SECONDS)).toEqual({
         tokens: 0,
         grants: 0,
-        clients: 1
+        clients: 1,
+        pendingSignIns: 0
       });
     });
   });
@@ -479,7 +589,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
     admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
   });
   beforeEach(async () => {
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
   });
   afterAll(async () => {
     await admin.end();
@@ -499,7 +609,27 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
       await holder.query('BEGIN');
       await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [held]);
       const started = Date.now();
-      expect(await store.sweepExpiredOAuthRows(NOW() + 365 * 24 * 60 * 60)).toEqual({ tokens: 0, grants: 1, clients: 1 });
+      expect(await store.sweepExpiredOAuthRows(NOW() + 365 * 24 * 60 * 60)).toEqual({ tokens: 0, grants: 1, clients: 1, pendingSignIns: 0 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await store.close();
+    }
+  });
+
+  // Another deleter (a concurrent /authorize or the cleanup) holding an expired
+  // row must not make a sign-in start wait on the main pool's 9 s lock_timeout.
+  it('starts a pending sign-in without waiting on an expired row another deleter holds', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const now = NOW();
+    await store.createPendingSignIn('old', pendingSignIn({ expiresAt: now + 5 }), 10_000, now);
+    const holder = await admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_pending_sign_ins WHERE id_hash = $1 FOR UPDATE', [hashToken('old')]);
+      const started = Date.now();
+      expect(await store.createPendingSignIn('p1', pendingSignIn({ expiresAt: now + 610 }), 10_000, now + 10)).toBe(true);
       expect(Date.now() - started).toBeLessThan(5_000);
     } finally {
       await holder.query('ROLLBACK');
@@ -518,14 +648,16 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
         const id = await a.createGrant(`c${i}`, signIn());
         await a.saveToken({ token: `t${i}`, kind: 'access', grantId: id, expiresAt: NOW() + 600 });
         await a.revokeGrant(id);
+        await a.createPendingSignIn(`p${i}`, pendingSignIn(), 10_000, NOW());
       }
       const later = NOW() + 365 * 24 * 60 * 60;
       const [fromA, fromB] = await Promise.all([a.sweepExpiredOAuthRows(later), b.sweepExpiredOAuthRows(later)]);
       expect({
         tokens: fromA.tokens + fromB.tokens,
         grants: fromA.grants + fromB.grants,
-        clients: fromA.clients + fromB.clients
-      }).toEqual({ tokens: 3, grants: 3, clients: 3 });
+        clients: fromA.clients + fromB.clients,
+        pendingSignIns: fromA.pendingSignIns + fromB.pendingSignIns
+      }).toEqual({ tokens: 3, grants: 3, clients: 3, pendingSignIns: 3 });
     } finally {
       await Promise.all([a.close(), b.close()]);
     }
@@ -550,7 +682,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
       await vi.waitFor(() => expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true));
       const closed = store.close();
       release();
-      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0 });
+      await expect(run).resolves.toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
       await closed;
       expect(issued.some((sql) => /DELETE FROM oauth_(grants|clients)/.test(sql))).toBe(false);
     } finally {
@@ -589,14 +721,46 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
   });
   beforeEach(async () => {
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
   });
   afterAll(async () => {
     vi.restoreAllMocks();
     await Promise.all(stores.map((store) => store.close()));
     // Live rows under this run's random keys would stop the next run's boots.
-    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients RESTART IDENTITY');
+    await admin.query('TRUNCATE oauth_tokens, oauth_grants, oauth_clients, oauth_pending_sign_ins RESTART IDENTITY');
     await admin.end();
+  });
+
+  it('stores a pending sign-in with its id, csrf and browser key hashed and its hub verifier encrypted', async () => {
+    const store = await open(KEY_A);
+    await store.createPendingSignIn('pending-id', pendingSignIn(), 10_000, NOW());
+
+    const { rows } = await admin.query('SELECT * FROM oauth_pending_sign_ins');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id_hash: hashToken('pending-id'),
+      csrf_hash: hashToken('csrf'),
+      browser_key_hash: hashToken('browser-key'),
+      hub_pkce_verifier: expect.stringMatching(new RegExp(`^v1\\.${new TokenCipher(KEY_A).currentKeyId}\\.`))
+    });
+    expect(JSON.stringify(rows)).not.toContain('pending-id');
+    expect(JSON.stringify(rows)).not.toContain('v'.repeat(43));
+  });
+
+  // A pending sign-in written under a key this instance lacks (a rotation
+  // without the previous key) cannot finish; it reads as gone, never a crash.
+  it('reads a pending sign-in whose verifier it cannot decrypt as gone, logging the reason', async () => {
+    const writer = await open(KEY_A);
+    const reader = await open(KEY_B);
+    await writer.createPendingSignIn('p1', pendingSignIn(), 10_000, NOW());
+
+    const logText = captureLog();
+    expect(await reader.getPendingSignIn('p1', NOW())).toBeUndefined();
+    expect(await reader.takePendingSignIn('p1', NOW())).toBeUndefined();
+    // The take deleted the row before its decrypt failed: gone for every instance.
+    expect(await writer.getPendingSignIn('p1', NOW())).toBeUndefined();
+    expect(logText()).toContain('pending sign-in unreadable: unknown key id');
+    expect(logText()).not.toContain('v'.repeat(43));
   });
 
   it('logs the key ids at boot, and never a key', async () => {

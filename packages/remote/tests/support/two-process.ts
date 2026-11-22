@@ -216,8 +216,8 @@ export function newTokenKey(): string {
 
 export interface ServerProcess {
   base: string;
-  /** SIGKILL, and wait for the exit. */
-  kill(): Promise<void>;
+  /** SIGKILL (or `signal`), and wait for the exit. */
+  kill(signal?: NodeJS.Signals): Promise<void>;
 }
 
 /** Spawns the built server and waits until /healthz answers. */
@@ -231,10 +231,10 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
   const stderr = () => output.join('');
   const server: ServerProcess = {
     base,
-    kill: async () => {
+    kill: async (signal = 'SIGKILL') => {
       if (child.exitCode !== null || child.signalCode !== null) return;
       const exited = new Promise((resolve) => child.once('exit', resolve));
-      child.kill('SIGKILL');
+      child.kill(signal);
       await exited;
     }
   };
@@ -258,10 +258,14 @@ export async function startServer(env: NodeJS.ProcessEnv): Promise<ServerProcess
 export async function startAlternatingProxy(
   port: number,
   backends: string[]
-): Promise<{ base: string; close(): Promise<void> }> {
+): Promise<{ base: string; routed: Array<{ path: string; backend: string }>; close(): Promise<void> }> {
   let next = 0;
+  // Which backend served each request, in arrival order.
+  const routed: Array<{ path: string; backend: string }> = [];
   const server = createServer((req, res) => {
-    const target = new URL(req.url ?? '/', backends[next++ % backends.length]);
+    const backend = backends[next++ % backends.length]!;
+    const target = new URL(req.url ?? '/', backend);
+    routed.push({ path: target.pathname, backend });
     const upstream = httpRequest(target, { method: req.method, headers: req.headers }, (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);
@@ -275,6 +279,7 @@ export async function startAlternatingProxy(
   await new Promise<void>((resolve) => server.listen(port, '127.0.0.1', resolve));
   return {
     base: `http://127.0.0.1:${port}`,
+    routed,
     close: () => {
       server.closeAllConnections();
       return new Promise<void>((resolve) => server.close(() => resolve()));
@@ -291,10 +296,11 @@ export interface SignedIn {
 const REDIRECT = 'http://127.0.0.1:9/callback';
 
 /**
- * Registration, consent, hub callback and code exchange, all on one process:
- * the pending sign-in lives in that process's memory.
+ * Registration, consent, hub callback and code exchange on `base`. `afterConsent`
+ * runs between consent and the hub callback and names the base the sign-in
+ * finishes on (another process: the pending sign-in is in Postgres).
  */
-export async function signIn(base: string): Promise<SignedIn> {
+export async function signIn(base: string, afterConsent?: () => Promise<string>): Promise<SignedIn> {
   const registered = await fetch(`${base}/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -321,6 +327,7 @@ export async function signIn(base: string): Promise<SignedIn> {
     body: new URLSearchParams({ pending: field('pending'), csrf: field('csrf'), decision: 'approve' })
   });
   const state = new URL(consent.headers.get('location')!).searchParams.get('state')!;
+  if (afterConsent) base = await afterConsent();
   const callback = await fetch(`${base}/oauth/callback?state=${state}&code=hub-code`, {
     redirect: 'manual',
     headers: { Cookie: cookieOf(consent) }

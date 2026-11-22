@@ -1,7 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 
 /**
- * At-rest encryption of the hub tokens in oauth_grants: AES-256-GCM, stored as
+ * At-rest encryption of the hub tokens in oauth_grants, and of the hub PKCE
+ * verifier of a pending sign-in: AES-256-GCM, stored as
  * `v1.<key id>.<base64url(iv | tag | ciphertext)>`. The key id (first 8 hex of
  * the key's SHA-256) picks the key on read, so a rotation can keep the
  * previous key for decryption while every write uses the current one. The
@@ -9,7 +10,7 @@ import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:
  * other column fails to decrypt.
  */
 
-export type TokenColumn = 'hub_access_token' | 'hub_refresh_token';
+export type TokenColumn = 'hub_access_token' | 'hub_refresh_token' | 'hub_pkce_verifier';
 
 const VERSION = 'v1';
 const IV_BYTES = 12;

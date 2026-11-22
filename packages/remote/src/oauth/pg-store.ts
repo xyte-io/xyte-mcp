@@ -15,6 +15,7 @@ import {
   type LockedGrant,
   type NewToken,
   type OAuthStore,
+  type PendingSignIn,
   type TokenKind,
   type TokenRecord
 } from './store.js';
@@ -23,7 +24,7 @@ import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * This service owns its whole schema: three tables built at boot by the
+ * This service owns its whole schema: the tables built at boot by the
  * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
  * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
  * server never queries inside it — it goes back to the SDK exactly as
@@ -121,6 +122,33 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
   UPDATE oauth_grants
      SET revoked_at = now(), hub_access_token = NULL, hub_refresh_token = NULL
    WHERE revoked_at IS NULL;
+`
+  },
+  // Sign-ins in progress, so any instance can serve each step of one. Only a
+  // new table: an older build keeps its in-memory map and ignores it. No
+  // foreign key to oauth_clients: a client swept mid-sign-in fails at /token.
+  {
+    version: 3,
+    name: 'pending_sign_ins',
+    breaksRollback: false,
+    sql: `
+  CREATE TABLE IF NOT EXISTS oauth_pending_sign_ins (
+    id_hash           text PRIMARY KEY,
+    client_id         text NOT NULL,
+    redirect_uri      text NOT NULL,
+    code_challenge    text NOT NULL,
+    client_state      text,
+    resource          text,
+    csrf_hash         text NOT NULL,
+    browser_key_hash  text NOT NULL,
+    approved          boolean NOT NULL DEFAULT false,
+    -- Encrypted (TokenCipher, this column name as the AAD).
+    hub_pkce_verifier text NOT NULL,
+    expires_at        timestamptz NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now()
+  );
+  -- The expired-row deletes and the live count on every /authorize.
+  CREATE INDEX IF NOT EXISTS oauth_pending_sign_ins_expires_at ON oauth_pending_sign_ins (expires_at);
 `
   }
 ];
@@ -415,6 +443,19 @@ interface TokenRow {
   code_challenge: string | null;
   redirect_uri: string | null;
   resource: string | null;
+  expires_at: Date;
+}
+
+interface PendingSignInRow {
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  client_state: string | null;
+  resource: string | null;
+  csrf_hash: string;
+  browser_key_hash: string;
+  approved: boolean;
+  hub_pkce_verifier: string;
   expires_at: Date;
 }
 
@@ -777,9 +818,122 @@ export class PgOAuthStore implements OAuthStore {
   }
 
   /**
-   * Three autocommit DELETEs, in foreign-key order (a token references its
-   * grant, without cascade). Each locks only the rows it deletes, which no
-   * request uses any more, so requests keep being served.
+   * One statement: the expired rows go, and the insert happens only while
+   * fewer than `max` live rows remain (≤ 10 000 rows, counted on the
+   * expires_at index). Both parts read the same snapshot, so the count skips
+   * the expired rows rather than waiting for their delete. SKIP LOCKED: an
+   * expired row another deleter (a concurrent /authorize, the cleanup) holds
+   * is left to it, not waited on up to the pool's lock_timeout.
+   */
+  async createPendingSignIn(
+    id: string,
+    entry: PendingSignIn,
+    max: number,
+    now: number
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `WITH expired AS (
+         DELETE FROM oauth_pending_sign_ins WHERE id_hash IN (
+           SELECT id_hash FROM oauth_pending_sign_ins
+            WHERE expires_at <= to_timestamp($11) FOR UPDATE SKIP LOCKED
+         )
+       )
+       INSERT INTO oauth_pending_sign_ins
+         (id_hash, client_id, redirect_uri, code_challenge, client_state, resource,
+          csrf_hash, browser_key_hash, hub_pkce_verifier, expires_at)
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, to_timestamp($10)
+        WHERE (SELECT count(*) FROM oauth_pending_sign_ins WHERE expires_at > to_timestamp($11)) < $12`,
+      [
+        hashToken(id),
+        entry.clientId,
+        entry.redirectUri,
+        entry.codeChallenge,
+        entry.state ?? null,
+        entry.resource ?? null,
+        entry.csrfHash,
+        entry.browserKeyHash,
+        this.cipher.encrypt(entry.hubVerifier, 'hub_pkce_verifier'),
+        entry.expiresAt,
+        now,
+        max
+      ]
+    );
+    return result.rowCount === 1;
+  }
+
+  async getPendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined> {
+    const result = await this.pool.query<PendingSignInRow>(
+      'SELECT * FROM oauth_pending_sign_ins WHERE id_hash = $1 AND expires_at > to_timestamp($2)',
+      [hashToken(id), now]
+    );
+    return this.pendingSignInOf(result.rows[0]);
+  }
+
+  async approvePendingSignIn(id: string, now: number): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE oauth_pending_sign_ins SET approved = true
+        WHERE id_hash = $1 AND expires_at > to_timestamp($2)`,
+      [hashToken(id), now]
+    );
+    return result.rowCount === 1;
+  }
+
+  // pg's query_timeout is client-side, so a take that timed out may still have
+  // deleted the row; the user then restarts the sign-in (accepted).
+  async takePendingSignIn(id: string, now: number): Promise<PendingSignIn | undefined> {
+    const result = await this.pool.query<PendingSignInRow>(
+      `DELETE FROM oauth_pending_sign_ins
+        WHERE id_hash = $1 AND expires_at > to_timestamp($2) RETURNING *`,
+      [hashToken(id), now]
+    );
+    return this.pendingSignInOf(result.rows[0]);
+  }
+
+  async livePendingSignInIds(ids: string[], now: number): Promise<Set<string>> {
+    if (!ids.length) return new Set();
+    const byHash = new Map(ids.map((id) => [hashToken(id), id]));
+    const result = await this.pool.query<{ id_hash: string }>(
+      `SELECT id_hash FROM oauth_pending_sign_ins
+        WHERE id_hash = ANY($1) AND expires_at > to_timestamp($2)`,
+      [[...byHash.keys()], now]
+    );
+    return new Set(result.rows.map((row) => byHash.get(row.id_hash)!));
+  }
+
+  /**
+   * Undefined for no row, and for one whose verifier this instance cannot
+   * decrypt (written under a key it lacks): that sign-in cannot finish, so it
+   * reads as gone and the user restarts the connection.
+   */
+  private pendingSignInOf(row: PendingSignInRow | undefined): PendingSignIn | undefined {
+    if (!row) return undefined;
+    let hubVerifier: string;
+    try {
+      hubVerifier = this.cipher.decrypt(row.hub_pkce_verifier, 'hub_pkce_verifier');
+    } catch (error) {
+      if (!(error instanceof TokenDecryptError)) throw error;
+      logError(`pending sign-in unreadable: ${error.reason}${error.keyId ? ` (key id ${error.keyId})` : ''}`);
+      return undefined;
+    }
+    return {
+      clientId: row.client_id,
+      redirectUri: row.redirect_uri,
+      codeChallenge: row.code_challenge,
+      ...(row.client_state !== null ? { state: row.client_state } : {}),
+      ...(row.resource !== null ? { resource: row.resource } : {}),
+      csrfHash: row.csrf_hash,
+      browserKeyHash: row.browser_key_hash,
+      approved: row.approved,
+      hubVerifier,
+      expiresAt: Math.floor(row.expires_at.getTime() / 1000)
+    };
+  }
+
+  /**
+   * Four autocommit DELETEs: expired pending sign-ins, then the rest in
+   * foreign-key order (a token references its grant, without cascade). Each
+   * locks only the rows it deletes, which no request uses any more, so requests
+   * keep being served.
    *
    * Token expiries come from this app's clock, created_at and revoked_at from
    * Postgres now(); a skew between the two is harmless at day-scale retentions.
@@ -799,8 +953,9 @@ export class PgOAuthStore implements OAuthStore {
    * migration) if a run ever gets slow; a global registration cap is separate work.
    */
   async sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts> {
-    const deleted = { tokens: 0, grants: 0, clients: 0 };
+    const deleted = { tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 };
     const steps: Array<[keyof DeletedOAuthRowCounts, string, number[]]> = [
+      ['pendingSignIns', 'DELETE FROM oauth_pending_sign_ins WHERE expires_at <= to_timestamp($1)', [now]],
       ['tokens', 'DELETE FROM oauth_tokens WHERE expires_at <= to_timestamp($1)', [now]],
       [
         'grants',

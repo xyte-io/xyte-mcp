@@ -48,9 +48,10 @@ import { errorCodeOf, logEvent } from '../log-event.js';
  *   consent page, delegates sign-in to hub's OAuth server, and every verified
  *   token resolves to its grant's hub token — built into a per-request
  *   `createToolContext`, exactly as `context.ts` promised. Client tokens are
- *   never forwarded to the hub (confused-deputy). Tokens live in Postgres
- *   (`DATABASE_URL`) so they survive a dyno restart; without it, an in-memory
- *   store that loudly warns.
+ *   never forwarded to the hub (confused-deputy). Tokens and sign-ins in
+ *   progress live in Postgres (`DATABASE_URL`), so they survive a dyno restart
+ *   and any instance serves any step; without it (config allows that only for
+ *   a localhost issuer), an in-memory store that loudly warns.
  *
  * Read-only unless `XYTE_MCP_ALLOW_WRITES=1`: unlike stdio, writes are opt-in.
  */
@@ -340,9 +341,9 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
     logError(`http listener failed: ${error.message}`);
     process.exit(1);
   });
-  // OAuth mode: expired tokens, and grants and clients nothing uses any more,
-  // are deleted now and then hourly. One run at a time; the next tick retries
-  // a failed run.
+  // OAuth mode: expired pending sign-ins and tokens, and grants and clients
+  // nothing uses any more, are deleted now and then hourly. One run at a time;
+  // the next tick retries a failed run.
   let oauthCleanup: NodeJS.Timeout | undefined;
   if (store) {
     const cleanupStore = store;
@@ -352,10 +353,11 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
       cleaning = true;
       try {
         const deleted = await cleanupStore.sweepExpiredOAuthRows(Math.floor(Date.now() / 1000));
-        if (deleted.tokens || deleted.grants || deleted.clients) {
+        if (deleted.tokens || deleted.grants || deleted.clients || deleted.pendingSignIns) {
           log(
             `OAuth store cleanup: deleted ${deleted.tokens} expired token(s), ` +
-              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s)`
+              `${deleted.grants} ended grant(s), ${deleted.clients} unused client(s), ` +
+              `${deleted.pendingSignIns} expired pending sign-in(s)`
           );
         }
       } catch (error) {

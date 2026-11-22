@@ -83,10 +83,10 @@ Everything below is about running the server itself.
 | `XYTE_MCP_ISSUER_URL` | **Hosted server only.** This deployment's public https URL; setting it enables OAuth 2.1. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
-| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Absent → in-memory, tokens die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
+| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Required unless `XYTE_MCP_ISSUER_URL` is on `localhost` or `127.0.0.1` (the server refuses to boot); with a local issuer, absent → in-memory, tokens and sign-ins in progress die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
 | `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
-| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
+| `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database, and the hub PKCE verifier of each sign-in in progress, are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
 | `XYTE_MCP_TOKEN_KEY_PREVIOUS` | **Hosted server + OAuth + `DATABASE_URL`, optional.** The key being rotated out, same format: only decrypts. See [Security notes](#security-notes) for rotation. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
@@ -271,12 +271,15 @@ Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
 rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
 (schema version 2) cannot be rolled back: an older build refuses to boot against it.
 
-Deploy with preboot off (`heroku features:disable preboot -a <app>`), and keep it off while
-sign-in state is in memory (see "One dyno" under [OAuth 2.1](#oauth-21)):
-old and new process then overlap only for the shutdown drain. Upgrading from a build without
+Keep preboot off (`heroku features:disable preboot -a <app>`), so the old and new process
+overlap only for the shutdown drain: the rate-limit counters are in memory (see **One dyno**
+below), so a longer overlap doubles every budget. Upgrading from a build without
 the cross-process refresh lock, a refresh on each process in that overlap can race; the loser
 gets `invalid_grant` from hub and that connection has to sign in again. That window is
 accepted.
+
+An OAuth app whose issuer is not localhost or 127.0.0.1 refuses to boot on this build
+without `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`: set both before deploying it.
 
 An app that had both modes configured refuses to boot on this build: remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
@@ -288,7 +291,8 @@ checked on the `heroku-24` stack; run the app on that stack. If the boot stops o
 
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
 drop its tables (`oauth_tokens`, `oauth_grants`, `oauth_clients` and, if present,
-`oauth_schema_migrations`) once before this build starts; it recreates them at boot.
+`oauth_schema_migrations` and `oauth_pending_sign_ins`) once before this build starts; it
+recreates them at boot.
 
 `HEAD:main` is what lets this be deployed from a feature branch — Heroku builds the app's
 own `main`, which has nothing to do with the GitHub branch you are on.
@@ -464,15 +468,18 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Disconnect.** Revoking any of our tokens revokes its grant, and calls hub's revoke —
   which ends that user's sign-in on that organization for every client — only when no
   other live grant rides the same sign-in.
-- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants and token hashes
-  across dyno restarts; without it an in-memory store logs a loud warning and every restart
-  logs users out. At boot and then hourly the server deletes expired tokens, revoked grants
-  with no token left after 7 days (the row shows who was signed out and when), sign-ins with
-  no token left, 97 days after the sign-in (hub's 90-day chain has ended, plus a week), sign-ins whose
-  client is gone, and registered clients with no grant after 30 days (registration is open,
-  so junk registrations go; a client in use keeps its grant). A returning user whose client
-  was deleted must re-add the connector; see "Cleanup of old rows" in
-  [packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md). The hub tokens in each grant are encrypted with AES-256-GCM under
+- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants, token hashes and
+  sign-ins in progress across dyno restarts, so a sign-in started on one instance finishes on
+  any other. It is required unless the issuer is on `localhost` or `127.0.0.1`; there, without
+  it, an in-memory store logs a loud warning and every restart logs users out. At boot and
+  then hourly the server deletes sign-ins in progress past their 10 minutes, expired tokens,
+  revoked grants with no token left after 7 days (the row shows who was signed out and
+  when), sign-ins with no token left, 97 days after the sign-in (hub's 90-day chain has
+  ended, plus a week), sign-ins whose client is gone, and registered clients with no grant
+  after 30 days (registration is open, so junk registrations go; a client in use keeps its
+  grant). A returning user whose client was deleted must re-add the connector; see "Cleanup
+  of old rows" in [packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md). The hub
+  tokens in each grant are encrypted with AES-256-GCM under
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the
   key id (the first 8 hex characters of the key's SHA-256) is logged at boot, the key never.
   A grant whose tokens cannot be decrypted (unknown key, tampered or plain-text value) is
@@ -511,10 +518,10 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
   one-off dyno (`heroku run`) needs it as a config var
   (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
-- **One dyno.** The pending consent state and the rate-limit counters are in memory, so the
-  app must run on a single dyno (a second one doubles every budget). The hub token refresh is
-  already safe across processes: a Postgres row lock lets one process at a time refresh a
-  connection.
+- **One dyno.** The rate-limit counters are in memory, so the app must run on a single dyno
+  (a second one doubles every budget). Sign-ins in progress live in Postgres, so a sign-in
+  started on one process finishes on any other, and the hub token refresh is safe across
+  processes: a Postgres row lock lets one process at a time refresh a connection.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of
@@ -598,7 +605,8 @@ a public sign-in URL.
    WHERE revoked_at IS NULL AND hub_refresh_token LIKE 'v1.<old key id>.%';
   ```
 
-  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0. After 30 days, the ones left have made
+  Remove `XYTE_MCP_TOKEN_KEY_PREVIOUS` when that is 0; a sign-in started under the old key in
+  the 10 minutes before ends on the expired page, and its user starts it again. After 30 days, the ones left have made
   no tool call in that time; revoke them first (their users connect again once):
 
   ```sql

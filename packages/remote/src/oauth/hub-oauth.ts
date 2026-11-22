@@ -1,4 +1,4 @@
-import { XyteError } from '@xyteai/mcp/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 
 /**
@@ -105,7 +105,11 @@ export function createHubOAuth(options: {
         code_verifier: codeVerifier
       });
       if (!response.ok) {
-        throw new Error(`hub code exchange failed: ${response.status} ${await errorOf(response)}`);
+        const error = await errorOf(response);
+        const message = `hub code exchange failed: ${response.status} ${error}`;
+        // Hub paused the app between /oauth/authorize and this exchange: a try-later, not a failure.
+        if (response.status === 403 && error === 'application_paused') throw new HubPausedError(message);
+        throw new Error(message);
       }
       const { idToken, ...rest } = await tokens(response);
       if (!idToken) throw new Error('hub token response has no id_token');
@@ -157,13 +161,22 @@ export function createHubOAuth(options: {
   };
 }
 
+/** Hub answered the code exchange 403 `application_paused`: the user can sign in again later. */
+export class HubPausedError extends Error {
+  override name = 'HubPausedError';
+}
+
 /** Hub answered a refresh with an error status; 5xx leaves it unknown whether hub rotated. */
 export class HubRefreshError extends XyteError {
   constructor(
     readonly status: number,
     error: string
   ) {
-    super(status >= 500 ? 'network' : 'auth', `hub token refresh failed: ${status} ${error}`);
+    super(
+      status >= 500 ? 'network' : 'auth',
+      `hub token refresh failed: ${status} ${error}`,
+      status === 403 && error === 'application_paused' ? [APPLICATION_PAUSED_HINT] : []
+    );
     this.name = 'HubRefreshError';
   }
 }

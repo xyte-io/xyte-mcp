@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
-import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
@@ -597,6 +597,26 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(stderr).not.toContain('user@example.com');
   });
 
+  it('a paused application on the code exchange sends temporarily_unavailable with a try-later message', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await approve(provider, client);
+    hub.onCode = () => json(403, { error: 'application_paused', error_code: 'application_paused' });
+
+    const stderr = await captureStderr(async () => {
+      const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
+      const url = new URL(out.location);
+      expect(url.origin + url.pathname).toBe(REDIRECT);
+      expect(url.searchParams.get('error')).toBe('temporarily_unavailable');
+      expect(url.searchParams.get('error_description')).toBe(
+        'Xyte has paused this connection for now. Try signing in again later.'
+      );
+      expect(url.searchParams.get('state')).toBe('st4te');
+      expect(url.searchParams.get('code')).toBeNull();
+    });
+    expect(stderr).toContain('hub sign-in failed: hub code exchange failed: 403 application_paused');
+  });
+
   it('passes a hub error and error_reason through to the client redirect', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
@@ -1145,6 +1165,43 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     );
   });
 
+  it('a hub 403 application_paused on a call is returned unchanged, no refresh', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    const paused = new XyteHttpError(
+      403,
+      'Forbidden',
+      { error: 'paused', error_code: 'application_paused' },
+      'k'
+    );
+    const upstream = stubHttp(() => paused);
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstream)
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toBe(paused);
+    expect(hub.refreshes()).toHaveLength(0);
+  });
+
+  it.each([
+    [403, 'unauthorized_client'],
+    [401, 'application_paused']
+  ])('a refresh %i %s carries no paused hint', async (status, error) => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId } = await connected(provider, client);
+    hub.onRefresh = () => json(status, { error });
+
+    await expect(
+      provider
+        .hubHttp(grantId, upstreamOk())
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'auth', hints: [] });
+  });
+
   it('a hub 401 without invalid_token (record not in the org) is returned unchanged, no refresh', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);
@@ -1583,10 +1640,46 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     await expect(call).rejects.toBeInstanceOf(XyteError);
     await expect(call).rejects.toMatchObject({
       kind: 'auth',
-      message: expect.stringMatching(/refresh failed: 401/)
+      message: expect.stringMatching(/refresh failed: 401/),
+      hints: []
     });
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  it('a 403 application_paused on refresh says the connection is paused and keeps the grant', async () => {
+    const { provider, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    const sentBefore = hub.refreshes().length;
+    hub.onRefresh = () =>
+      json(403, {
+        error: 'application_paused',
+        error_description: 'This application is temporarily paused. Try again later.'
+      });
+    const get = () =>
+      provider
+        .hubHttp(grantId, upstreamOk())
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+
+    await expect(get()).rejects.toMatchObject({
+      kind: 'auth',
+      message: 'hub token refresh failed: 403 application_paused',
+      hints: [APPLICATION_PAUSED_HINT]
+    });
+    expect(hub.refreshes()).toHaveLength(sentBefore + 1);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+
+    // Once unpaused, the same refresh token works: the paused answer burned nothing.
+    hub.onRefresh = undefined;
+    await get();
+    expect(hub.refreshes()).toHaveLength(sentBefore + 2);
+    const [paused, resumed] = hub
+      .refreshes()
+      .slice(-2)
+      .map((call) => call.form.get('refresh_token'));
+    expect(resumed).toBe(paused);
   });
 
   // A lock wait past lock_timeout, no free connection, a failed BEGIN: nothing reached hub.

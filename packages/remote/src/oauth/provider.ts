@@ -22,6 +22,7 @@ import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { logError } from '@xyteai/mcp/log.js';
 import { errorCodeOf, logEvent } from '../log-event.js';
 import {
+  HubPausedError,
   HubRefreshError,
   nowSeconds,
   type HubOAuth,
@@ -328,7 +329,15 @@ export class XyteOAuthProvider implements OAuthServerProvider {
       logEvent('sign_in', { outcome: 'failed', reason: 'exchange', client: taken.clientId });
       res.redirect(
         302,
-        clientRedirect(taken, { error: 'server_error', error_description: 'Xyte sign-in failed' })
+        clientRedirect(
+          taken,
+          error instanceof HubPausedError
+            ? {
+                error: 'temporarily_unavailable',
+                error_description: 'Xyte has paused this connection for now. Try signing in again later.'
+              }
+            : { error: 'server_error', error_description: 'Xyte sign-in failed' }
+        )
       );
     }
   }

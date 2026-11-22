@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { apiCallTool } from '../src/tools/api-call.js';
 import { endpointDescribeTool } from '../src/tools/endpoint-describe.js';
 import { endpointsListTool } from '../src/tools/endpoints-list.js';
-import { XyteHttpError } from '../src/http/errors.js';
+import { APPLICATION_PAUSED_HINT, XyteHttpError } from '../src/http/errors.js';
 import { REDACTED } from '../src/redact.js';
 import { stubHttp, testContext } from './support/context.js';
 
@@ -49,6 +49,17 @@ describe('xyte_endpoint_describe', () => {
     expect(structured.method).toBe('GET');
     expect(structured.mutating).toBe(false);
     expect(structured.url).toContain('https://hub.xyte.io');
+  });
+
+  it.each([
+    [undefined, 'auth: organization key'],
+    [{ organization: { accessToken: 'xoat_abcdef123456' } }, 'auth: organization, signed-in user'],
+  ])('names the credential in use (%j)', async (credentials, line) => {
+    const result = await endpointDescribeTool.handler(
+      { key: READ_KEY },
+      testContext(credentials ? { credentials } : {})
+    );
+    expect(result.content[0]?.text).toContain(line);
   });
 
   it('errors with suggestions on a near-miss key', async () => {
@@ -161,7 +172,7 @@ describe('xyte_api_call', () => {
     'You have no access to this item. Ask an organization administrator for access.';
   const SIGN_IN_HINT =
     'The Xyte sign-in behind this connection has ended. Reconnect the Xyte connector to sign in again.';
-  const SIGNED_IN_HINTS = [IDS_HINT, ADMIN_HINT, NO_ACCESS_HINT, SIGN_IN_HINT];
+  const SIGNED_IN_HINTS = [IDS_HINT, ADMIN_HINT, NO_ACCESS_HINT, SIGN_IN_HINT, APPLICATION_PAUSED_HINT];
 
   it.each([401, 403])('keeps the API-key hint on %i in API-key mode', async (status) => {
     const http = stubHttp(() => new XyteHttpError(status, 'Denied', { error: 'nope' }, READ_KEY));
@@ -171,6 +182,7 @@ describe('xyte_api_call', () => {
 
   it.each([
     [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined],
+    [403, { error_code: 'application_paused', error: 'x' }, undefined],
     [401, { error: 'x' }, 'Bearer error="invalid_token"']
   ])(
     'gives only the API-key hint on %i %j %s in API-key mode',
@@ -199,6 +211,7 @@ describe('xyte_api_call', () => {
     it.each([
       [403, { error_code: 'organization_administrator_required', error: 'x' }, undefined, ADMIN_HINT],
       [403, { error_code: 'no_access_to_resource', error: 'x' }, undefined, NO_ACCESS_HINT],
+      [403, { error_code: 'application_paused', error: 'x' }, undefined, APPLICATION_PAUSED_HINT],
       [
         401,
         { error: 'x' },
@@ -248,7 +261,7 @@ describe('xyte_api_call', () => {
       const error = new XyteHttpError(422, 'Unprocessable', { error: 'x' }, READ_KEY);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
       const text = result.content[0]?.text;
-      expect(text).toContain(`Run xyte_endpoint_describe on ${READ_KEY} to check the expected body.`);
+      expect(text).toContain(`Run xyte_endpoint_describe on ${READ_KEY} to check the expected arguments.`);
       expect(text).not.toContain(API_KEY_HINT);
     });
 

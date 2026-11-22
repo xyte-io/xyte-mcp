@@ -105,7 +105,11 @@ export function createHubOAuth(options: {
         code_verifier: codeVerifier
       });
       if (!response.ok) {
-        throw new Error(`hub code exchange failed: ${response.status} ${await errorOf(response)}`);
+        const error = await errorOf(response);
+        const message = `hub code exchange failed: ${response.status} ${error}`;
+        // Hub paused the app between /oauth/authorize and this exchange: a try-later, not a failure.
+        if (response.status === 403 && error === 'application_paused') throw new HubPausedError(message);
+        throw new Error(message);
       }
       const { idToken, ...rest } = await tokens(response);
       if (!idToken) throw new Error('hub token response has no id_token');
@@ -155,6 +159,11 @@ export function createHubOAuth(options: {
       }
     }
   };
+}
+
+/** Hub answered the code exchange 403 `application_paused`: the user can sign in again later. */
+export class HubPausedError extends Error {
+  override name = 'HubPausedError';
 }
 
 /** Hub answered a refresh with an error status; 5xx leaves it unknown whether hub rotated. */

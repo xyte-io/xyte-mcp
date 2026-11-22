@@ -597,6 +597,26 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(stderr).not.toContain('user@example.com');
   });
 
+  it('a paused application on the code exchange sends temporarily_unavailable with a try-later message', async () => {
+    const { provider, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { pending, cookie } = await approve(provider, client);
+    hub.onCode = () => json(403, { error: 'application_paused', error_code: 'application_paused' });
+
+    const stderr = await captureStderr(async () => {
+      const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
+      const url = new URL(out.location);
+      expect(url.origin + url.pathname).toBe(REDIRECT);
+      expect(url.searchParams.get('error')).toBe('temporarily_unavailable');
+      expect(url.searchParams.get('error_description')).toBe(
+        'Xyte has paused this connection for now. Try signing in again later.'
+      );
+      expect(url.searchParams.get('state')).toBe('st4te');
+      expect(url.searchParams.get('code')).toBeNull();
+    });
+    expect(stderr).toContain('hub sign-in failed: hub code exchange failed: 403 application_paused');
+  });
+
   it('passes a hub error and error_reason through to the client redirect', async () => {
     const { provider, hub } = makeProvider();
     const client = await registeredClient(provider);

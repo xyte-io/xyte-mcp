@@ -1,11 +1,16 @@
-import { describe, expect, it, vi } from 'vitest';
+import { randomBytes, randomUUID } from 'node:crypto';
+import pg from 'pg';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
 import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
-import { MemoryOAuthStore } from '../src/oauth/store.js';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
+import { MemoryOAuthStore, type OAuthStore } from '../src/oauth/store.js';
+import { TokenCipher } from '../src/oauth/token-cipher.js';
 import { stubHttp } from '../../mcp/tests/support/context.js';
 import { hubAcceptsPkce } from './support/pkce.js';
 
@@ -100,9 +105,23 @@ function tokenRejected(): XyteHttpError {
 
 let currentHub: ReturnType<typeof fakeHub> | undefined;
 
-function makeProvider() {
-  const store = new MemoryOAuthStore();
-  const hub = fakeHub();
+/**
+ * The grant lock's connection or commit fails once, after its holder ran: what
+ * it wrote rolls back (here: its save writes nothing), and the provider saves
+ * the new pair outside the lock (saveHubTokens).
+ */
+function failGrantLockCommitOnce(store: OAuthStore): void {
+  const withLock = store.withGrantLock.bind(store);
+  vi.spyOn(store, 'withGrantLock').mockImplementationOnce((async (
+    id: string,
+    fn: Parameters<OAuthStore['withGrantLock']>[1]
+  ) => {
+    await withLock(id, (locked) => fn({ ...locked, rotate: async () => true }));
+    throw Object.assign(new Error('connection lost'), { code: '08006' });
+  }) as never);
+}
+
+function makeProvider(store: OAuthStore = new MemoryOAuthStore(), hub = fakeHub()) {
   currentHub = hub;
   const provider = new XyteOAuthProvider(
     store,
@@ -117,6 +136,16 @@ function makeProvider() {
     ISSUER
   );
   return { provider, store, hub };
+}
+
+/** Every pending sign-in row in the store, live or not. */
+async function pendingRowCount(store: OAuthStore): Promise<number> {
+  if (store instanceof MemoryOAuthStore) {
+    return (store as unknown as { pendingSignIns: Map<string, unknown> }).pendingSignIns.size;
+  }
+  const { pool } = store as unknown as { pool: pg.Pool };
+  const { rows } = await pool.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_pending_sign_ins');
+  return rows[0]!.n;
 }
 
 async function registeredClient(
@@ -183,7 +212,18 @@ async function openConsent(provider: XyteOAuthProvider, client: OAuthClientInfor
 
 /** Approve on the consent page; returns the hub redirect and the rotated cookie. */
 async function approve(provider: XyteOAuthProvider, client: OAuthClientInformationFull) {
-  const consent = await openConsent(provider, client);
+  const approved = await submitApprove(provider, await openConsent(provider, client));
+  // Specs built on this would otherwise pass on a refused Approve.
+  expect(approved.out.status).toBe(302);
+  expect(approved.cookie).not.toBe('');
+  return approved;
+}
+
+/** Approve a consent page opened earlier, possibly on another instance. */
+async function submitApprove(
+  provider: XyteOAuthProvider,
+  consent: { pending: string; csrf: string; cookie: string }
+) {
   const { out, res } = fakeRes();
   await provider.consent(
     fakeReq({
@@ -192,9 +232,9 @@ async function approve(provider: XyteOAuthProvider, client: OAuthClientInformati
     }),
     res
   );
-  const [cookieName, cookie] = Object.entries(out.cookies)[0]!;
-  currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
-  return { out, pending: consent.pending, cookie: `${cookieName}=${cookie.value}` };
+  const [cookieName, cookie] = Object.entries(out.cookies)[0] ?? [];
+  if (out.location) currentHub!.challenge = new URL(out.location).searchParams.get('code_challenge') ?? undefined;
+  return { out, pending: consent.pending, cookie: cookieName ? `${cookieName}=${cookie!.value}` : '' };
 }
 
 async function callback(
@@ -280,8 +320,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(url.searchParams.get('code_challenge')).not.toBe('client-challenge');
   });
 
-  it('refuses an approve without the browser cookie or with a wrong CSRF token', async () => {
-    const { provider } = makeProvider();
+  it('refuses an approve without the browser cookie or with a wrong CSRF token, leaving the sign-in', async () => {
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     for (const tamper of [{ cookie: undefined }, { csrf: 'forged' }]) {
       const consent = await openConsent(provider, client);
@@ -295,6 +335,8 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       );
       expect(out.status).toBe(400);
       expect(out.location).toBe('');
+      expect(await store.getPendingSignIn(consent.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+      expect((await submitApprove(provider, consent)).out.status).toBe(302);
     }
   });
 
@@ -318,6 +360,45 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(hub.calls).toHaveLength(0);
     // The flow is over, so its cookie goes too.
     expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    // ...and a callback on it, even with that cookie, finds nothing.
+    const late = await callback(provider, { state: consent.pending, code: 'hub-code' }, consent.cookie);
+    expect(late.status).toBe(400);
+    expect(late.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('refuses an Approve once the sign-in has expired, asking hub nothing', async () => {
+    const { provider, hub } = makeProvider();
+    const consent = await openConsent(provider, await registeredClient(provider));
+    vi.useFakeTimers({ now: Date.now() + 11 * 60 * 1000 });
+    try {
+      const { out } = await submitApprove(provider, consent);
+      expect(out.status).toBe(400);
+      expect(out.html).toContain('Authorization expired or invalid');
+      expect(out.location).toBe('');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  // Saved for ten minutes from an unauthenticated request, so it is bounded.
+  it('refuses an /authorize whose state is over 1024 characters, saving nothing', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const create = vi.spyOn(store, 'createPendingSignIn');
+    const start = async (state: string) => {
+      const { out, res } = fakeRes();
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT, state }, res);
+      return out;
+    };
+
+    const long = await start('x'.repeat(1025));
+    expect(long.status).toBe(400);
+    expect(long.location).toBe('');
+    expect(long.cookies).toEqual({});
+    expect(create).not.toHaveBeenCalled();
+    expect((await start('x'.repeat(1024))).status).toBe(200);
   });
 
   it('expires flow cookies whose flow is gone when a new /authorize starts', async () => {
@@ -335,18 +416,63 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.cookies.other).toBeUndefined();
   });
 
-  it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
-    const { provider } = makeProvider();
+  it('still serves the consent page when the flow-cookie lookup fails, keeping the old cookies', async () => {
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
-    const start = () => {
-      const { out, res } = fakeRes();
-      return provider
+    vi.spyOn(store, 'livePendingSignInIds').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+    (res as unknown as { req: Request }).req = fakeReq({ cookie: '__Host-xmcp_gone=v' });
+
+    const stderr = await captureStderr(() =>
+      provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+    );
+    expect(out.status).toBe(200);
+    expect(out.html).toContain('name="pending"');
+    expect(out.cookies['__Host-xmcp_gone']).toBeUndefined();
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([]);
+  });
+
+  it('logs a store failure on /authorize and rethrows it for the SDK to redirect', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    vi.spyOn(store, 'createPendingSignIn').mockRejectedValueOnce(
+      Object.assign(new Error('connect ECONNREFUSED db.internal:5432'), { code: 'ECONNREFUSED' })
+    );
+    const { out, res } = fakeRes();
+
+    let thrown: unknown;
+    const stderr = await captureStderr(() =>
+      provider
         .authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
-        .then(() => out.status);
+        .catch((error: unknown) => (thrown = error))
+    );
+    expect(thrown).toBeInstanceOf(Error);
+    expect(out.cookies).toEqual({});
+    expect(stderr).toContain('ECONNREFUSED');
+    expect(stderr).not.toContain('db.internal');
+    expect(eventsIn(stderr)).toEqual([
+      { event: 'sign_in', outcome: 'failed', reason: 'store', client: 'client-1' }
+    ]);
+  });
+
+  it('answers 503 instead of parking more than 10 000 pending sign-ins', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const start = async () => {
+      const { out, res } = fakeRes();
+      await provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+      return out;
     };
     for (let i = 0; i < 10_000; i += 1) await start();
 
-    expect(await start()).toBe(503);
+    const out = await start();
+    expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
+    expect(await pendingRowCount(store)).toBe(10_000);
   });
 
   it('callback mints a code bound to the client challenge and stores the hub sign-in', async () => {
@@ -374,7 +500,7 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
   });
 
   it('callback without, or with the wrong, browser cookie issues nothing', async () => {
-    const { provider, hub } = makeProvider();
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
 
     const missing = await approve(provider, client);
@@ -386,15 +512,21 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
     expect(out.status).toBe(400);
     expect(out.location).toBe('');
     expect(hub.calls).toHaveLength(0);
+
+    // ...and leaves the sign-in for its own browser to finish.
+    expect(await store.getPendingSignIn(wrong.pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const real = await callback(provider, { state: wrong.pending, code: 'hub-code' }, wrong.cookie);
+    expect(new URL(real.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
   });
 
   // The state is in hub's URL (history, logs): knowing it must not cancel a login.
   it('a cookieless callback leaves the login for its own browser to finish', async () => {
-    const { provider } = makeProvider();
+    const { provider, store } = makeProvider();
     const client = await registeredClient(provider);
     const { pending, cookie } = await approve(provider, client);
 
     expect((await callback(provider, { state: pending, code: 'c' })).status).toBe(400);
+    expect(await store.getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
     const out = await callback(provider, { state: pending, code: 'hub-code' }, cookie);
     expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
     // ...once: the replay is refused.
@@ -544,6 +676,274 @@ describe('XyteOAuthProvider: consent and hub sign-in', () => {
       res
     );
     expect(out.status).toBe(400);
+  });
+});
+
+const PG_URL = process.env.TEST_DATABASE_URL;
+const KEY_A = randomBytes(32);
+const KEY_B = randomBytes(32);
+
+/** A Postgres schema of its own, so oauth-store.test.ts's truncates never meet these rows. */
+async function pgSchema() {
+  const schema = `provider_test_${randomUUID().replaceAll('-', '')}`;
+  const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  const url = new URL(PG_URL!);
+  url.searchParams.set('options', `-c search_path=${schema}`);
+  const stores: PgOAuthStore[] = [];
+  return {
+    connect: async (key: Buffer) => {
+      const store = await PgOAuthStore.connect(url.toString(), new TokenCipher(key), 15_000);
+      stores.push(store);
+      return store;
+    },
+    drop: async () => {
+      await Promise.all(stores.map((store) => store.close().catch(() => undefined)));
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    }
+  };
+}
+
+/**
+ * Two stores on one database, as two server instances have. The memory pair is
+ * one shared store: only the Postgres pair proves cross-instance behaviour.
+ */
+const storePairs: Array<[string, () => Promise<{ stores: [OAuthStore, OAuthStore]; drop(): Promise<void> }>]> = [
+  [
+    'memory, one shared store',
+    async () => {
+      const store = new MemoryOAuthStore();
+      return { stores: [store, store], drop: async () => {} };
+    }
+  ]
+];
+if (PG_URL) {
+  storePairs.push([
+    'postgres',
+    async () => {
+      const db = await pgSchema();
+      return { stores: [await db.connect(KEY_A), await db.connect(KEY_A)], drop: db.drop };
+    }
+  ]);
+}
+
+describe.each(storePairs)('XyteOAuthProvider: a sign-in across instances (%s)', (_name, makeStores) => {
+  let pair: Awaited<ReturnType<typeof makeStores>>;
+  let instances: [XyteOAuthProvider, XyteOAuthProvider];
+  let hub: ReturnType<typeof fakeHub>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    pair = await makeStores();
+    hub = fakeHub();
+    instances = [makeProvider(pair.stores[0], hub).provider, makeProvider(pair.stores[1], hub).provider];
+  });
+  afterEach(async () => {
+    await pair.drop();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    [0, 1, 0],
+    [1, 0, 1],
+    [0, 0, 1],
+    [0, 1, 1]
+  ])('authorize on %i, consent on %i, callback on %i mints a working code', async (authorizeOn, consentOn, callbackOn) => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[authorizeOn]!, client);
+    const approved = await submitApprove(instances[consentOn]!, consent);
+    expect(approved.out.status).toBe(302);
+
+    const out = await callback(instances[callbackOn]!, { state: consent.pending, code: 'hub-code' }, approved.cookie);
+    const code = new URL(out.location).searchParams.get('code')!;
+    expect(code).toMatch(/^xmcp_ac_/);
+    const tokens = await instances[1 - callbackOn]!.exchangeAuthorizationCode(client, code);
+    expect(hubIdentityOf(await instances[authorizeOn]!.verifyAccessToken(tokens.access_token)).accessToken).toBe(
+      'xoat_1'
+    );
+  });
+
+  it('a replayed callback, and two concurrent ones on both instances, mint one code', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const outs = await Promise.all(
+      instances.map((instance) => callback(instance, { state: pending, code: 'hub-code' }, cookie))
+    );
+    expect(outs.map((out) => out.status).sort()).toEqual([302, 400]);
+    expect(outs.filter((out) => out.location.includes('code=xmcp_ac_'))).toHaveLength(1);
+    expect((await callback(instances[1], { state: pending, code: 'hub-code' }, cookie)).status).toBe(400);
+    expect(hub.calls.filter((call) => call.form.get('grant_type') === 'authorization_code')).toHaveLength(1);
+  });
+
+  it('a double-clicked Approve, on either instance, still finishes the sign-in', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const first = await submitApprove(instances[0], consent);
+    const second = await submitApprove(instances[1], consent);
+
+    expect([first.out.status, second.out.status]).toEqual([302, 302]);
+    expect(second.out.location).toBe(first.out.location);
+    expect(second.cookie).toBe(consent.cookie);
+    const out = await callback(instances[0], { state: consent.pending, code: 'hub-code' }, second.cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('an Approve whose sign-in is taken between its read and its approve ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    // The other instance takes the row right after this consent has read it.
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out } = await submitApprove(instances[1], consent);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a Deny whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const consent = await openConsent(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const { out, res } = fakeRes();
+    await instances[1].consent(
+      fakeReq({ body: { pending: consent.pending, csrf: consent.csrf, decision: 'deny' }, cookie: consent.cookie }),
+      res
+    );
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[consent.cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+  });
+
+  it('a callback whose sign-in is taken between its read and its take ends on the expired page', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+    const read = pair.stores[1].getPendingSignIn.bind(pair.stores[1]);
+    vi.spyOn(pair.stores[1], 'getPendingSignIn').mockImplementationOnce(async (id, now) => {
+      const entry = await read(id, now);
+      await pair.stores[0].takePendingSignIn(id, now);
+      return entry;
+    });
+
+    const out = await callback(instances[1], { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.cookies[cookie.split('=')[0]!]?.options.maxAge).toBe(0);
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+  });
+
+  it('a wrong-cookie callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    const forged = `${cookie.split('=')[0]}=attacker-value`;
+    expect((await callback(instances[1], { state: pending, code: 'c' }, forged)).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('a cookieless callback on one instance leaves the sign-in for the other to finish', async () => {
+    const client = await registeredClient(instances[0]);
+    const { pending, cookie } = await approve(instances[0], client);
+
+    expect((await callback(instances[1], { state: pending, code: 'c' })).status).toBe(400);
+    expect(await pair.stores[0].getPendingSignIn(pending, Math.floor(Date.now() / 1000))).toBeDefined();
+    const out = await callback(instances[0], { state: pending, code: 'hub-code' }, cookie);
+    expect(new URL(out.location).searchParams.get('code')).toMatch(/^xmcp_ac_/);
+  });
+
+  it('answers 503 once the store is at its cap', async () => {
+    const client = await registeredClient(instances[0]);
+    for (const store of new Set(pair.stores)) {
+      const create = store.createPendingSignIn.bind(store);
+      vi.spyOn(store, 'createPendingSignIn').mockImplementation((id, entry, _max, now) => create(id, entry, 2, now));
+    }
+    await openConsent(instances[0], client);
+    await openConsent(instances[1], client);
+
+    const { out, res } = fakeRes();
+    await instances[0].authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res);
+    expect(out.status).toBe(503);
+    expect(out.html).toContain('Too many sign-ins in progress');
+    expect(out.cookies).toEqual({});
+    expect(await pendingRowCount(pair.stores[0])).toBe(2);
+  });
+});
+
+describe.skipIf(!PG_URL)('XyteOAuthProvider: pending sign-ins on Postgres', () => {
+  let db: Awaited<ReturnType<typeof pgSchema>>;
+  beforeEach(async () => {
+    vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    db = await pgSchema();
+  });
+  afterEach(async () => {
+    await db.drop();
+    vi.restoreAllMocks();
+  });
+
+  // An instance without the key the sign-in was started under (a rotation
+  // without XYTE_MCP_TOKEN_KEY_PREVIOUS) cannot read its hub verifier.
+  it('a callback on an instance without the key of the hub verifier ends on the expired page, not a 500', async () => {
+    const hub = fakeHub();
+    const writer = makeProvider(await db.connect(KEY_A), hub).provider;
+    const reader = makeProvider(await db.connect(KEY_B), hub).provider;
+    const client = await registeredClient(writer);
+    const { pending, cookie } = await approve(writer, client);
+
+    const out = await callback(reader, { state: pending, code: 'hub-code' }, cookie);
+    expect(out.status).toBe(400);
+    expect(out.html).toContain('Authorization expired or invalid');
+    expect(out.location).toBe('');
+    expect(hub.calls).toHaveLength(0);
+    const logged = vi.mocked(process.stderr.write).mock.calls.map(([line]) => String(line)).join('');
+    expect(logged).toContain('pending sign-in unreadable: unknown key id');
+
+    // An Approve there reads the same row: the expired page too.
+    const approved = await submitApprove(reader, await openConsent(writer, client));
+    expect(approved.out.status).toBe(400);
+    expect(approved.out.html).toContain('Authorization expired or invalid');
+    expect(approved.out.location).toBe('');
+  });
+
+  // The SDK's authorize handler turns the rejection into a server_error
+  // redirect to the client: a clean error, bounded by the pool's connect
+  // timeout.
+  it('rejects an /authorize promptly while Postgres is down, setting no cookie', async () => {
+    const store = await db.connect(KEY_A);
+    const { provider } = makeProvider(store);
+    const client = await registeredClient(provider);
+    const live = (store as unknown as { pool: pg.Pool }).pool;
+    const down = new pg.Pool({ connectionString: 'postgres://127.0.0.1:9/none', connectionTimeoutMillis: 2000 });
+    (store as unknown as { pool: pg.Pool }).pool = down;
+    try {
+      const { out, res } = fakeRes();
+      const started = Date.now();
+      await expect(
+        provider.authorize(client, { codeChallenge: 'c', redirectUri: REDIRECT }, res)
+      ).rejects.toThrow();
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(out.cookies).toEqual({});
+      expect(out.html).toBe('');
+    } finally {
+      (store as unknown as { pool: pg.Pool }).pool = live;
+      await down.end();
+    }
   });
 });
 
@@ -863,12 +1263,53 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     ]);
   });
 
+  // Under the lock the stored pair is the one just read, so a save that matches
+  // nothing means the row is inconsistent: fail closed rather than drop the pair.
+  it('a save under the lock that matches no stored pair revokes the grant and signs the call out', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockResolvedValueOnce(false);
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    expect(upstream.calls).toHaveLength(0);
+    expect(eventsIn(stderr)).toContainEqual(
+      expect.objectContaining({ event: 'revoke', connection: grantId, reason: 'hub_save_failed' })
+    );
+    expect(hub.revokes()).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('a store that is closing fails the refresh as restarting, asking hub nothing', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
+    );
+
+    await expect(
+      provider.hubHttp(grantId, upstreamOk()).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'network', message: 'The server is restarting.' });
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
   it('a lost compare-and-set on save logs, keeps the stored pair and still serves the call', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     vi.spyOn(store, 'rotateHubTokens').mockResolvedValueOnce(false);
     const upstream = upstreamOk();
 
@@ -890,6 +1331,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -920,6 +1362,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const { grantId: siblingId } = await connected(provider, client);
     const siblingHub = (await store.getGrant(siblingId))?.hub;
     hub.expiresIn = 3600;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -935,7 +1378,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     );
     expect(hub.revokes()).toEqual([]);
     expect(stderr).toContain(
-      `grant ${grantId}: revoked during the hub refresh; a live sibling shares the hub sign-in, so the new hub pair is kept`
+      `grant ${grantId}: revoked during the hub refresh; revoking the new hub pair unless a live sibling shares the hub sign-in`
     );
     expect(siblingHub).toBeDefined();
     expect((await store.getGrant(siblingId))?.hub).toEqual(siblingHub);
@@ -948,6 +1391,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     hub.revokeStatus = 503;
+    failGrantLockCommitOnce(store);
     const rotate = store.rotateHubTokens.bind(store);
     vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id, previous, next) => {
       await store.revokeGrant(id);
@@ -975,6 +1419,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       const client = await registeredClient(provider);
       const { grantId } = await connected(provider, client);
       hub.expiresIn = 3600;
+      failGrantLockCommitOnce(store);
       vi.spyOn(store, 'rotateHubTokens').mockImplementationOnce(async (id) => {
         if (failing === 'hasLiveHubSibling') await store.revokeGrant(id);
         vi.spyOn(store, failing).mockRejectedValueOnce(new Error('db down'));
@@ -989,25 +1434,81 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
         ).rejects.toThrow(/sign-in behind this connection has ended/)
       );
       expect(hub.revokes()).toEqual([]);
-      expect(stderr).toContain(`grant ${grantId}: could not check the grant after a lost hub token save`);
+      expect(stderr).toContain(
+        failing === 'getGrant'
+          ? `grant ${grantId}: could not check the grant after a lost hub token save`
+          : `grant ${grantId}: sibling check failed after the revoke`
+      );
       expect(stderr).not.toContain('xort_2');
       expect(stderr).not.toContain('xoat_2');
     }
   );
 
-  it('keeps a rotated hub pair in memory when saving it keeps failing, and saves it later', async () => {
+  // `unsaved` is this process's only: another one would replay the burned stored
+  // token. So when the save fails for good, the grant ends (fail closed).
+  it('revokes the grant when saving a rotated hub pair keeps failing: signed out, and no instance refreshes again', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(
+      Object.assign(new Error('db down at db.internal'), { code: '57P01' })
+    );
+    const upstream = upstreamOk();
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider.hubHttp(grantId, upstream).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toThrow(/sign-in behind this connection has ended/)
+    );
+    save.mockRestore();
+    expect(upstream.calls).toHaveLength(0); // the new access token is never used
+    expect(eventsIn(stderr)).toContainEqual({
+      event: 'revoke', connection: grantId, organization: 'org-1', user: 'user-1', reason: 'hub_save_failed'
+    });
+    expect(stderr).toContain(`grant ${grantId}: could not save rotated hub tokens after 3 attempts (57P01); revoked the grant`);
+    expect(stderr).not.toContain('db.internal');
+    expect(stderr).not.toContain('xort_2');
+    expect(hub.revokes()).toEqual([]); // the new pair expires on its own
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+
+    // Another instance on the same store: nothing left to refresh with.
+    const other = new XyteOAuthProvider(
+      store,
+      createHubOAuth({
+        hubUrl: HUB,
+        clientId: 'mcp-client',
+        clientSecret: 's3cret',
+        redirectUri: `${ISSUER}/oauth/callback`,
+        timeoutMs: 1000,
+        fetchImpl: hub.fetchImpl
+      }),
+      ISSUER
+    );
+    await expect(
+      other.hubHttp(grantId, upstreamOk()).request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    ).rejects.toMatchObject({ kind: 'auth' });
+    expect(hub.refreshes()).toHaveLength(1);
+  });
+
+  it('keeps a rotated hub pair in memory when saving it and revoking the grant both keep failing, and saves it later', async () => {
     const { provider, store, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
     const http = provider.hubHttp(grantId, upstreamOk());
     const get = () => http.request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
 
-    await get();
-    expect(save).toHaveBeenCalledTimes(3); // the DB write is retried...
+    const stderr = await captureStderr(get);
+    // 3 tries under the lock, then (the revoke under the lock failed too) 3 more after it...
+    expect(save).toHaveBeenCalledTimes(6);
+    expect(revoke).toHaveBeenCalledTimes(4);
     expect(hub.refreshes()).toHaveLength(1); // ...the hub POST is not
+    expect(stderr).toContain('another instance may replay the stored hub token until the save lands');
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
 
     // Later calls use the unsaved pair instead of refreshing (or replaying xort_1).
@@ -1016,6 +1517,7 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
 
     // The next refresh sends the in-memory token and saves over the stored one.
     save.mockRestore();
+    revoke.mockRestore();
     const upstream = stubHttp((request) =>
       request.headers.Authorization === 'Bearer xoat_2'
         ? tokenRejected()
@@ -1026,29 +1528,6 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
     expect(hub.refreshes()[1]!.form.get('refresh_token')).toBe('xort_2');
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_3');
-  });
-
-  it('invalid_grant with a stale refresh token does not revoke: the rotated token is used', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId, tokens } = await connected(provider, client);
-    hub.onRefresh = async () => {
-      // Someone else rotated while our POST was in flight.
-      await store.rotateHubTokens(grantId, 'xort_1', {
-        accessToken: 'xoat_other',
-        refreshToken: 'xort_other',
-        expiresAt: Math.floor(Date.now() / 1000) + 3600
-      });
-      return json(400, { error: 'invalid_grant' });
-    };
-    const upstream = upstreamOk();
-
-    await provider
-      .hubHttp(grantId, upstream)
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
-    expect(upstream.calls[0]!.headers.Authorization).toBe('Bearer xoat_other');
-    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
 
   it('invalid_grant with the current refresh token revokes the grant: tool error now, 401 next', async () => {
@@ -1109,6 +1588,31 @@ describe('XyteOAuthProvider: hub token lifecycle', () => {
     expect(hub.refreshes()).toHaveLength(1);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
+
+  // A lock wait past lock_timeout, no free connection, a failed BEGIN: nothing reached hub.
+  it('fails retryably, keeping the grant and asking hub nothing, when the grant lock cannot be taken', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' })
+    );
+
+    const stderr = await captureStderr(() =>
+      expect(
+        provider
+          .hubHttp(grantId, upstreamOk())
+          .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+      ).rejects.toMatchObject({
+        kind: 'network',
+        message: 'This Xyte sign-in is busy: another request is refreshing it, or the server is busy.'
+      })
+    );
+    expect(stderr).toContain(`grant ${grantId}: grant lock transaction failed for a hub refresh (55P03)`);
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
 });
 
 describe('XyteOAuthProvider: drain on shutdown', () => {
@@ -1145,12 +1649,16 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
-    await provider
-      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1');
 
     save.mockRestore();
+    revoke.mockRestore();
     await provider.drain();
     expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_2');
     expect(hub.refreshes()).toHaveLength(1); // saved, not refreshed again
@@ -1163,9 +1671,12 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     const { grantId } = await connected(provider, client);
     hub.expiresIn = 3600;
     vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
-    await provider
-      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
-      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
 
     const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
     try {
@@ -1176,6 +1687,28 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
     } finally {
       stderr.mockRestore();
     }
+  });
+
+  it('revokes, and does not report as lost, a held pair whose last save at shutdown fails while the revoke lands', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider
+        .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+        .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' })
+    );
+
+    revoke.mockRestore(); // the save still fails at shutdown, the revoke lands
+    const stderr = await captureStderr(() => provider.drain());
+    vi.restoreAllMocks();
+    expect(stderr).not.toContain('lost at shutdown');
+    expect(eventsIn(stderr)).toContainEqual(expect.objectContaining({ event: 'revoke', reason: 'hub_save_failed' }));
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
   });
 
   it('starts no hub refresh once draining: the call fails retryably, hub is never asked', async () => {
@@ -1189,6 +1722,33 @@ describe('XyteOAuthProvider: drain on shutdown', () => {
       .hubHttp(grantId, stubHttp(() => ({ data: {} })))
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
     await expect(call).rejects.toMatchObject({ kind: 'network' });
+    expect(hub.refreshes()).toHaveLength(0);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+});
+
+// A flight queued on the grant lock (another process refreshing) must not reach hub
+// after drain started: its POST could outlast the shutdown deadline.
+describe('XyteOAuthProvider: drain while a refresh waits on the grant lock', () => {
+  it('drain does not wait for it, and it sends nothing once it gets the lock: the call fails retryably, the grant is kept', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    let release!: () => void;
+    const holder = store.withGrantLock(grantId, () => new Promise<void>((resolve) => (release = resolve)));
+
+    const call = provider
+      .hubHttp(grantId, stubHttp(() => ({ data: {} })))
+      .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
+    call.catch(() => undefined);
+    await tick();
+    // drain() does not wait for a flight still queued on the lock: it sends nothing.
+    await provider.drain();
+    release();
+    await holder;
+
+    await expect(call).rejects.toMatchObject({ kind: 'network', message: 'The server is restarting.' });
     expect(hub.refreshes()).toHaveLength(0);
     await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
   });
@@ -1259,7 +1819,7 @@ describe('XyteOAuthProvider: revocation', () => {
     await tick();
     expect(hub.revokes()).toEqual([]); // waiting on the refresh, not racing it
     answer();
-    await Promise.allSettled([call, revoke]);
+    await Promise.all([call, revoke]); // both succeed: the call with the new pair, then the revoke
 
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
     await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
@@ -1270,7 +1830,7 @@ describe('XyteOAuthProvider: revocation', () => {
     hub.expiresIn = 30; // every call wants a refresh
     const client = await registeredClient(provider);
     const { grantId, tokens } = await connected(provider, client);
-    // Hold revoke inside its window: after it marks the grant, before it is revoked.
+    // Hold revoke inside the grant lock, before it revokes.
     const getGrant = store.getGrant.bind(store);
     let reads = 0;
     let release!: () => void;
@@ -1286,10 +1846,11 @@ describe('XyteOAuthProvider: revocation', () => {
     const call = provider
       .hubHttp(grantId, stubHttp(() => ({ data: {} })))
       .request({ method: 'GET', url: `${HUB}/x`, headers: {}, endpointKey: 'k' });
-    await expect(call).rejects.toMatchObject({ kind: 'auth' });
+    await vi.waitFor(() => expect(reads).toBe(3)); // the call's read, before it queues on the lock
 
     release();
     await revoke;
+    await expect(call).rejects.toMatchObject({ kind: 'auth' });
     expect(hub.refreshes()).toHaveLength(0);
     expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_1']);
   });
@@ -1310,6 +1871,61 @@ describe('XyteOAuthProvider: revocation', () => {
     await store.sweepExpiredOAuthRows(now);
     await provider.revokeToken(client, { token: 'expired-after' });
     expect((await store.getGrant(after.grantId))?.revoked).toBe(false);
+  });
+
+  it('logs and fails a revoke that cannot take the grant lock', async () => {
+    const { provider, store, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' })
+    );
+    const stderr = await captureStderr(() =>
+      expect(provider.revokeToken(client, { token: tokens.access_token })).rejects.toMatchObject({ code: '55P03' })
+    );
+    expect(stderr).toContain(`grant ${grantId}: grant lock transaction failed for a revoke (55P03)`);
+    expect(eventsIn(stderr)).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+    expect(hub.revokes()).toEqual([]);
+  });
+
+  // An OAuth error the SDK answers with 400 temporarily_unavailable, not a 500.
+  it('answers a revoke while the store is closing as temporarily unavailable', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { tokens } = await connected(provider, client);
+    vi.spyOn(store, 'withGrantLock').mockRejectedValueOnce(
+      new XyteError('network', 'The server is restarting.', ['Retry in a few seconds.'])
+    );
+    await expect(provider.revokeToken(client, { token: tokens.access_token })).rejects.toBeInstanceOf(
+      TemporarilyUnavailableError
+    );
+    await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toBeTruthy();
+  });
+
+  // The revoke has committed: what is left is best effort, and the client is answered.
+  it('a failing sibling check after the revoke is logged, skips the hub revoke, and the revoke succeeds', async () => {
+    const { provider, store, hub } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    vi.spyOn(store, 'hasLiveHubSibling').mockRejectedValueOnce(
+      Object.assign(new Error('db down'), { code: '57P01' })
+    );
+    const stderr = await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(stderr).toContain(`grant ${grantId}: sibling check failed after the revoke (57P01); not revoking at hub`);
+    expect(hub.revokes()).toEqual([]);
+    await expect(provider.verifyAccessToken(tokens.access_token)).rejects.toThrow(/invalid/);
+  });
+
+  it('a hub revoke that throws after the revoke is logged, and the revoke succeeds', async () => {
+    const { provider, store } = makeProvider();
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    const hubOAuth = (provider as unknown as { hub: { revoke(token: string): Promise<void> } }).hub;
+    vi.spyOn(hubOAuth, 'revoke').mockRejectedValueOnce(new TypeError('fetch failed'));
+    const stderr = await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(stderr).toContain(`grant ${grantId}: hub revoke failed (TypeError)`);
+    expect((await store.getGrant(grantId))?.revoked).toBe(true);
   });
 
   it("revoking another client's token is a silent no-op", async () => {
@@ -1572,27 +2188,6 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('invalid_grant after someone else rotated logs hub_refresh already_rotated, not invalid_grant', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId } = await connected(provider, client);
-    hub.onRefresh = async () => {
-      await store.rotateHubTokens(grantId, 'xort_1', {
-        accessToken: 'xoat_other',
-        refreshToken: 'xort_other',
-        expiresAt: Math.floor(Date.now() / 1000) + 3600
-      });
-      return json(400, { error: 'invalid_grant' });
-    };
-    const stderr = await captureStderr(() =>
-      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
-    );
-    expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'already_rotated', hub_status: 400 }
-    ]);
-  });
-
   it('an unknown refresh outcome logs hub_refresh unknown (with a 5xx status), then revoke refresh_unknown', async () => {
     const { provider, hub } = makeProvider();
     hub.expiresIn = 30;
@@ -1623,24 +2218,6 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('invalid_grant on a grant already ended meanwhile logs hub_refresh, but no second revoke', async () => {
-    const { provider, store, hub } = makeProvider();
-    hub.expiresIn = 30;
-    const client = await registeredClient(provider);
-    const { grantId } = await connected(provider, client);
-    // The operator's SQL cut-off lands while the refresh is at the hub.
-    hub.onRefresh = async () => {
-      await store.revokeGrant(grantId);
-      return json(400, { error: 'invalid_grant' });
-    };
-    const stderr = await captureStderr(() =>
-      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get).catch(() => undefined)
-    );
-    expect(eventsIn(stderr)).toEqual([
-      { event: 'hub_refresh', connection: grantId, organization: 'org-1', user: 'user-1', outcome: 'invalid_grant', hub_status: 400 }
-    ]);
-  });
-
   it('a client revoke logs revoke client with the organization and user', async () => {
     const { provider } = makeProvider();
     const client = await registeredClient(provider);
@@ -1653,16 +2230,40 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('a client revoke of a grant whose hub sign-in is already gone logs only the connection and reason', async () => {
-    const { provider, store } = makeProvider();
+  // Ended by someone else after the revoke's own check: that one logged and revoked it.
+  it('a client revoke of a grant ended before it took the lock logs nothing and revokes nothing at hub', async () => {
+    const { provider, store, hub } = makeProvider();
     const client = await registeredClient(provider);
-    const { grantId, tokens } = await connected(provider, client);
-    // The grant passes the revoke's own check, then its hub sign-in is gone by the time it is read.
+    const { tokens } = await connected(provider, client);
     const getGrant = store.getGrant.bind(store);
-    vi.spyOn(store, 'getGrant').mockImplementationOnce(getGrant).mockResolvedValueOnce(undefined);
+    vi.spyOn(store, 'getGrant').mockImplementationOnce(async (id) => {
+      const grant = await getGrant(id);
+      await store.revokeGrant(id);
+      return grant;
+    });
     const stderr = await captureStderr(() =>
       provider.revokeToken(client, { token: tokens.access_token })
     );
-    expect(eventsIn(stderr)).toEqual([{ event: 'revoke', connection: grantId, reason: 'client' }]);
+    expect(eventsIn(stderr)).toEqual([]);
+    expect(hub.revokes()).toEqual([]);
+  });
+
+  it('a client revoke while the current hub pair is held only in memory revokes that pair at hub', async () => {
+    const { provider, store, hub } = makeProvider();
+    hub.expiresIn = 30;
+    const client = await registeredClient(provider);
+    const { grantId, tokens } = await connected(provider, client);
+    hub.expiresIn = 3600;
+    const save = vi.spyOn(store, 'rotateHubTokens').mockRejectedValue(new Error('db down'));
+    const revoke = vi.spyOn(store, 'revokeGrant').mockRejectedValue(new Error('db down'));
+    await captureStderr(() =>
+      provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)
+    );
+    save.mockRestore();
+    revoke.mockRestore();
+    expect((await store.getGrant(grantId))?.hub?.refreshToken).toBe('xort_1'); // xort_2 only in memory
+
+    await captureStderr(() => provider.revokeToken(client, { token: tokens.access_token }));
+    expect(hub.revokes().map((r) => r.form.get('token'))).toEqual(['xort_2']);
   });
 });

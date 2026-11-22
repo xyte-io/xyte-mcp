@@ -191,7 +191,8 @@ describe('PgOAuthStore.connect', () => {
   it('turns a boot connection failure into a config error', async () => {
     const error = await PgOAuthStore.connect(
       'postgres://u:p@127.0.0.1:1/db?sslmode=disable',
-      new TokenCipher(Buffer.alloc(32))
+      new TokenCipher(Buffer.alloc(32)),
+      15_000
     ).catch(
       (caught: unknown) => caught
     );
@@ -203,7 +204,8 @@ describe('PgOAuthStore.connect', () => {
   it('turns an unreadable sslrootcert into a config error with a hint', async () => {
     const error = await PgOAuthStore.connect(
       'postgres://u:p@db.example.com/db?sslrootcert=/no/such.pem',
-      new TokenCipher(Buffer.alloc(32))
+      new TokenCipher(Buffer.alloc(32)),
+      15_000
     ).catch((caught: unknown) => caught);
     expect(isXyteError(error)).toBe(true);
     expect((error as { hints: string[] }).hints[0]).toMatch(/sslrootcert/);

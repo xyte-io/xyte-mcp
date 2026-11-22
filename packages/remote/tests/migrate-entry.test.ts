@@ -68,7 +68,8 @@ describe('migrate entry without a database', () => {
     );
     expect(code).toBe(1);
     expect(stderr).toContain('[xyte-mcp] error: OAuth store migration failed:');
-    expect(stderr).toContain('/nonexistent');
+    // Windows resolves it to <drive>:\nonexistent.
+    expect(stderr).toMatch(/[\\/]nonexistent/);
     expect(stderr).not.toMatch(/^\s+at /m);
   });
 

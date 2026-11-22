@@ -4,8 +4,10 @@ import { connect, createServer } from 'node:net';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { XyteOAuthProvider } from '../src/oauth/provider.js';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
 import { MemoryOAuthStore } from '../src/oauth/store.js';
 import { startHttpServer } from '../src/transports/http.js';
+import { createTestSchema, listDevices, newTokenKey, serverEnv, signIn, startFakeHub } from './support/two-process.js';
 
 /**
  * Drives a real HTTP server process over the network, so this covers the
@@ -13,6 +15,7 @@ import { startHttpServer } from '../src/transports/http.js';
  * the same reasoning as `protocol-smoke.test.ts` does for stdio.
  */
 
+const PG_URL = process.env.TEST_DATABASE_URL;
 const DIST_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'index.js');
 // The hosted server reports @xyteai/mcp's version.
 const MCP_PACKAGE_VERSION = (
@@ -533,6 +536,38 @@ describe('http transport: token store outage', () => {
       getClient.mockRestore();
       stderr.mockRestore();
       await new Promise<void>((resolve) => listener.close(() => resolve()));
+    }
+  });
+
+  // Same answer as a failed token check: a client retries instead of reporting a hard error.
+  it.skipIf(!PG_URL)('answers 503 retryable, not a 429 or 500, when the shared rate-limit counter fails', async () => {
+    const schema = await createTestSchema(PG_URL!);
+    const hub = await startFakeHub();
+    const port = await freePort();
+    const base = `http://127.0.0.1:${port}`;
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const listener = await startHttpServer(
+      serverEnv({ port, issuerUrl: base, hubUrl: hub.url, databaseUrl: schema.databaseUrl, tokenKey: newTokenKey() })
+    );
+    try {
+      const { accessToken } = await signIn(base);
+      const count = vi
+        .spyOn(PgOAuthStore.prototype, 'countRateLimitHit')
+        .mockRejectedValue(Object.assign(new Error('db down at db.internal'), { code: '57P01' }));
+      const response = await listDevices(base, accessToken);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({
+        error: { code: -32603, message: 'temporarily unavailable, retry' }
+      });
+      expect(count).toHaveBeenCalledOnce();
+      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
+      expect(logged).toContain('rate limit check failed: 57P01');
+      expect(logged).not.toContain('db.internal');
+    } finally {
+      vi.restoreAllMocks();
+      await new Promise<void>((resolve) => listener.close(() => resolve()));
+      await hub.close();
+      await schema.drop();
     }
   });
 

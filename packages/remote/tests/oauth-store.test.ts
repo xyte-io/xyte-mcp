@@ -691,6 +691,62 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
   });
 });
 
+// The per-grant /mcp limit is shared by every process through this counter.
+describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
+  let admin: pg.Pool;
+  let a: PgOAuthStore;
+  let b: PgOAuthStore;
+  beforeAll(async () => {
+    admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
+    a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+  });
+  beforeEach(async () => {
+    await admin.query('TRUNCATE mcp_rate_limit_counters');
+  });
+  afterAll(async () => {
+    await Promise.all([a.close(), b.close()]);
+    await admin.end();
+  });
+  const backdate = (key: string) =>
+    admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() - interval '1 second' WHERE key = $1`, [key]);
+
+  it('counts hits in a fixed window, and starts again at 1 once the window has ended', async () => {
+    const first = await a.countRateLimitHit('grant:1', 60_000);
+    expect(first.totalHits).toBe(1);
+    expect(first.resetTime.getTime()).toBeGreaterThan(Date.now() + 55_000);
+    expect(first.resetTime.getTime()).toBeLessThan(Date.now() + 65_000);
+    expect((await a.countRateLimitHit('grant:1', 60_000)).totalHits).toBe(2);
+    const third = await a.countRateLimitHit('grant:1', 60_000);
+    expect(third).toEqual({ totalHits: 3, resetTime: first.resetTime });
+    expect((await a.countRateLimitHit('grant:2', 60_000)).totalHits).toBe(1);
+
+    await backdate('grant:1');
+    const restarted = await a.countRateLimitHit('grant:1', 60_000);
+    expect(restarted.totalHits).toBe(1);
+    expect(restarted.resetTime.getTime()).toBeGreaterThan(Date.now() + 55_000);
+  });
+
+  it('shares one count between two stores on one database', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await b.countRateLimitHit('grant:1', 60_000);
+    const hits = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => (i % 2 ? a : b).countRateLimitHit('grant:1', 60_000))
+    );
+    expect(hits.map((hit) => hit.totalHits).sort((x, y) => x - y)).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  });
+
+  it('the cleanup deletes a counter whose window has ended and keeps a live one, reporting no count', async () => {
+    await a.countRateLimitHit('grant:stale', 60_000);
+    await a.countRateLimitHit('grant:live', 60_000);
+    await backdate('grant:stale');
+
+    expect(await a.sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
+    const keys = (await admin.query<{ key: string }>('SELECT key FROM mcp_rate_limit_counters')).rows;
+    expect(keys).toEqual([{ key: 'grant:live' }]);
+  });
+});
+
 /** What only the Postgres store does: the hub tokens are encrypted at rest. */
 describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   let admin: pg.Pool;

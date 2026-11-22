@@ -272,8 +272,8 @@ rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). T
 (schema version 2) cannot be rolled back: an older build refuses to boot against it.
 
 Keep preboot off (`heroku features:disable preboot -a <app>`), so the old and new process
-overlap only for the shutdown drain: the rate-limit counters are in memory (see **One dyno**
-below), so a longer overlap doubles every budget. Upgrading from a build without
+overlap only for the shutdown drain: the per-IP rate-limit counters are in memory (see
+**One dyno** below), so a longer overlap doubles the per-IP budgets. Upgrading from a build without
 the cross-process refresh lock, a refresh on each process in that overlap can race; the loser
 gets `invalid_grant` from hub and that connection has to sign in again. That window is
 accepted.
@@ -518,8 +518,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   naming these options. The Procfile sets `NODE_EXTRA_CA_CERTS` for the web process only: a
   one-off dyno (`heroku run`) needs it as a config var
   (`NODE_EXTRA_CA_CERTS=/usr/lib/ssl/certs/ca-certificates.crt`) to reach the database.
-- **One dyno.** The rate-limit counters are in memory, so the app must run on a single dyno
-  (a second one doubles every budget). Sign-ins in progress live in Postgres, so a sign-in
+- **One dyno.** The per-IP rate-limit counters are in memory, so the app must run on a single
+  dyno (a second one doubles the per-IP budgets). Sign-ins in progress live in Postgres, so a sign-in
   started on one process finishes on any other, and the hub token refresh is safe across
   processes: a Postgres row lock lets one process at a time refresh a connection.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
@@ -532,7 +532,9 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   from shared backend IPs. `/mcp` allows 60 calls a minute per connection (OAuth grant) and
   300 a minute per IP for requests without a valid token; over that it answers 429 with
   `Retry-After` and draft-8 `RateLimit` / `RateLimit-Policy` headers (sent on every `/mcp`
-  answer), so a flooded IP sees 429 instead of 401 for up to a minute. `/oauth/callback`
+  answer), so a flooded IP sees 429 instead of 401 for up to a minute. The per-connection
+  limit is shared by all processes through Postgres; if the database fails there, `/mcp`
+  answers 503 (retry). `/oauth/callback`
   allows 30 a minute per IP. The per-IP limits assume exactly one trusted proxy hop
   (Heroku's router): behind a CDN every client counts as the CDN's egress IP (raise the hop
   count), and with no proxy the client's own `X-Forwarded-For` decides, so the per-IP limit

@@ -147,6 +147,27 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
     }
   });
 
+  it('limits one connection to 60 calls a minute over both processes, and answers 503 when the counter fails', async () => {
+    const { accessToken } = await signIn(proxy.base);
+    const statuses: number[] = [];
+    for (let i = 0; i < 61; i += 1) {
+      const answer = await listDevices(proxy.base, accessToken);
+      await answer.arrayBuffer();
+      statuses.push(answer.status);
+    }
+    expect(statuses.slice(0, 60)).toEqual(Array(60).fill(200));
+    expect(statuses[60]).toBe(429);
+
+    await schema.admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
+    try {
+      const answer = await listDevices(proxy.base, accessToken);
+      expect(answer.status).toBe(503);
+      expect(await answer.json()).toMatchObject({ error: { code: -32603 } });
+    } finally {
+      await schema.admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
+    }
+  });
+
   // Last: it kills a process and starts it again.
   it('kill -9 of the refreshing process frees the lock and keeps the stored pair; the next call refreshes', async () => {
     const { accessToken } = await expiringSignIn();

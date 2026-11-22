@@ -502,7 +502,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   when), sign-ins with no token left, 97 days after the sign-in (hub's 90-day chain has
   ended, plus a week), sign-ins whose client is gone, and registered clients with no grant
   after 30 days (registration is open, so junk registrations go; a client in use keeps its
-  grant), and ended `/mcp` rate-limit windows. A returning user whose client was deleted must re-add the connector; see "Cleanup
+  grant; client secrets themselves never expire, `client_secret_expires_at` 0), and ended `/mcp` rate-limit windows. A returning user whose client was deleted must re-add the connector; see "Cleanup
   of old rows" in [packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md). The hub
   tokens in each grant are encrypted with AES-256-GCM under
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the

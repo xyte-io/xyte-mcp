@@ -573,6 +573,43 @@ describe('oauth over http, in order', () => {
     }
   });
 
+  // The SDK default is 30 days, after which /token answers invalid_client.
+  it('gives a confidential client a secret that never expires', async () => {
+    const response = await fetch(`${base}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [REDIRECT], token_endpoint_auth_method: 'client_secret_post' })
+    });
+    expect(response.status).toBe(201);
+    const client = (await response.json()) as {
+      client_id: string;
+      client_secret?: string;
+      client_secret_expires_at?: number;
+    };
+    expect(client.client_secret).toBeTruthy();
+    expect(client.client_secret_expires_at).toBe(0);
+
+    // The stored client authenticates with its secret at /token (past client auth, the bogus
+    // refresh token fails). This does not pin the stored expiry; the registration answer does.
+    const refresh = (secret: string) =>
+      fetch(`${base}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: 'not-a-token',
+          client_id: client.client_id,
+          client_secret: secret
+        })
+      });
+    const accepted = await refresh(client.client_secret!);
+    expect(accepted.status).toBe(400);
+    expect(((await accepted.json()) as { error: string }).error).toBe('invalid_grant');
+    const refused = await refresh('wrong-secret');
+    expect(refused.status).toBe(400);
+    expect(((await refused.json()) as { error: string }).error).toBe('invalid_client');
+  });
+
   it.skipIf(!PG_URL)('keeps a connection across a restart mid key rotation: hub gets the decrypted token, and a forced refresh rotates it under the new key', async () => {
     const token = await connectAgain();
     const live = await admin!.query<{ hub_access_token: string; hub_refresh_token: string }>(

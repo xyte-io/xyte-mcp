@@ -182,6 +182,11 @@ from `/token` and `/revoke` too (a client usually first retries its stored refre
 The server logs nothing for it: the router's lines are the only trace. The fix is to remove
 the connector in the client and add it again.
 
+Client secrets do not expire. A confidential client (one registered with a secret) stored by
+an older pre-release build still carries that build's 30-day secret expiry: from then on
+`/token` and `/revoke` answer `400` `invalid_client` ("Client secret has expired") while
+`/authorize` still accepts it. The fix is the same: remove the connector and add it again.
+
 ### The 90-day end
 
 Every connection ends 90 days after its sign-in, however often it is used: each hub refresh

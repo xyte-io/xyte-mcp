@@ -187,7 +187,12 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         // thousand users behind one IP (a refresh per user per hour, the access
         // TTL); tokens are 256-bit random, so the limit is load control, not
         // brute-force defence. `/authorize` is a browser, so it keeps the default.
-        clientRegistrationOptions: { rateLimit: { windowMs: 60 * 60 * 1000, max: 1000 } },
+        // Registration is open, so a client secret proves little; the SDK's 30-day
+        // expiry would only cut confidential clients off (RFC 7591: 0 = never).
+        clientRegistrationOptions: {
+          rateLimit: { windowMs: 60 * 60 * 1000, max: 1000 },
+          clientSecretExpirySeconds: 0
+        },
         tokenOptions: { rateLimit: { windowMs: 15 * 60 * 1000, max: 2000 } },
         revocationOptions: { rateLimit: { windowMs: 15 * 60 * 1000, max: 500 } }
       })

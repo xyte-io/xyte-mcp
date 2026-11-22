@@ -161,7 +161,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
     expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain(
-      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, booting`
+      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, continuing`
     );
   });
 
@@ -245,6 +245,30 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     expect(await tablesIn()).toEqual([]);
   });
 
+  it('names the code but not the row data of a migration that fails an integrity constraint', async () => {
+    const failing: Migration[] = [
+      {
+        version: 1,
+        name: 'not_null',
+        sql: `CREATE TABLE secrets (a int NOT NULL, b text); INSERT INTO secrets VALUES (NULL, 'row-secret');`,
+        breaksRollback: false
+      }
+    ];
+    const error = (await migrateOAuthSchema(poolForSchema(), failing).catch((e: unknown) => e)) as Error;
+    expect(error.message).toContain('(code 23502');
+    expect(error.message).not.toContain('row-secret');
+  });
+
+  it('names the code but not the value of a migration that fails a data exception (class 22)', async () => {
+    const failing: Migration[] = [
+      { version: 1, name: 'bad_uuid', sql: `SELECT 'row-secret'::uuid;`, breaksRollback: false }
+    ];
+    const error = (await migrateOAuthSchema(poolForSchema(), failing).catch((e: unknown) => e)) as Error;
+    expect(error.message).toContain('migration 1 (bad_uuid) failed: (value omitted, class 22)');
+    expect(error.message).toContain('(code 22P02');
+    expect(error.message).not.toContain('row-secret');
+  });
+
   it('leaves an already-migrated database at its version when a later migration fails', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool, V1);
@@ -275,7 +299,7 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
 
     expect(await appliedVersions()).toEqual([BASELINE, { version: 2, name: 'newer', breaks_rollback: false }]);
     expect(logText()).toContain(
-      "OAuth store schema is at version 2, newer than this build's 1; those versions are rollback-safe, booting"
+      "OAuth store schema is at version 2, newer than this build's 1; those versions are rollback-safe, continuing"
     );
     expect(logText()).not.toContain('migrated to version');
   });

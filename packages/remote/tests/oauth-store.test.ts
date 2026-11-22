@@ -552,9 +552,9 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 });
 
 // A failing cleanup step names itself and its code only (a pg message can name the host and
-// role), and the steps after it are not issued.
+// role), the steps after it are not issued, and the run returns what the earlier steps deleted.
 describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
-  it('throws "the <step> step failed: <code>" with the cause, and issues no later step', async () => {
+  it('logs "the <step> step failed … <code>", issues no later step and returns the earlier counts', async () => {
     const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     const pool = (store as unknown as { pool: pg.Pool }).pool;
     const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
@@ -564,18 +564,49 @@ describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
     });
     vi.spyOn(pool, 'query').mockImplementation(((sql: string, values?: unknown[]) => {
       issued.push(sql);
-      return sql.includes('DELETE FROM oauth_grants') ? Promise.reject(failure) : query(sql, values);
+      if (sql.includes('DELETE FROM oauth_grants')) return Promise.reject(failure);
+      if (sql.includes('DELETE FROM oauth_tokens')) return Promise.resolve({ rowCount: 3 });
+      if (sql.includes('DELETE FROM oauth_pending_sign_ins')) return Promise.resolve({ rowCount: 2 });
+      return query(sql, values);
     }) as never);
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      const error = await store.sweepExpiredOAuthRows(NOW()).then(
-        () => undefined,
-        (rejected: unknown) => rejected as Error
+      expect(await store.sweepExpiredOAuthRows(NOW())).toEqual({
+        tokens: 3,
+        grants: 0,
+        clients: 0,
+        pendingSignIns: 2
+      });
+      const logged = write.mock.calls.map((call) => String(call[0])).join('');
+      expect(logged).toContain(
+        '[xyte-mcp] error: OAuth store cleanup: the grants step failed, retried within an hour: 57014'
       );
-      expect(error?.message).toBe('the grants step failed: 57014');
-      expect(error?.message).not.toContain('secret');
-      expect(error?.cause).toBe(failure);
-      expect(issued.some((sql) => sql.includes('DELETE FROM oauth_tokens'))).toBe(true);
+      expect(logged).not.toContain('secret');
+      expect(
+        issued.filter((sql) => sql.startsWith('DELETE FROM')).map((sql) => sql.split(/\s+/)[2])
+      ).toEqual(['oauth_pending_sign_ins', 'oauth_tokens', 'oauth_grants']);
       expect(issued.some((sql) => sql.includes('DELETE FROM oauth_clients'))).toBe(false);
+      expect(issued.some((sql) => sql.includes('DELETE FROM mcp_rate_limit_counters'))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await store.close();
+    }
+  });
+
+  // pg's client-side errors carry no code; these two messages name no host, so a fixed label stands in.
+  it.each([
+    ['Query read timeout', 'query timeout'],
+    ['Connection terminated unexpectedly', 'connection terminated']
+  ])('logs a code-less pg %j as %j', async (message, label) => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    vi.spyOn(pool, 'query').mockRejectedValue(new Error(message));
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await store.sweepExpiredOAuthRows(NOW());
+      expect(write.mock.calls.map((call) => String(call[0])).join('')).toContain(
+        `[xyte-mcp] error: OAuth store cleanup: the pendingSignIns step failed, retried within an hour: ${label}\n`
+      );
     } finally {
       vi.restoreAllMocks();
       await store.close();
@@ -771,16 +802,19 @@ describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
     expect(keys).toEqual([{ key: 'grant:live' }]);
   });
 
-  it('the cleanup names the rateLimitCounters step and its code only when that step fails', async () => {
+  it('the cleanup logs the rateLimitCounters step and its code only when that step fails, and still returns the counts', async () => {
+    await admin.query('TRUNCATE oauth_pending_sign_ins');
+    const now = NOW();
+    await a.createPendingSignIn('expired', pendingSignIn({ expiresAt: now + 5 }), 10_000, now);
     await admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      const error = await a.sweepExpiredOAuthRows(NOW()).then(
-        () => undefined,
-        (rejected: unknown) => rejected as Error
+      expect(await a.sweepExpiredOAuthRows(now + 10)).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 1 });
+      expect(write.mock.calls.map((call) => String(call[0])).join('')).toContain(
+        '[xyte-mcp] error: OAuth store cleanup: the rateLimitCounters step failed, retried within an hour: 42P01'
       );
-      expect(error?.message).toBe('the rateLimitCounters step failed: 42P01');
-      expect((error?.cause as { code?: string } | undefined)?.code).toBe('42P01');
     } finally {
+      write.mockRestore();
       await admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
     }
   });

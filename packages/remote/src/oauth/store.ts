@@ -190,7 +190,8 @@ export interface OAuthStore {
    * have none (and a client with a grant is never deleted).
    * An orphan's hub tokens are not revoked at hub: nobody holds them once the
    * row is gone, and hub ends the chain by itself.
-   * Safe while requests are served; a second run deletes nothing more.
+   * Safe while requests are served; a second run deletes nothing more. A step
+   * that fails is logged and ends the run, which returns what was deleted so far.
    */
   sweepExpiredOAuthRows(now: number): Promise<DeletedOAuthRowCounts>;
 

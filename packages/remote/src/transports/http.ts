@@ -385,7 +385,7 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
           );
         }
       } catch (error) {
-        // The Postgres store's message names the failed step and the error code only.
+        // The Postgres store logs a failed step itself and returns; this is for anything else.
         const reason = error instanceof Error ? error.message : errorCodeOf(error);
         logError(`OAuth store cleanup failed, retried within an hour: ${reason}`);
       } finally {

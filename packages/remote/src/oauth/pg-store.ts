@@ -24,9 +24,9 @@ import { TokenDecryptError, type TokenCipher } from './token-cipher.js';
 /**
  * Postgres-backed OAuthStore — the "survives a dyno restart" requirement.
  *
- * This service owns its whole schema: the tables built at boot by the
- * ordered MIGRATIONS below, plus the oauth_schema_migrations ledger that
- * migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
+ * This service owns its whole schema: the tables built by the ordered
+ * MIGRATIONS below (in the release phase, see migrateOAuthSchema), plus the
+ * oauth_schema_migrations ledger that migrateOAuthSchema keeps. Client metadata is one jsonb blob because the
  * server never queries inside it — it goes back to the SDK exactly as
  * registered. The hub tokens are encrypted (TokenCipher); the refresh token's
  * hash sits next to them, so a rotation compares without decrypting.
@@ -55,17 +55,20 @@ export interface Migration {
  * tightening anything an older build reads is not (`true`), and an older build
  * then refuses to boot instead of running against a schema it does not know.
  *
- * The flag guards a later boot of an older build, not the rollout itself:
- * during a deploy the old dyno keeps serving against the new schema until it
+ * The flag guards a later release or boot of an older build, not the rollout
+ * itself: during a deploy the old dyno keeps serving against the new schema until it
  * stops. So a breaking migration may only drop or rewrite what the previous
  * release already stopped reading — ship the reader change one release ahead.
  * Version 2 is a deliberate pre-launch exception (README, "Deploy it").
  *
  * All pending migrations run in one transaction, so a statement that cannot
  * run inside one (CREATE INDEX CONCURRENTLY, ALTER TYPE ... ADD VALUE on old
- * Postgres) is not allowed here. Statements have no time limit, but they run
- * before the server listens, so a long data rewrite still counts against the
- * platform's boot timeout — keep those out of the boot path.
+ * Postgres) is not allowed here. They run in the release phase (src/migrate.ts),
+ * before any new dyno starts; the boot call then finds nothing to apply and only
+ * refuses a newer breaking schema. Statements have no time limit, yet no long
+ * rewrites or long lock holds, on either path: old dynos keep serving during the
+ * release phase, and a run without one (a local run, another platform) migrates
+ * at boot, where it counts against the boot timeout.
  */
 export const MIGRATIONS: ReadonlyArray<Migration> = [
   // IF NOT EXISTS, so a database created before versioning is adopted as
@@ -171,18 +174,34 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
 /** Arbitrary, constant: the advisory lock serializing schema migrations. */
 const SCHEMA_LOCK_ID = 674_601;
 
+/**
+ * The SQLSTATE class ('22' or '23') of an error whose message or detail holds
+ * row values, which are then not logged: a data exception (class 22) quotes
+ * the value in its message ('invalid input syntax for type uuid: "…"'), an
+ * integrity constraint error (class 23) has "Failing row contains (...)" as
+ * its detail, row data with emails and tokens.
+ */
+function rowValueClass(code: string | undefined): string | undefined {
+  return ['22', '23'].find((sqlClass) => code?.startsWith(sqlClass));
+}
+
 /** The error a failed schema step throws, with the pg fields that locate it. */
 function schemaError(step: string, error: unknown): Error {
   const pgError = error as Partial<pg.DatabaseError>;
+  const valueClass = rowValueClass(pgError.code);
   const details = [
     pgError.code && `code ${pgError.code}`,
-    pgError.detail,
+    !valueClass && pgError.detail,
     pgError.hint,
     pgError.position && `at character ${pgError.position}`
   ]
     .filter(Boolean)
     .join('; ');
-  const message = error instanceof Error ? error.message : String(error);
+  const message = valueClass
+    ? `(value omitted, class ${valueClass})`
+    : error instanceof Error
+      ? error.message
+      : String(error);
   return new Error(`OAuth store schema ${step} failed: ${message}${details ? ` (${details})` : ''}`, {
     cause: error
   });
@@ -190,10 +209,12 @@ function schemaError(step: string, error: unknown): Error {
 
 /**
  * Brings the schema up to the newest migration this build knows, once per
- * version, under a transaction-scoped advisory lock: two boots on one database
- * (preboot, a one-off dyno) take turns, and the second finds nothing left to
- * apply. Everything runs in one transaction, so a failure leaves the database
- * exactly as it was and throws, which stops the boot.
+ * version, under a transaction-scoped advisory lock: two runs on one database
+ * (the release phase and a boot, preboot, a one-off dyno) take turns, and the
+ * second finds nothing left to apply. Everything runs in one transaction, so a
+ * failure leaves the database exactly as it was and throws. The release phase
+ * (src/migrate.ts) runs it first, where a failure stops the release; the boot
+ * call is then a no-op that still refuses a newer breaking schema.
  */
 export async function migrateOAuthSchema(
   pool: pg.Pool,
@@ -214,8 +235,8 @@ export async function migrateOAuthSchema(
       let adopting: boolean;
       try {
         // Server-side, unlike pg's client-side query_timeout: waiting longer
-        // than this for another boot's lock, or for a table a running query
-        // holds, fails the boot instead of hanging it.
+        // than this for another run's lock, or for a table a running query
+        // holds, fails the run (release or boot) instead of hanging it.
         await client.query(`SET LOCAL lock_timeout = '10s'`);
         await client.query(`SELECT pg_advisory_xact_lock(${SCHEMA_LOCK_ID})`);
         await client.query(`CREATE TABLE IF NOT EXISTS oauth_schema_migrations (
@@ -253,7 +274,7 @@ export async function migrateOAuthSchema(
       }
       if (newer.length) {
         log(
-          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, booting`
+          `OAuth store schema is at version ${newer.at(-1)!.version}, newer than this build's ${migrations.length}; those versions are rollback-safe, continuing`
         );
       }
       const appliedVersions = new Set(applied.map((row) => row.version));
@@ -371,9 +392,10 @@ export function bootConnectionHints(error: unknown): string[] {
 }
 
 /**
- * The boot failure in one line. pg's own code and detail are kept, and a Node 22
- * multi-address connect failure (an AggregateError with an empty message) shows
- * its inner errors.
+ * The boot failure in one line. pg's own code and detail are kept (not the
+ * message and detail of a rowValueClass error), and a Node 22 multi-address
+ * connect failure (an AggregateError with an empty message) shows its inner
+ * errors.
  */
 export function bootFailureMessage(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -381,8 +403,12 @@ export function bootFailureMessage(error: unknown): string {
     error instanceof AggregateError
       ? error.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
       : [];
-  const { code, detail } = error as Error & { code?: string; detail?: string };
-  return [error.message || inner.join('; '), code && `[${code}]`, detail].filter(Boolean).join(' ');
+  const pgError = error as Error & { code?: string; detail?: string };
+  const valueClass = rowValueClass(pgError.code);
+  if (valueClass) return `(value omitted, class ${valueClass}) [${pgError.code}]`;
+  return [error.message || inner.join('; '), pgError.code && `[${pgError.code}]`, pgError.detail]
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
@@ -488,6 +514,18 @@ interface GrantRow {
 
 /** The pool, or one checked-out connection (inside a transaction). */
 type Queryable = Pick<pg.ClientBase, 'query'>;
+
+/** pg client errors with no code whose message names no host, logged as a fixed label. */
+const CODELESS_PG_ERROR_LABELS = new Map([
+  ['Query read timeout', 'query timeout'],
+  ['Connection terminated unexpectedly', 'connection terminated']
+]);
+
+/** A failed cleanup step's code; a code-less pg client error gets a safe label instead of `Error`. */
+function sweepFailureLabel(error: unknown): string {
+  const codeless = error instanceof Error && !(error as { code?: unknown }).code;
+  return (codeless && CODELESS_PG_ERROR_LABELS.get(error.message)) || errorCodeOf(error);
+}
 
 export class PgOAuthStore implements OAuthStore {
   /** Set by close(): a cleanup run stops before its next statement. */
@@ -979,7 +1017,9 @@ export class PgOAuthStore implements OAuthStore {
    * foreign-key order (a token references its grant, without cascade), then
    * ended rate-limit windows (on the database clock, not counted). Each
    * locks only the rows it deletes, which no request uses any more, so requests
-   * keep being served.
+   * keep being served. A failing step is logged (its name and error code) and
+   * ends the run; the counts of the steps before it are returned, and the next
+   * run retries.
    *
    * Token expiries come from this app's clock, created_at and revoked_at from
    * Postgres now(); a skew between the two is harmless at day-scale retentions.
@@ -1035,8 +1075,10 @@ export class PgOAuthStore implements OAuthStore {
         const rowCount = (await this.pool.query(sql, cutoffs)).rowCount ?? 0;
         if (step !== 'rateLimitCounters') deleted[step] = rowCount;
       } catch (error) {
-        // The code only: a pg message can name the database host and role.
-        throw new Error(`the ${step} step failed: ${errorCodeOf(error)}`, { cause: error });
+        // The code only: a pg message can name the database host and role. The
+        // steps already run have committed, so their counts are still returned.
+        logError(`OAuth store cleanup: the ${step} step failed, retried within an hour: ${sweepFailureLabel(error)}`);
+        break;
       }
     }
     return deleted;

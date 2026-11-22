@@ -221,6 +221,19 @@ describe('bootFailureMessage', () => {
     expect(bootFailureMessage(error)).toBe('relation exists [42P07] Key (x)=(1).');
   });
 
+  it('drops the message and detail of an integrity constraint error (class 23), which hold row data', () => {
+    const error = Object.assign(new Error('null value in column "client_id" violates not-null constraint'), {
+      code: '23502',
+      detail: 'Failing row contains (1, null, user@example.com, v1.secret).'
+    });
+    expect(bootFailureMessage(error)).toBe('(value omitted, class 23) [23502]');
+  });
+
+  it('drops the message of a data exception (class 22), which holds the value', () => {
+    const error = Object.assign(new Error('invalid input syntax for type uuid: "row-secret"'), { code: '22P02' });
+    expect(bootFailureMessage(error)).toBe('(value omitted, class 22) [22P02]');
+  });
+
   it('shows the inner errors of an AggregateError with no message', () => {
     const error = Object.assign(
       new AggregateError(

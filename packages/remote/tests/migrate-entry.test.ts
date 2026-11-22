@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createTestSchema, type TestSchema } from './support/two-process.js';
+import { createTestSchema, newTokenKey, type TestSchema } from './support/two-process.js';
 
 /**
  * The release-phase entry's wiring only (the migrations themselves are
@@ -11,17 +11,28 @@ import { createTestSchema, type TestSchema } from './support/two-process.js';
 
 const PG_URL = process.env.TEST_DATABASE_URL;
 const MIGRATE_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'migrate.js');
+/** Port 1 refuses at once: a connection attempt would fail the run with a connection error. */
+const UNREACHABLE_DSN = 'postgres://127.0.0.1:1/none?sslmode=disable';
 
-async function runMigrate(
-  databaseUrl: string | undefined,
-  issuerUrl: string | undefined = 'https://mcp.example.com'
-): Promise<{ code: number | null; stderr: string }> {
+/** A complete OAuth config, as on the app; overrides with `undefined` unset a variable. */
+function oauthEnv(databaseUrl: string | undefined): Record<string, string | undefined> {
+  return {
+    XYTE_MCP_ISSUER_URL: 'https://mcp.example.com',
+    XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+    XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
+    XYTE_MCP_TOKEN_KEY: newTokenKey(),
+    DATABASE_URL: databaseUrl
+  };
+}
+
+async function runMigrate(vars: Record<string, string | undefined>): Promise<{ code: number | null; stderr: string }> {
   if (!existsSync(MIGRATE_ENTRY)) throw new Error(`Build first: ${MIGRATE_ENTRY} is missing (npm run build).`);
-  const env = { ...process.env };
-  delete env.DATABASE_URL;
-  delete env.XYTE_MCP_ISSUER_URL;
-  if (databaseUrl) env.DATABASE_URL = databaseUrl;
-  if (issuerUrl) env.XYTE_MCP_ISSUER_URL = issuerUrl;
+  const env: NodeJS.ProcessEnv = {};
+  // Only this test's config: none of the runner's XYTE_*, DATABASE_URL or PORT.
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!/^(XYTE_|DATABASE_URL$|PORT$)/.test(name)) env[name] = value;
+  }
+  for (const [name, value] of Object.entries(vars)) if (value !== undefined) env[name] = value;
   const child = spawn(process.execPath, [MIGRATE_ENTRY], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
@@ -30,17 +41,37 @@ async function runMigrate(
 }
 
 describe('migrate entry without a database', () => {
-  it('exits 0 and says there is nothing to migrate', async () => {
-    const { code, stderr } = await runMigrate(undefined);
-    expect(code).toBe(0);
+  it('exits 0 and says there is nothing to migrate for a local issuer without a database', async () => {
+    const { code, stderr } = await runMigrate({
+      ...oauthEnv(undefined),
+      XYTE_MCP_ISSUER_URL: 'http://localhost:3000'
+    });
+    expect(code, stderr).toBe(0);
     expect(stderr).toContain('[xyte-mcp] no DATABASE_URL, nothing to migrate');
   });
 
   it('exits 0 without connecting when the app is not in OAuth mode', async () => {
-    // Port 1 refuses at once: a connection attempt would fail the run.
-    const { code, stderr } = await runMigrate('postgres://127.0.0.1:1/none?sslmode=disable', '');
+    const { code, stderr } = await runMigrate({
+      XYTE_MCP_HTTP_TOKEN: `xmcp_${'a'.repeat(32)}`,
+      XYTE_ORG_API_KEY: 'org-key',
+      DATABASE_URL: UNREACHABLE_DSN
+    });
     expect(code, stderr).toBe(0);
     expect(stderr).toContain('[xyte-mcp] XYTE_MCP_ISSUER_URL is not set (not in OAuth mode), nothing to migrate');
+  });
+
+  it('exits 1 with the config error, before connecting, when the web boot would refuse the config', async () => {
+    const { code, stderr } = await runMigrate({
+      ...oauthEnv(UNREACHABLE_DSN),
+      XYTE_MCP_HTTP_TOKEN: `xmcp_${'a'.repeat(32)}`,
+      XYTE_ORG_API_KEY: 'org-key'
+    });
+    expect(code).toBe(1);
+    expect(stderr).toContain(
+      '[xyte-mcp] error: XYTE_MCP_HTTP_TOKEN and XYTE_MCP_ISSUER_URL are both set; a deployment serves one or the other.'
+    );
+    expect(stderr).toContain('  - Unset XYTE_MCP_HTTP_TOKEN for OAuth');
+    expect(stderr).not.toContain('migration failed');
   });
 });
 
@@ -53,13 +84,24 @@ describe.skipIf(!PG_URL)('migrate entry against Postgres', () => {
     await schema?.drop();
   });
 
+  // First: the schema is still fresh here.
+  it('exits 1 and leaves a fresh schema unmigrated when the token key is missing', async () => {
+    const { code, stderr } = await runMigrate({ ...oauthEnv(schema.databaseUrl), XYTE_MCP_TOKEN_KEY: undefined });
+    expect(code).toBe(1);
+    expect(stderr).toContain('[xyte-mcp] error: XYTE_MCP_TOKEN_KEY must be the base64 of exactly 32 random bytes');
+    const { rows } = await schema.admin.query<{ table: string | null }>(
+      `SELECT to_regclass('oauth_schema_migrations')::text AS table`
+    );
+    expect(rows[0]!.table).toBeNull();
+  });
+
   it('migrates a fresh schema and exits 0, and a second run exits 0 too', async () => {
-    const first = await runMigrate(schema.databaseUrl);
+    const first = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(first.code, first.stderr).toBe(0);
     const { rows } = await schema.admin.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_schema_migrations');
     expect(rows[0]!.n).toBeGreaterThan(0);
 
-    const second = await runMigrate(schema.databaseUrl);
+    const second = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(second.code, second.stderr).toBe(0);
   });
 
@@ -67,7 +109,7 @@ describe.skipIf(!PG_URL)('migrate entry against Postgres', () => {
     await schema.admin.query(
       `INSERT INTO oauth_schema_migrations (version, name, breaks_rollback) VALUES (9999, 'from the future', true)`
     );
-    const { code, stderr } = await runMigrate(schema.databaseUrl);
+    const { code, stderr } = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(code).toBe(1);
     expect(stderr).toContain('[xyte-mcp] error: OAuth store migration failed:');
     expect(stderr).toContain('version 9999');

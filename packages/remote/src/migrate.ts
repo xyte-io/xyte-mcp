@@ -4,17 +4,34 @@
  * migrations once per release, before any new dyno starts. A non-zero exit
  * fails the release, so the running dynos keep serving the old build. The web
  * boot still calls migrateOAuthSchema, which then finds nothing to apply.
- * Gated like the web boot: only an OAuth app (issuer set) uses the database.
+ *
+ * It resolves the config the web boot does first, so a config the new dynos
+ * would refuse fails the release before a migration (perhaps one that breaks
+ * rollback) is applied. resolveHttpConfig is pure (no log, no I/O) and needs no
+ * PORT: unset, it defaults (a release dyno gets none); set but invalid, the web
+ * boot would refuse it too.
  */
 import pg from 'pg';
-import { ENV } from '@xyteai/mcp/config.js';
+import { ENV, resolveHttpConfig, type HttpConfig } from '@xyteai/mcp/config.js';
+import { isXyteError } from '@xyteai/mcp/http/errors.js';
 import { log, logError } from '@xyteai/mcp/log.js';
 import { errorCodeOf } from './log-event.js';
 import { bootConnectionHints, bootFailureMessage, migrateOAuthSchema, sslOption } from './oauth/pg-store.js';
 
-// ponytail: the env check resolveHttpConfig picks OAuth mode by; the boot reports a bad config.
-const databaseUrl = process.env[ENV.databaseUrl]?.trim();
-if (!process.env[ENV.issuerUrl]?.trim()) {
+let config: HttpConfig | undefined;
+try {
+  config = resolveHttpConfig();
+} catch (error) {
+  if (!isXyteError(error)) throw error;
+  // Same output as the web boot's (index.ts).
+  logError(error.message);
+  for (const hint of error.hints) process.stderr.write(`  - ${hint}\n`);
+  process.exitCode = 1;
+}
+const databaseUrl = config?.oauth?.databaseUrl;
+if (!config) {
+  // The config error is reported above.
+} else if (!config.oauth) {
   log(`${ENV.issuerUrl} is not set (not in OAuth mode), nothing to migrate`);
 } else if (!databaseUrl) {
   log('no DATABASE_URL, nothing to migrate');
@@ -26,6 +43,8 @@ if (!process.env[ENV.issuerUrl]?.trim()) {
       connectionString: databaseUrl,
       ...sslOption(databaseUrl),
       connectionTimeoutMillis: 10_000,
+      // A half-open connection during a failover then errors instead of hanging the release.
+      keepAlive: true,
       max: 1
     });
     pool.on('error', (error) => logError(`postgres migration pool: ${errorCodeOf(error)}`));

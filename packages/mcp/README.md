@@ -231,8 +231,9 @@ challenge pointing at the resource metadata when OAuth is on (RFC 9728, how clie
 the flow), and deliberately *without* one in static mode (a challenge makes
 `mcp-remote` open a browser for an OAuth flow that does not exist there).
 `/mcp` can also answer `429` (rate limited; `405`s count against the same budget), `413`
-(body over 1 MiB), `415` (the body must be uncompressed UTF-8 JSON) and `400` (a JSON-RPC
-batch); see the rate limits under [OAuth 2.1](#oauth-21).
+(body over 1 MiB), `415` (the body must be uncompressed UTF-8 JSON), `400` (a JSON-RPC
+batch) and `503` (the database is unavailable for the token check or the rate counter;
+retry); see the rate limits under [OAuth 2.1](#oauth-21).
 
 ### Run it
 
@@ -275,8 +276,9 @@ Keep preboot off (`heroku features:disable preboot -a <app>`), so the old and ne
 overlap only for the shutdown drain: the per-IP rate-limit counters are in memory (see
 **One dyno** below), so a longer overlap doubles the per-IP budgets. Upgrading from a build without
 the cross-process refresh lock, a refresh on each process in that overlap can race; the loser
-gets `invalid_grant` from hub and that connection has to sign in again. That window is
-accepted.
+gets `invalid_grant` from hub and that connection has to sign in again. Upgrading from a
+build without the shared per-grant counter, the per-grant budget also doubles for that one
+overlap. That window is accepted.
 
 An OAuth app whose issuer is not localhost or 127.0.0.1 refuses to boot on this build
 without `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`: set both before deploying it.
@@ -533,8 +535,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   300 a minute per IP for requests without a valid token; over that it answers 429 with
   `Retry-After` and draft-8 `RateLimit` / `RateLimit-Policy` headers (sent on every `/mcp`
   answer), so a flooded IP sees 429 instead of 401 for up to a minute. The per-connection
-  limit is shared by all processes through Postgres; if the database fails there, `/mcp`
-  answers 503 (retry). `/oauth/callback`
+  limit is shared by all processes through Postgres (without a database, localhost only, it
+  is kept in memory per process); if the database fails there, `/mcp` answers 503 (retry). `/oauth/callback`
   allows 30 a minute per IP. The per-IP limits assume exactly one trusted proxy hop
   (Heroku's router): behind a CDN every client counts as the CDN's egress IP (raise the hop
   count), and with no proxy the client's own `X-Forwarded-For` decides, so the per-IP limit

@@ -84,6 +84,13 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     expect(logText()).toContain('OAuth store schema migrated to version 2 (encrypt_hub_tokens)');
     expect(logText()).toContain('OAuth store schema migrated to version 3 (pending_sign_ins)');
     expect(logText()).toContain('OAuth store schema migrated to version 4 (rate_limit_counters)');
+    // Unlogged: the counters are hot, short-lived writes that need no WAL or crash safety.
+    const persistence = await admin.query<{ relpersistence: string }>(
+      `SELECT c.relpersistence FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = 'mcp_rate_limit_counters' AND n.nspname = $1`,
+      [schema]
+    );
+    expect(persistence.rows).toEqual([{ relpersistence: 'u' }]);
   });
 
   it('adopts a database created before versioning as version 1, keeping its rows', async () => {

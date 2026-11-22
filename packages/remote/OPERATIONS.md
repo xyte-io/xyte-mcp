@@ -156,13 +156,14 @@ At boot and then every hour the server deletes sign-ins in progress past their 1
 expired tokens, revoked connections with no token left 7 days after the revoke, connections
 left without a client (a sign-in still in progress when its client was deleted), connections
 with no token left 97 days after the sign-in (a sign-in never completed, or a user idle past
-the refresh lifetime: [the 90-day end](#the-90-day-end) has passed, plus a week), and
-registered clients with no connection 30 days after registration. When it deletes anything
+the refresh lifetime: [the 90-day end](#the-90-day-end) has passed, plus a week),
+registered clients with no connection 30 days after registration, and ended `/mcp`
+rate-limit windows (these are not counted in the log line). When it deletes anything
 it writes one line: `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended
 grant(s), <n> unused client(s), <n> expired pending sign-in(s)`. Every dyno runs the
 cleanup; a run at the same time as another deletes nothing more, so the counts are not
 doubled and a dyno may log nothing. A failed run writes `[xyte-mcp] error: OAuth store
-cleanup failed, retried within an hour: the <pendingSignIns|tokens|grants|clients> step
+cleanup failed, retried within an hour: the <pendingSignIns|tokens|grants|clients|rateLimitCounters> step
 failed: <code>`, and the next run tries again. `<code>` is the error code, as in `healthz:
 token store check failed: <code>`; a plain `Error` is usually a pg timeout (query or
 connect, 10 s). A query timeout stops only the wait: the delete may still finish in
@@ -213,6 +214,8 @@ it from production data**.
   `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`.
 - **5xx rate:** the router `code=` (`H10` crashed, `H12` timeout, `H80` maintenance mode) and
   the `[xyte-mcp] error:` lines at the same time. `token check failed` means the database.
+  So does `rate limit check failed: <code>` (a `503` on `/mcp`: the per-connection rate
+  counter could not be written); a plain `Error` code there is a pg pool or query timeout.
 - **Hub refresh failures:** the `outcome` and `hub_status`. Many `unknown` or `5xx` at once
   means the hub or the network to it; check the hub's health first. Many `rejected` with
   `hub_status` `401` or `400` at once means the hub refuses this server itself: check its hub

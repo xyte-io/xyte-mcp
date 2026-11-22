@@ -72,7 +72,10 @@ export const endpointDescribeTool = defineTool({
     const lines = [
       `${endpoint.key} — ${endpoint.title}`,
       `${endpoint.method} ${base}${endpoint.pathTemplate}`,
-      `auth: ${endpoint.authScope} key`,
+      // Signed-in: the description's "Signed-in user access" rules apply to this connection.
+      typeof context.credentials[endpoint.authScope] === 'object'
+        ? `auth: ${endpoint.authScope}, signed-in user`
+        : `auth: ${endpoint.authScope} key`,
       endpoint.description ? `\n${endpoint.description}` : '',
       endpoint.pathParams.length
         ? `\npath params (all required): ${endpoint.pathParams.join(', ')}`

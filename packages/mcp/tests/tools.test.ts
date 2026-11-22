@@ -51,6 +51,17 @@ describe('xyte_endpoint_describe', () => {
     expect(structured.url).toContain('https://hub.xyte.io');
   });
 
+  it.each([
+    [undefined, 'auth: organization key'],
+    [{ organization: { accessToken: 'xoat_abcdef123456' } }, 'auth: organization, signed-in user'],
+  ])('names the credential in use (%j)', async (credentials, line) => {
+    const result = await endpointDescribeTool.handler(
+      { key: READ_KEY },
+      testContext(credentials ? { credentials } : {})
+    );
+    expect(result.content[0]?.text).toContain(line);
+  });
+
   it('errors with suggestions on a near-miss key', async () => {
     // `getDevice` (singular) is a real endpoint, so use a name that truly is not.
     const result = await endpointDescribeTool.handler(
@@ -250,7 +261,7 @@ describe('xyte_api_call', () => {
       const error = new XyteHttpError(422, 'Unprocessable', { error: 'x' }, READ_KEY);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
       const text = result.content[0]?.text;
-      expect(text).toContain(`Run xyte_endpoint_describe on ${READ_KEY} to check the expected body.`);
+      expect(text).toContain(`Run xyte_endpoint_describe on ${READ_KEY} to check the expected arguments.`);
       expect(text).not.toContain(API_KEY_HINT);
     });
 

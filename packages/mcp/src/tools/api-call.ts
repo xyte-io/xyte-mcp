@@ -125,7 +125,7 @@ function toErrorResult(
       hints.push('Check the path parameter values — the resource may not exist.');
     }
     if (error.status === 422 || error.status === 400) {
-      hints.push(`Run xyte_endpoint_describe on ${endpointKey} to check the expected body.`);
+      hints.push(`Run xyte_endpoint_describe on ${endpointKey} to check the expected arguments.`);
     }
     return errorResult(
       `${endpointKey} failed: ${error.status} ${error.statusText}\n\n${JSON.stringify(body, null, 2)}`,

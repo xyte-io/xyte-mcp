@@ -573,6 +573,19 @@ describe('oauth over http, in order', () => {
     }
   });
 
+  // The SDK default is 30 days, after which /token answers invalid_client.
+  it('gives a confidential client a secret that never expires', async () => {
+    const response = await fetch(`${base}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ redirect_uris: [REDIRECT], token_endpoint_auth_method: 'client_secret_post' })
+    });
+    expect(response.status).toBe(201);
+    const client = (await response.json()) as { client_secret?: string; client_secret_expires_at?: number };
+    expect(client.client_secret).toBeTruthy();
+    expect(client.client_secret_expires_at).toBe(0);
+  });
+
   it.skipIf(!PG_URL)('keeps a connection across a restart mid key rotation: hub gets the decrypted token, and a forced refresh rotates it under the new key', async () => {
     const token = await connectAgain();
     const live = await admin!.query<{ hub_access_token: string; hub_refresh_token: string }>(

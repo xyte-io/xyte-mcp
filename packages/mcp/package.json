@@ -87,7 +87,7 @@
     "smoke:live": "npm run build && node scripts/live-smoke.mjs",
     "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
     "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
-    "prepare": "npm run build",
+    "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run smoke:pack-install && node scripts/assert-pack-no-pg.mjs"
   },
   "dependencies": {

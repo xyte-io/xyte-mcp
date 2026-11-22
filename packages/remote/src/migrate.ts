@@ -4,14 +4,19 @@
  * migrations once per release, before any new dyno starts. A non-zero exit
  * fails the release, so the running dynos keep serving the old build. The web
  * boot still calls migrateOAuthSchema, which then finds nothing to apply.
+ * Gated like the web boot: only an OAuth app (issuer set) uses the database.
  */
 import pg from 'pg';
+import { ENV } from '@xyteai/mcp/config.js';
 import { log, logError } from '@xyteai/mcp/log.js';
 import { errorCodeOf } from './log-event.js';
 import { bootConnectionHints, bootFailureMessage, migrateOAuthSchema, sslOption } from './oauth/pg-store.js';
 
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) {
+// ponytail: the env check resolveHttpConfig picks OAuth mode by; the boot reports a bad config.
+const databaseUrl = process.env[ENV.databaseUrl]?.trim();
+if (!process.env[ENV.issuerUrl]?.trim()) {
+  log(`${ENV.issuerUrl} is not set (not in OAuth mode), nothing to migrate`);
+} else if (!databaseUrl) {
   log('no DATABASE_URL, nothing to migrate');
 } else {
   let pool: pg.Pool | undefined;

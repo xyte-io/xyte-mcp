@@ -272,11 +272,14 @@ Upgrading an OAuth app from a build that stored the hub tokens unencrypted: set
 rotate the hub OAuth client secret (see Storage under [OAuth 2.1](#oauth-21)). This upgrade
 (schema version 2) cannot be rolled back: an older build refuses to start against it.
 
-The Procfile's release phase applies the schema migrations once per release, before any new
-dyno starts; a failed migration fails the release, and the running dynos keep serving the old
-build. Heroku also runs the release phase on a config-var change and on a rollback: a rollback
-to an older build against a newer breaking schema fails there (the older build refuses it), so
-the rollback stops before any dyno restarts. Preboot, rolling deploys and several web dynos are
+On an OAuth app (`XYTE_MCP_ISSUER_URL` set) with `DATABASE_URL`, the Procfile's release phase
+applies the schema migrations once per release, before any new dyno starts; a failed migration
+fails the release, and the running dynos keep serving the old build. Heroku also runs the
+release phase on a config-var change and on a rollback: a rollback to an older build that has
+the release phase (this one onward) against a newer breaking schema fails there (the older
+build refuses it), so the rollback stops before any dyno restarts. A rollback to an earlier
+build has no release phase: its dynos restart and refuse to boot, so never roll back past a
+breaking migration. Preboot, rolling deploys and several web dynos are
 allowed (see **Several dynos** below). The exception is a release that contains a
 `breaksRollback: true` migration: turn preboot off for that release
 (`heroku features:disable preboot -a <app>`; `strategy: Recreate` on EKS), so no new process
@@ -513,7 +516,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   rollback-safe, i.e. whether an older build still boots against it: adding tables, nullable
   columns or indexes is safe; dropping, renaming or tightening is not. An older build boots
   against a newer rollback-safe schema, and refuses one that is not: its release phase fails,
-  naming the version. A build from before versioning does not check, so never roll back past this
+  naming the version (a build from before the release phase has none, so its dynos restart
+  and refuse to boot). A build from before versioning does not check, so never roll back past this
   release once a breaking migration has run. During a deploy the old dynos still serve
   against the new schema while the release phase and the new boot run, even with preboot off,
   so a breaking migration may only drop or rewrite what the previous release already stopped

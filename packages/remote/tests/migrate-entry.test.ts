@@ -12,11 +12,16 @@ import { createTestSchema, type TestSchema } from './support/two-process.js';
 const PG_URL = process.env.TEST_DATABASE_URL;
 const MIGRATE_ENTRY = path.resolve(import.meta.dirname, '..', 'dist', 'migrate.js');
 
-async function runMigrate(databaseUrl: string | undefined): Promise<{ code: number | null; stderr: string }> {
+async function runMigrate(
+  databaseUrl: string | undefined,
+  issuerUrl: string | undefined = 'https://mcp.example.com'
+): Promise<{ code: number | null; stderr: string }> {
   if (!existsSync(MIGRATE_ENTRY)) throw new Error(`Build first: ${MIGRATE_ENTRY} is missing (npm run build).`);
   const env = { ...process.env };
   delete env.DATABASE_URL;
+  delete env.XYTE_MCP_ISSUER_URL;
   if (databaseUrl) env.DATABASE_URL = databaseUrl;
+  if (issuerUrl) env.XYTE_MCP_ISSUER_URL = issuerUrl;
   const child = spawn(process.execPath, [MIGRATE_ENTRY], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
@@ -29,6 +34,13 @@ describe('migrate entry without a database', () => {
     const { code, stderr } = await runMigrate(undefined);
     expect(code).toBe(0);
     expect(stderr).toContain('[xyte-mcp] no DATABASE_URL, nothing to migrate');
+  });
+
+  it('exits 0 without connecting when the app is not in OAuth mode', async () => {
+    // Port 1 refuses at once: a connection attempt would fail the run.
+    const { code, stderr } = await runMigrate('postgres://127.0.0.1:1/none?sslmode=disable', '');
+    expect(code, stderr).toBe(0);
+    expect(stderr).toContain('[xyte-mcp] XYTE_MCP_ISSUER_URL is not set (not in OAuth mode), nothing to migrate');
   });
 });
 

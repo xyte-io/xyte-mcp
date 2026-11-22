@@ -189,8 +189,9 @@ reaches it together, 90 days later.
 
 ## A failed release
 
-The Procfile's release phase applies the schema migrations once per release (and Heroku runs it
-again on a config-var change and a rollback). When it fails, the release log
+On an OAuth app (`XYTE_MCP_ISSUER_URL` set) with `DATABASE_URL`, the Procfile's release phase
+applies the schema migrations once per release (and Heroku runs it again on a config-var change
+and a rollback); otherwise it logs `nothing to migrate` and passes. When it fails, the release log
 (`heroku releases:output <version> -a <app>`) ends with `[xyte-mcp] error: OAuth store
 migration failed: <reason>`, possibly followed by hints, and `heroku releases -a <app>` shows
 that release as failed. No new dyno starts: the old build keeps serving, and the database is
@@ -199,7 +200,9 @@ unchanged (all pending migrations run in one transaction).
 - A connection or certificate error: fix the config var it names (`DATABASE_URL`,
   `NODE_EXTRA_CA_CERTS`, `PGSSLMODE`), which starts a new release.
 - `… which this build … does not know and which breaks rollback`: a rollback or an older build
-  against a newer breaking schema. Release a build at that version or later instead.
+  against a newer breaking schema. Release a build at that version or later instead. This
+  stop covers only builds with the release phase: a rollback to an earlier build restarts the
+  dynos, which then refuse to boot, so never roll back past a breaking migration.
 - A migration's database error (or `lock_timeout`, another run holding the lock): fix the
   migration in a new build, or for a lock wait run the release again
   (`heroku releases:retry -a <app>`).

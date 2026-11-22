@@ -718,13 +718,38 @@ describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
     expect(first.resetTime.getTime()).toBeLessThan(Date.now() + 65_000);
     expect((await a.countRateLimitHit('grant:1', 60_000)).totalHits).toBe(2);
     const third = await a.countRateLimitHit('grant:1', 60_000);
-    expect(third).toEqual({ totalHits: 3, resetTime: first.resetTime });
+    expect(third.totalHits).toBe(3);
+    // Same window end; rebuilt on the process clock per call, so within the calls' gap.
+    expect(Math.abs(third.resetTime.getTime() - first.resetTime.getTime())).toBeLessThan(1_000);
     expect((await a.countRateLimitHit('grant:2', 60_000)).totalHits).toBe(1);
 
     await backdate('grant:1');
     const restarted = await a.countRateLimitHit('grant:1', 60_000);
     expect(restarted.totalHits).toBe(1);
     expect(restarted.resetTime.getTime()).toBeGreaterThan(Date.now() + 55_000);
+  });
+
+  it('restarts a window that ends more than one window ahead (the database clock stepped back)', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await a.countRateLimitHit('grant:1', 60_000);
+    await admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() + interval '1 hour' WHERE key = 'grant:1'`);
+    const restarted = await a.countRateLimitHit('grant:1', 60_000);
+    expect(restarted.totalHits).toBe(1);
+    expect(restarted.resetTime.getTime()).toBeLessThan(Date.now() + 65_000);
+  });
+
+  it('builds resetTime on the process clock from the time left, so a skewed database clock does not shift it', async () => {
+    await a.countRateLimitHit('grant:1', 60_000);
+    await admin.query(`UPDATE mcp_rate_limit_counters SET reset_at = now() + interval '30 seconds' WHERE key = 'grant:1'`);
+    const processNow = Date.now() + 3_600_000;
+    vi.useFakeTimers({ toFake: ['Date'], now: processNow });
+    try {
+      const { resetTime } = await a.countRateLimitHit('grant:1', 60_000);
+      expect(resetTime.getTime()).toBeGreaterThan(processNow + 25_000);
+      expect(resetTime.getTime()).toBeLessThanOrEqual(processNow + 30_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('shares one count between two stores on one database', async () => {
@@ -744,6 +769,20 @@ describe.skipIf(!PG_URL)('PgOAuthStore: rate-limit counters', () => {
     expect(await a.sweepExpiredOAuthRows(NOW())).toEqual({ tokens: 0, grants: 0, clients: 0, pendingSignIns: 0 });
     const keys = (await admin.query<{ key: string }>('SELECT key FROM mcp_rate_limit_counters')).rows;
     expect(keys).toEqual([{ key: 'grant:live' }]);
+  });
+
+  it('the cleanup names the rateLimitCounters step and its code only when that step fails', async () => {
+    await admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
+    try {
+      const error = await a.sweepExpiredOAuthRows(NOW()).then(
+        () => undefined,
+        (rejected: unknown) => rejected as Error
+      );
+      expect(error?.message).toBe('the rateLimitCounters step failed: 42P01');
+      expect((error?.cause as { code?: string } | undefined)?.code).toBe('42P01');
+    } finally {
+      await admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
+    }
   });
 });
 

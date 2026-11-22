@@ -149,20 +149,26 @@ describe.skipIf(!PG_URL)('two server processes on one database', () => {
 
   it('limits one connection to 60 calls a minute over both processes, and answers 503 when the counter fails', async () => {
     const { accessToken } = await signIn(proxy.base);
+    const from = proxy.routed.length;
     const statuses: number[] = [];
-    for (let i = 0; i < 61; i += 1) {
+    for (let i = 0; i < 60; i += 1) {
       const answer = await listDevices(proxy.base, accessToken);
       await answer.arrayBuffer();
       statuses.push(answer.status);
     }
-    expect(statuses.slice(0, 60)).toEqual(Array(60).fill(200));
-    expect(statuses[60]).toBe(429);
+    expect(statuses).toEqual(Array(60).fill(200));
+    const limited = await listDevices(proxy.base, accessToken);
+    expect(limited.status).toBe(429);
+    expect(await limited.json()).toMatchObject({
+      error: { code: -32000, message: expect.stringMatching(/^rate limit exceeded, retry in ([1-9]|[1-5]\d|60) s$/) }
+    });
+    expect(new Set(proxy.routed.slice(from).map((request) => request.backend)).size).toBe(2);
 
     await schema.admin.query('ALTER TABLE mcp_rate_limit_counters RENAME TO mcp_rate_limit_counters_away');
     try {
       const answer = await listDevices(proxy.base, accessToken);
       expect(answer.status).toBe(503);
-      expect(await answer.json()).toMatchObject({ error: { code: -32603 } });
+      expect(await answer.json()).toMatchObject({ error: { code: -32603, message: 'temporarily unavailable, retry' } });
     } finally {
       await schema.admin.query('ALTER TABLE mcp_rate_limit_counters_away RENAME TO mcp_rate_limit_counters');
     }

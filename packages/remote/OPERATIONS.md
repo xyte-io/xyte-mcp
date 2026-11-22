@@ -158,8 +158,8 @@ left without a client (a sign-in still in progress when its client was deleted),
 with no token left 97 days after the sign-in (a sign-in never completed, or a user idle past
 the refresh lifetime: [the 90-day end](#the-90-day-end) has passed, plus a week),
 registered clients with no connection 30 days after registration, and ended `/mcp`
-rate-limit windows (these are not counted in the log line). When it deletes anything
-it writes one line: `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended
+rate-limit windows. When it deletes any counted row it writes one line (a run that deletes
+only ended rate-limit windows writes none): `[xyte-mcp] OAuth store cleanup: deleted <n> expired token(s), <n> ended
 grant(s), <n> unused client(s), <n> expired pending sign-in(s)`. Every dyno runs the
 cleanup; a run at the same time as another deletes nothing more, so the counts are not
 doubled and a dyno may log nothing. A failed run writes `[xyte-mcp] error: OAuth store

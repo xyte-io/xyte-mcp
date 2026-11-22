@@ -540,7 +540,7 @@ describe('http transport: token store outage', () => {
   });
 
   // Same answer as a failed token check: a client retries instead of reporting a hard error.
-  it.skipIf(!PG_URL)('answers 503 retryable, not a 429 or 500, when the shared rate-limit counter fails', async () => {
+  it.skipIf(!PG_URL)('answers a POST and a GET 503 retryable, not a 429 or 500, when the shared rate-limit counter fails', async () => {
     const schema = await createTestSchema(PG_URL!);
     const hub = await startFakeHub();
     const port = await freePort();
@@ -554,15 +554,29 @@ describe('http transport: token store outage', () => {
       const count = vi
         .spyOn(PgOAuthStore.prototype, 'countRateLimitHit')
         .mockRejectedValue(Object.assign(new Error('db down at db.internal'), { code: '57P01' }));
+      const hubCallsBefore = hub.apiAuth.length;
       const response = await listDevices(base, accessToken);
       expect(response.status).toBe(503);
       expect(await response.json()).toMatchObject({
         error: { code: -32603, message: 'temporarily unavailable, retry' }
       });
       expect(count).toHaveBeenCalledOnce();
-      const logged = stderr.mock.calls.map(([line]) => String(line)).join('');
-      expect(logged).toContain('rate limit check failed: 57P01');
-      expect(logged).not.toContain('db.internal');
+      // The 503 stops the request: the tool never runs, so hub sees no call.
+      expect(hub.apiAuth.length).toBe(hubCallsBefore);
+      const failures = stderr.mock.calls
+        .flatMap(([chunk]) => String(chunk).split('\n'))
+        .filter((line) => line.includes('rate limit check failed'));
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatch(/rate limit check failed: 57P01$/);
+      expect(failures[0]).not.toContain('db.internal');
+
+      // The GET (app.all) path goes through the same limiter.
+      const get = await fetch(`${base}/mcp`, { headers: { Authorization: `Bearer ${accessToken}` } });
+      expect(get.status).toBe(503);
+      expect(await get.json()).toMatchObject({
+        error: { code: -32603, message: 'temporarily unavailable, retry' }
+      });
+      expect(count).toHaveBeenCalledTimes(2);
     } finally {
       vi.restoreAllMocks();
       await new Promise<void>((resolve) => listener.close(() => resolve()));

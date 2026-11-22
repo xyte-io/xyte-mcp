@@ -150,18 +150,18 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     ]);
   });
 
-  // The previous release (up to version 2) keeps serving during the rollout,
-  // and may be rolled back to: it must still boot against version 3.
-  it('lets a build that only knows versions 1 and 2 boot against versions 3 and 4', async () => {
+  // Older releases keep serving during the rollout, and may be rolled back to:
+  // the v3 build (the one a rollback lands on) and the v1-2 build must still boot against version 4.
+  it.each([2, 3])('lets a build that only knows versions 1 to %i boot against version 4', async (known) => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool);
 
     const logText = captureLog();
-    await expect(migrateOAuthSchema(pool, MIGRATIONS.slice(0, 2))).resolves.toBeUndefined();
+    await expect(migrateOAuthSchema(pool, MIGRATIONS.slice(0, known))).resolves.toBeUndefined();
 
     expect(await appliedVersions()).toEqual([BASELINE, ENCRYPT, PENDING, RATE_LIMITS]);
     expect(logText()).toContain(
-      "OAuth store schema is at version 4, newer than this build's 2; those versions are rollback-safe, booting"
+      `OAuth store schema is at version 4, newer than this build's ${known}; those versions are rollback-safe, booting`
     );
   });
 
@@ -195,13 +195,15 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     ]);
   });
 
-  it('refuses a migration list whose versions do not run 1, 2, 3 in order', async () => {
+  it('refuses a migration list whose versions do not equal their position', async () => {
     await expect(
       migrateOAuthSchema(poolForSchema(), [
         MIGRATIONS[0]!,
         { version: 3, name: 'skipped', sql: 'SELECT 1', breaksRollback: false }
       ])
-    ).rejects.toThrow(/^OAuth store migration at position 2 says version 3/);
+    ).rejects.toThrow(
+      'OAuth store migration at position 2 says version 3; versions must equal their position, starting at 1'
+    );
     expect(await tablesIn()).toEqual([]);
   });
 

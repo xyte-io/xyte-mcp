@@ -470,8 +470,8 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 - **Disconnect.** Revoking any of our tokens revokes its grant, and calls hub's revoke —
   which ends that user's sign-in on that organization for every client — only when no
   other live grant rides the same sign-in.
-- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants, token hashes and
-  sign-ins in progress across dyno restarts, so a sign-in started on one instance finishes on
+- **Storage.** `DATABASE_URL` (Heroku Postgres) persists clients, grants, token hashes,
+  sign-ins in progress and the per-connection `/mcp` rate counters across dyno restarts, so a sign-in started on one instance finishes on
   any other. It is required unless the issuer is on `localhost` or `127.0.0.1`; there, without
   it, an in-memory store logs a loud warning and every restart logs users out. At boot and
   then hourly the server deletes sign-ins in progress past their 10 minutes, expired tokens,
@@ -479,7 +479,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   when), sign-ins with no token left, 97 days after the sign-in (hub's 90-day chain has
   ended, plus a week), sign-ins whose client is gone, and registered clients with no grant
   after 30 days (registration is open, so junk registrations go; a client in use keeps its
-  grant). A returning user whose client was deleted must re-add the connector; see "Cleanup
+  grant), and ended `/mcp` rate-limit windows. A returning user whose client was deleted must re-add the connector; see "Cleanup
   of old rows" in [packages/remote/OPERATIONS.md](packages/remote/OPERATIONS.md). The hub
   tokens in each grant are encrypted with AES-256-GCM under
   `XYTE_MCP_TOKEN_KEY` (required with `DATABASE_URL`), stored as `v1.<key id>.<data>`; the

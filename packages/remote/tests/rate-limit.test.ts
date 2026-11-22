@@ -4,6 +4,7 @@ import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 import express from 'express';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgOAuthStore } from '../src/oauth/pg-store.js';
 import { XyteOAuthProvider } from '../src/oauth/provider.js';
 import { startHttpServer } from '../src/transports/http.js';
 
@@ -32,12 +33,12 @@ async function freePort(): Promise<number> {
 let listener: Server | undefined;
 let base = '';
 
-async function start(mode: 'oauth' | 'static', hubUrl = 'http://127.0.0.1:9'): Promise<void> {
+async function start(mode: 'oauth' | 'static', hubUrl = 'http://127.0.0.1:9', databaseUrl = ''): Promise<void> {
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   listener = await startHttpServer({
     PORT: String(port),
-    DATABASE_URL: '',
+    DATABASE_URL: databaseUrl,
     XYTE_HUB_URL: hubUrl,
     ...(mode === 'oauth'
       ? {
@@ -175,11 +176,14 @@ describe('/mcp rate limit', () => {
     await expectRateLimited(await fetch(`${base}/mcp`, { method: 'DELETE' }));
   });
 
-  it('never limits the static token (dev/CI), but still limits token-less calls', async () => {
-    await start('static');
+  it('never limits the static token (dev/CI), even with a database set, but still limits token-less calls', async () => {
+    // The static mode never opens DATABASE_URL, so nothing listens there.
+    const sharedCount = vi.spyOn(PgOAuthStore.prototype, 'countRateLimitHit');
+    await start('static', undefined, 'postgres://127.0.0.1:9/none');
 
     const statuses = await burst(70, () => mcp(STATIC_TOKEN));
     expect(statuses).toEqual(Array(70).fill(200));
+    expect(sharedCount).not.toHaveBeenCalled();
 
     const anonymous = await mcp(null);
     expect(anonymous.status).toBe(401);

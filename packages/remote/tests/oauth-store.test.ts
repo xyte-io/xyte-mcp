@@ -582,8 +582,31 @@ describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
         '[xyte-mcp] error: OAuth store cleanup: the grants step failed, retried within an hour: 57014'
       );
       expect(logged).not.toContain('secret');
+      expect(
+        issued.filter((sql) => sql.startsWith('DELETE FROM')).map((sql) => sql.split(/\s+/)[2])
+      ).toEqual(['oauth_pending_sign_ins', 'oauth_tokens', 'oauth_grants']);
       expect(issued.some((sql) => sql.includes('DELETE FROM oauth_clients'))).toBe(false);
       expect(issued.some((sql) => sql.includes('DELETE FROM mcp_rate_limit_counters'))).toBe(false);
+    } finally {
+      vi.restoreAllMocks();
+      await store.close();
+    }
+  });
+
+  // pg's client-side errors carry no code; these two messages name no host, so a fixed label stands in.
+  it.each([
+    ['Query read timeout', 'query timeout'],
+    ['Connection terminated unexpectedly', 'connection terminated']
+  ])('logs a code-less pg %j as %j', async (message, label) => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    vi.spyOn(pool, 'query').mockRejectedValue(new Error(message));
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      await store.sweepExpiredOAuthRows(NOW());
+      expect(write.mock.calls.map((call) => String(call[0])).join('')).toContain(
+        `[xyte-mcp] error: OAuth store cleanup: the pendingSignIns step failed, retried within an hour: ${label}\n`
+      );
     } finally {
       vi.restoreAllMocks();
       await store.close();

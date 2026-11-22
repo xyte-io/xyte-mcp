@@ -259,6 +259,16 @@ describe.skipIf(!PG_URL)('migrateOAuthSchema', () => {
     expect(error.message).not.toContain('row-secret');
   });
 
+  it('names the code but not the value of a migration that fails a data exception (class 22)', async () => {
+    const failing: Migration[] = [
+      { version: 1, name: 'bad_uuid', sql: `SELECT 'row-secret'::uuid;`, breaksRollback: false }
+    ];
+    const error = (await migrateOAuthSchema(poolForSchema(), failing).catch((e: unknown) => e)) as Error;
+    expect(error.message).toContain('migration 1 (bad_uuid) failed: (value omitted, class 22)');
+    expect(error.message).toContain('(code 22P02');
+    expect(error.message).not.toContain('row-secret');
+  });
+
   it('leaves an already-migrated database at its version when a later migration fails', async () => {
     const pool = poolForSchema();
     await migrateOAuthSchema(pool, V1);

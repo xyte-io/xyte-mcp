@@ -83,7 +83,7 @@ Everything below is about running the server itself.
 | `XYTE_MCP_ISSUER_URL` | **Hosted server only.** This deployment's public https URL; setting it enables OAuth 2.1. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_ID` | **Hosted server + OAuth, required.** This server's client id at hub's OAuth server — see [OAuth 2.1](#oauth-21) for registering it. |
 | `XYTE_MCP_HUB_OAUTH_CLIENT_SECRET` | **Hosted server + OAuth, required.** The matching client secret (sent as `client_secret_basic`). |
-| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Required unless `XYTE_MCP_ISSUER_URL` is on `localhost` or `127.0.0.1` (the server refuses to boot); with a local issuer, absent → in-memory, tokens and sign-ins in progress die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
+| `DATABASE_URL` | **Hosted server + OAuth only.** Postgres DSN for the token store; set by the Heroku Postgres add-on. Required unless `XYTE_MCP_ISSUER_URL` is on `localhost` or `127.0.0.1` (without it, on Heroku the release fails and the old build keeps serving; elsewhere the server refuses to boot); with a local issuer, absent → in-memory, tokens and sign-ins in progress die with the process. TLS: none for `localhost`, otherwise the certificate is verified (chain and hostname) — see Storage under the hosted server. An `sslmode` in the DSN wins (`sslmode=disable` for a compose DB). |
 | `PGSSLMODE` | **Hosted server + OAuth only.** `no-verify` keeps TLS but skips the certificate check (an accepted MITM risk, the on-call recovery switch); `disable` turns TLS off. Any other value keeps full verification. |
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
 | `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database, and the hub PKCE verifier of each sign-in in progress, are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
@@ -278,7 +278,7 @@ fails the release, and the running dynos keep serving the old build. It first re
 as a web dyno's boot does: a config error (say `XYTE_MCP_TOKEN_KEY` missing) fails the
 release before any migration runs. It does not check the token key against the stored hub
 tokens: a key the live connections were not written with passes the release and is refused
-only when the new dynos boot (see the key rotation steps). Heroku also runs the
+only when the new dynos boot (see [key rotation](#security-notes)). Heroku also runs the
 release phase on a config-var change you make (not on an add-on's own change, such as a
 Postgres credential rotation of `DATABASE_URL`) and on a rollback: a rollback to an older build that has
 the release phase (this one onward) against a newer breaking schema fails there (the older
@@ -290,7 +290,9 @@ allowed (see **Several dynos** below). The exception is a release that contains 
 (`heroku features:disable preboot -a <app>`; `strategy: Recreate` on EKS), so no new process
 serves next to an old one longer than the shutdown drain. Off Heroku (EKS, a local run) there is
 no release phase and the migrations run at boot, so with `Recreate` a failed migration means
-downtime until a fixed build ships.
+downtime until a fixed build ships. With N replicas starting together, a migration that holds
+the schema lock longer than 10 s fails the other pods with `55P03`; they recover on their next
+restart.
 
 Upgrading from a build without the cross-process refresh lock, a refresh on an old and a new
 process while they overlap can race; the loser gets `invalid_grant` from hub and that
@@ -298,16 +300,18 @@ connection has to sign in again. Upgrading from a build without the shared per-g
 the per-grant budget doubles while they overlap. Both last only for that one deploy and are
 accepted.
 
-An OAuth app whose issuer is not localhost or 127.0.0.1 refuses to boot on this build
-without `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`: set both before deploying it.
+An OAuth app whose issuer is not localhost or 127.0.0.1 needs `DATABASE_URL` and
+`XYTE_MCP_TOKEN_KEY` on this build: without them the release fails on Heroku (the old build
+keeps serving), and elsewhere the boot refuses. Set both before deploying it.
 
-An app that had both modes configured refuses to boot on this build: remove
+An app that had both modes configured fails the same way on this build (the release on
+Heroku, the boot elsewhere): remove
 `XYTE_MCP_HTTP_TOKEN` (and the org key it fronted) from an OAuth app. Writes are now off
 unless `XYTE_MCP_ALLOW_WRITES=1`, so `XYTE_MCP_READ_ONLY=1` is no longer needed there.
 
 This build verifies the Postgres certificate against the Procfile's CA bundle path, which is
-checked on the `heroku-24` stack; run the app on that stack. If the boot stops on it,
-`PGSSLMODE=no-verify` restores the old behaviour while the CA is sorted out.
+checked on the `heroku-24` stack; run the app on that stack. If it stops the release (on
+Heroku; the old build keeps serving) or, elsewhere, the boot, `PGSSLMODE=no-verify` restores the old behaviour while the CA is sorted out.
 
 A database created by a pre-release build of the OAuth branch has an incompatible schema:
 drop its tables (`oauth_tokens`, `oauth_grants`, `oauth_clients` and, if present,
@@ -548,11 +552,11 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
   piece is per process: after a database error during a hub refresh, the rotated hub token
   pair may live only in that process's memory; another dyno serving that connection then
   sends the stored, already-used refresh token, and the user has to sign in again. Each process
-  holds up to 8 Postgres connections (5 for requests, 3 for the refresh lock), plus 1 briefly at
-  boot for the schema check; the release phase holds 1 while it runs. During a preboot or
-  rolling deploy old and new dynos overlap, so the peak is about 2 × dynos × 8 + 1. Check that
-  against the Postgres plan's connection limit before scaling: the release's 1 connection must
-  fit under it while all old dynos hold theirs.
+  holds up to 8 Postgres connections (5 for requests, 3 for the refresh lock); at boot it
+  first holds 1 for the schema check, closed before the other 8 open. The release phase holds 1
+  while it runs. So the peak is dynos × 8 + 1 during the release (the old dynos hold theirs),
+  and about 2 × dynos × 8 during a preboot or rolling deploy, while old and new dynos overlap.
+  Check both against the Postgres plan's connection limit before scaling.
 - **Shutdown.** On `SIGTERM` (every deploy and daily restart) or `SIGINT` (Ctrl+C) the
   listener stops accepting, in-flight requests get 10 s, then in-flight hub refreshes are
   awaited and any rotated hub pair not yet saved is written before exit; a hard deadline of

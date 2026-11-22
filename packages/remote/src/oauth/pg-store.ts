@@ -175,25 +175,33 @@ export const MIGRATIONS: ReadonlyArray<Migration> = [
 const SCHEMA_LOCK_ID = 674_601;
 
 /**
- * pg's detail, except for an integrity constraint error (SQLSTATE class 23):
- * its detail is "Failing row contains (...)", row data with emails and tokens.
+ * The SQLSTATE class ('22' or '23') of an error whose message or detail holds
+ * row values, which are then not logged: a data exception (class 22) quotes
+ * the value in its message ('invalid input syntax for type uuid: "…"'), an
+ * integrity constraint error (class 23) has "Failing row contains (...)" as
+ * its detail, row data with emails and tokens.
  */
-function loggableDetail(error: { code?: string; detail?: string }): string | undefined {
-  return error.code?.startsWith('23') ? undefined : error.detail;
+function rowValueClass(code: string | undefined): string | undefined {
+  return ['22', '23'].find((sqlClass) => code?.startsWith(sqlClass));
 }
 
 /** The error a failed schema step throws, with the pg fields that locate it. */
 function schemaError(step: string, error: unknown): Error {
   const pgError = error as Partial<pg.DatabaseError>;
+  const valueClass = rowValueClass(pgError.code);
   const details = [
     pgError.code && `code ${pgError.code}`,
-    loggableDetail(pgError),
+    !valueClass && pgError.detail,
     pgError.hint,
     pgError.position && `at character ${pgError.position}`
   ]
     .filter(Boolean)
     .join('; ');
-  const message = error instanceof Error ? error.message : String(error);
+  const message = valueClass
+    ? `(value omitted, class ${valueClass})`
+    : error instanceof Error
+      ? error.message
+      : String(error);
   return new Error(`OAuth store schema ${step} failed: ${message}${details ? ` (${details})` : ''}`, {
     cause: error
   });
@@ -384,9 +392,10 @@ export function bootConnectionHints(error: unknown): string[] {
 }
 
 /**
- * The boot failure in one line. pg's own code and detail (loggableDetail) are
- * kept, and a Node 22 multi-address connect failure (an AggregateError with an
- * empty message) shows its inner errors.
+ * The boot failure in one line. pg's own code and detail are kept (not the
+ * message and detail of a rowValueClass error), and a Node 22 multi-address
+ * connect failure (an AggregateError with an empty message) shows its inner
+ * errors.
  */
 export function bootFailureMessage(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -395,7 +404,9 @@ export function bootFailureMessage(error: unknown): string {
       ? error.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)))
       : [];
   const pgError = error as Error & { code?: string; detail?: string };
-  return [error.message || inner.join('; '), pgError.code && `[${pgError.code}]`, loggableDetail(pgError)]
+  const valueClass = rowValueClass(pgError.code);
+  if (valueClass) return `(value omitted, class ${valueClass}) [${pgError.code}]`;
+  return [error.message || inner.join('; '), pgError.code && `[${pgError.code}]`, pgError.detail]
     .filter(Boolean)
     .join(' ');
 }
@@ -503,6 +514,18 @@ interface GrantRow {
 
 /** The pool, or one checked-out connection (inside a transaction). */
 type Queryable = Pick<pg.ClientBase, 'query'>;
+
+/** pg client errors with no code whose message names no host, logged as a fixed label. */
+const CODELESS_PG_ERROR_LABELS = new Map([
+  ['Query read timeout', 'query timeout'],
+  ['Connection terminated unexpectedly', 'connection terminated']
+]);
+
+/** A failed cleanup step's code; a code-less pg client error gets a safe label instead of `Error`. */
+function sweepFailureLabel(error: unknown): string {
+  const codeless = error instanceof Error && !(error as { code?: unknown }).code;
+  return (codeless && CODELESS_PG_ERROR_LABELS.get(error.message)) || errorCodeOf(error);
+}
 
 export class PgOAuthStore implements OAuthStore {
   /** Set by close(): a cleanup run stops before its next statement. */
@@ -1054,7 +1077,7 @@ export class PgOAuthStore implements OAuthStore {
       } catch (error) {
         // The code only: a pg message can name the database host and role. The
         // steps already run have committed, so their counts are still returned.
-        logError(`OAuth store cleanup: the ${step} step failed, retried within an hour: ${errorCodeOf(error)}`);
+        logError(`OAuth store cleanup: the ${step} step failed, retried within an hour: ${sweepFailureLabel(error)}`);
         break;
       }
     }

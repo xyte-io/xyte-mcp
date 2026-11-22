@@ -45,8 +45,12 @@ describe('migrate entry without a database', () => {
   it('is the entry the Procfile release line runs', () => {
     const procfile = readFileSync(path.resolve(import.meta.dirname, '..', '..', '..', 'Procfile'), 'utf8');
     // A Windows checkout has CRLF line ends and backslash paths.
-    const release = procfile.split(/\r?\n/).find((line) => line.startsWith('release:'));
+    const lines = procfile.split(/\r?\n/);
+    const release = lines.find((line) => line.startsWith('release:'));
+    const web = lines.find((line) => line.startsWith('web:'));
     expect(release).toMatch(/ node packages\/remote\/dist\/migrate\.js$/);
+    // The same CA default as the web line, so the two cannot drift.
+    expect(release).toBe(web?.replace(/^web:/, 'release:').replace('dist/index.js', 'dist/migrate.js'));
     expect(path.relative(path.resolve(import.meta.dirname, '..', '..', '..'), MIGRATE_ENTRY).split(path.sep).join('/')).toBe(
       'packages/remote/dist/migrate.js'
     );
@@ -64,6 +68,7 @@ describe('migrate entry without a database', () => {
     );
     expect(code).toBe(1);
     expect(stderr).toContain('[xyte-mcp] error: OAuth store migration failed:');
+    expect(stderr).toContain('/nonexistent');
     expect(stderr).not.toMatch(/^\s+at /m);
   });
 
@@ -126,6 +131,7 @@ describe.skipIf(!PG_URL)('migrate entry against Postgres', () => {
     expect(first.code, first.stderr).toBe(0);
     const { rows } = await schema.admin.query<{ n: number }>('SELECT count(*)::int AS n FROM oauth_schema_migrations');
     expect(rows[0]!.n).toBe(MIGRATIONS.length);
+    expect(first.stderr).toContain('OAuth store schema migrated to version');
 
     const second = await runMigrate(oauthEnv(schema.databaseUrl));
     expect(second.code, second.stderr).toBe(0);

@@ -147,9 +147,10 @@ tokens could not be saved, and the database refused the revoke too), and
 `rotated hub tokens lost at shutdown` (new tokens held in memory were never saved).
 
 Each server process holds up to 8 Postgres connections: 5 for requests and 3 for the refresh
-lock, plus 1 briefly at boot for the schema check; the release phase holds 1 while it runs.
-During a preboot or rolling deploy old and new dynos overlap, so the peak is about
-2 × dynos × 8 + 1. Check that against the Postgres plan's connection limit before scaling.
+lock; at boot it first holds 1 for the schema check, closed before the other 8 open. The release
+phase holds 1 while it runs. So the peak is dynos × 8 + 1 during the release (the old dynos hold
+theirs), and about 2 × dynos × 8 during a preboot or rolling deploy, while old and new dynos
+overlap. Check both against the Postgres plan's connection limit before scaling.
 
 ### Cleanup of old rows
 
@@ -167,9 +168,11 @@ doubled and a dyno may log nothing. A failed step writes `[xyte-mcp] error: OAut
 cleanup: the <pendingSignIns|tokens|grants|clients|rateLimitCounters> step failed, retried within
 an hour: <code>` and ends that run; the steps before it are kept and still logged in the
 `deleted` line, and the next run tries again. `<code>` is the error code, as in `healthz:
-token store check failed: <code>`; a plain `Error` is usually a pg timeout (query or
-connect, 10 s). A query timeout stops only the wait: the delete may still finish in
-Postgres, so the next run's counts are lower.
+token store check failed: <code>`, except that `query timeout` (pg's query timeout, 10 s) and
+`connection terminated` (a dropped connection) stand for pg errors with no code; a plain `Error`
+is usually a connect timeout (10 s). A query timeout stops only the wait: the delete may still
+finish in Postgres, so the next run's counts are lower. A run that fails outside the steps writes
+`[xyte-mcp] error: OAuth store cleanup failed, retried within an hour: <reason>`.
 
 A returning user can hit this: when all connections of a client were revoked (a disconnect,
 or [the 90-day end](#the-90-day-end)) or abandoned (no token left and signed in more than 97
@@ -189,23 +192,31 @@ reaches it together, 90 days later.
 
 ## A failed release
 
-On an OAuth app (`XYTE_MCP_ISSUER_URL` set) with `DATABASE_URL`, the Procfile's release phase
-applies the schema migrations once per release (and Heroku runs it again on a config-var change
-you make and on a rollback, not on an add-on's own config-var change such as a Postgres
-credential rotation of `DATABASE_URL`); otherwise it logs `nothing to migrate` and passes. It first resolves the HTTP config
-as a web dyno's boot does; it does not check the token key against the stored hub tokens, so a
+The Procfile's release phase runs on every release (and Heroku runs it again on a config-var
+change you make and on a rollback, not on an add-on's own config-var change such as a Postgres
+credential rotation of `DATABASE_URL`). On every app it first resolves the HTTP config as a web
+dyno's boot does, so a config error fails the release even without OAuth or a database. Then,
+when the app is not in OAuth mode (`XYTE_MCP_ISSUER_URL` unset) or has no `DATABASE_URL`, it
+logs `nothing to migrate` and passes; otherwise it applies the schema migrations once per
+release. It does not check the token key against the stored hub tokens, so a
 key the live connections were not written with passes the release and is refused only at boot
-(see the README's key rotation steps). When it fails, the release log
+(see [key rotation](../../README.md#security-notes)). When it fails, the release log
 (`heroku releases:output <version> -a <app>`) ends with `[xyte-mcp] error: OAuth store
 migration failed: <reason>`, or with the config error,
 possibly followed by hints, and `heroku releases -a <app>` shows that release as failed. No new
 dyno starts: the old build keeps serving, and the database is unchanged (a config error stops
-the release before any migration; all pending migrations run in one transaction).
+the release before any migration; all pending migrations run in one transaction). A SQL or
+migration failure shows the inner `OAuth store schema migration N (<name>) failed:` (or
+`OAuth store schema lock/version check failed:`) after the outer `OAuth store migration
+failed:`; a connect or TLS failure has the outer prefix only.
 
-- A config error (any `[xyte-mcp] error:` without `OAuth store migration failed`): fix the
-  config var it names, which starts a new release.
+- A config error (any `[xyte-mcp] error:` without `OAuth store migration failed`, other than a
+  `postgres migration pool:` line, which is a connection error): fix the config var it names,
+  which starts a new release.
 - A certificate or TLS config error (with hints): fix the config var it names (`DATABASE_URL`,
   `NODE_EXTRA_CA_CERTS`, `PGSSLMODE`), which starts a new release.
+- `28P01` (bad password), `3D000` (no such database) or `Invalid URL` (a malformed DSN) on an
+  `OAuth store migration failed` line: fix `DATABASE_URL`; a retry does not help.
 - The database down, a failover or a connect timeout (a connection error names no config
   var): wait until the database is reachable, then run the release again
   (`heroku releases:retry -a <app>`).
@@ -214,7 +225,12 @@ the release before any migration; all pending migrations run in one transaction)
 - `… which this build … does not know and which breaks rollback`: a rollback or an older build
   against a newer breaking schema. Release a build at that version or later instead. This
   stop covers only builds with the release phase: a rollback to an earlier build restarts the
-  dynos, which then refuse to boot, so never roll back past a breaking migration.
+  dynos, which then refuse to boot in a crash loop. To stop it, roll forward: deploy (or roll
+  back to) a build at or above the schema version. A build from before schema versioning does
+  not check at all and runs against the newer schema. So never roll back past a breaking
+  migration.
+- Code `57P01` (admin shutdown), an `08…` code, or a code-less `Connection terminated
+  unexpectedly` on a migration line: the connection dropped (a failover); retry the release.
 - Code `55P03` (lock timeout: another run, or a running query, holds the lock) on the
   lock/version check or a migration line: retry the release. Only other database codes on a
   migration line mean the migration needs fixing, in a new build.
@@ -232,7 +248,7 @@ it from production data**.
 | 5xx rate | Router lines with `status>=500` (this includes our own `500` and `503` answers) | More than 5% of requests over 5 minutes, with at least 20 requests |
 | Hub refresh failures | `hub_refresh` with `outcome` other than `ok` | More than 5 in 15 minutes. Expect it to fire 90 days after a busy sign-in day ([the 90-day end](#the-90-day-end)). |
 | Revoke spike | `revoke` events, counted by `reason` | More than 10 with a reason other than `client` in 1 hour. Expect it to fire 90 days after a busy sign-in day ([the 90-day end](#the-90-day-end)). |
-| Cleanup failures | `OAuth store cleanup: the <step> step failed` | The same step in 3 consecutive hourly runs on a dyno. The `deleted` line after a partial run still looks normal. |
+| Cleanup failures | `OAuth store cleanup: the <step> step failed` or `OAuth store cleanup failed` | The same failure in 3 consecutive hourly runs on a dyno. The `deleted` line after a partial run still looks normal. |
 | Rate-limit hits | Router lines with `status=429` (the limits on `/register`, `/token`, `/revoke`, `/authorize`), plus `hub_refresh` with `outcome=rate_limited`, plus `tool_call` with `status=429` | More than 10 in 15 minutes |
 
 ### Where to look first
@@ -244,11 +260,15 @@ it from production data**.
 - **Server down, boot stopped on the token key:** a missing or invalid `XYTE_MCP_TOKEN_KEY`,
   or `live grants use hub token key id(s) …` (a live connection uses a key the server has
   neither as `XYTE_MCP_TOKEN_KEY` nor as `XYTE_MCP_TOKEN_KEY_PREVIOUS`). See the key, rotation
-  and lost-key notes under [Security notes](../../README.md#security-notes).
+  and lost-key notes under [Security notes](../../README.md#security-notes). On Heroku a
+  missing or invalid `XYTE_MCP_TOKEN_KEY` now fails the release instead (see `heroku
+  releases:output`), and the old build keeps serving.
 - **Server down, boot stopped on `DATABASE_URL`:** `XYTE_MCP_ISSUER_URL is not local, so
   DATABASE_URL is required: without it OAuth state is held in memory, lost on every restart
   and not shared between instances.` The Postgres add-on or its config var is missing: set
-  `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`.
+  `DATABASE_URL` and `XYTE_MCP_TOKEN_KEY`. A release without `DATABASE_URL` fails on Heroku
+  instead; removing the Postgres add-on is an add-on config change that skips the release
+  phase, so that path still ends here, at boot.
 - **5xx rate:** the router `code=` (`H10` crashed, `H12` timeout, `H80` maintenance mode) and
   the `[xyte-mcp] error:` lines at the same time. `token check failed` means the database.
   So does `rate limit check failed: <code>` (a `503` on `/mcp`: the per-connection rate

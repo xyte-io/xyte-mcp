@@ -380,6 +380,7 @@ the boundary.
 
 ```bash
 npm install
+npm run build     # install no longer builds; needed before any single-workspace command
 npm run typecheck
 npm test          # builds, then runs unit + protocol tests of both packages
 npm run lint

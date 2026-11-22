@@ -14,6 +14,7 @@ import {
   type PendingSignIn
 } from '../src/oauth/store.js';
 import { TokenCipher } from '../src/oauth/token-cipher.js';
+import { lockWaiters } from './support/two-process.js';
 
 /**
  * The store guarantees the provider relies on, run against both stores: always
@@ -79,7 +80,7 @@ if (PG_URL) {
   harnesses.push([
     'postgres',
     async () => {
-      const store = await PgOAuthStore.connect(PG_URL, new TokenCipher(KEY_A));
+      const store = await PgOAuthStore.connect(PG_URL, new TokenCipher(KEY_A), 15_000);
       const admin = new pg.Pool({ connectionString: PG_URL, max: 1 });
       return {
         store,
@@ -313,6 +314,53 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
     });
   });
 
+  // The hub refresh single-flight across processes: one holder per grant, each
+  // reading what the previous holder saved.
+  it('runs grant lock holders one at a time, each reading the last one\'s save under the lock', async () => {
+    const id = await store().createGrant('c1', signIn());
+    const other = await store().createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    const order: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+
+    const first = store().withGrantLock(id, async (locked) => {
+      order.push('first');
+      expect(await locked.rotate('xort_1', next)).toBe(true);
+      await held;
+    });
+    await vi.waitFor(() => expect(order).toEqual(['first']));
+    const second = store().withGrantLock(id, async (locked) => {
+      order.push('second');
+      return locked.grant?.hub?.refreshToken;
+    });
+    // Another grant is not queued behind this one.
+    expect(await store().withGrantLock(other, async (locked) => locked.grant?.id)).toBe(other);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(order).toEqual(['first']);
+
+    release();
+    await first;
+    expect(await second).toBe('xort_2');
+    expect(order).toEqual(['first', 'second']);
+  });
+
+  it('frees the grant lock when the holder throws, and revokes through it', async () => {
+    const id = await store().createGrant('c1', signIn());
+    await expect(
+      store().withGrantLock(id, async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    await store().withGrantLock(id, (locked) => locked.revoke());
+    expect(await store().withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    expect(await store().withGrantLock('999999', async (locked) => locked.grant)).toBeUndefined();
+  });
+
   describe('sweepExpiredOAuthRows', () => {
     const DAY = 24 * 60 * 60;
     const client = (id: string) =>
@@ -507,7 +555,7 @@ describe.each(harnesses)('OAuthStore contract: %s', (_name, make) => {
 // role), and the steps after it are not issued.
 describe.skipIf(!PG_URL)('PgOAuthStore: a failing cleanup step', () => {
   it('throws "the <step> step failed: <code>" with the cause, and issues no later step', async () => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     const pool = (store as unknown as { pool: pg.Pool }).pool;
     const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
     const issued: string[] = [];
@@ -547,10 +595,33 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
     await admin.end();
   });
 
+  // A grant held by a hub refresh (the grant lock) is skipped, not waited on: with
+  // the main pool's 9 s lock_timeout the step would fail and skip the clients step.
+  it('skips a grant held by the grant lock, and still deletes the rest and runs the clients step', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const held = await store.createGrant('c1', signIn());
+    const free = await store.createGrant('c1', signIn());
+    await store.revokeGrant(held);
+    await store.revokeGrant(free);
+    await store.saveClient({ client_id: 'unused', redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
+    const holder = await admin.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [held]);
+      const started = Date.now();
+      expect(await store.sweepExpiredOAuthRows(NOW() + 365 * 24 * 60 * 60)).toEqual({ tokens: 0, grants: 1, clients: 1, pendingSignIns: 0 });
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await store.close();
+    }
+  });
+
   // Every dyno runs its own cleanup: a concurrent run deletes nothing the other one did.
   it('two concurrent runs on two pools delete each row once between them', async () => {
-    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
-    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const a = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const b = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     try {
       for (let i = 0; i < 3; i += 1) {
         await a.saveClient({ client_id: `c${i}`, redirect_uris: ['https://a/cb'] } as OAuthClientInformationFull);
@@ -574,7 +645,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: cleanup runs and shutdown', () => {
 
   // Else the next step would query an ended pool and the run would fail at shutdown.
   it('close() during a run lets the step in flight finish and issues no later step', async () => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
     const pool = (store as unknown as { pool: pg.Pool }).pool;
     const query = pool.query.bind(pool) as (sql: string, values?: unknown[]) => Promise<unknown>;
     const issued: string[] = [];
@@ -605,7 +676,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   let admin: pg.Pool;
   const stores: PgOAuthStore[] = [];
   const open = async (current: Buffer, previous?: Buffer) => {
-    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(current, previous));
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(current, previous), 15_000);
     stores.push(store);
     return store;
   };
@@ -811,6 +882,150 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
     expect(await store.hasLiveHubSibling('user-1', 'org-1', next)).toBe(false);
   });
 
+  // getGrant's revoke runs on the main pool and would wait on the row the lock holds.
+  it('revokes an unreadable grant read under the grant lock on the locked connection', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    expect(await store.withGrantLock(id, async (locked) => locked.grant)).toEqual({
+      id,
+      clientId: 'c1',
+      revoked: true
+    });
+    vi.restoreAllMocks();
+    expect(logText()).toContain('"reason":"unreadable_token"');
+    expect((await row(id)).hub_refresh_token).toBeNull();
+  });
+
+  // A token INSERT takes FOR KEY SHARE on its grant (the foreign key): a /token
+  // exchange during a hub refresh must not wait for the refresh.
+  it('saves a token for a grant while another holds that grant\'s lock', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    let release!: () => void;
+    let locked!: () => void;
+    const inside = new Promise<void>((resolve) => (locked = resolve));
+    const holder = store.withGrantLock(id, () => {
+      locked();
+      return new Promise<void>((resolve) => (release = resolve));
+    });
+    await inside;
+    try {
+      const saved = store.saveToken({ token: 'during', kind: 'access', grantId: id, expiresAt: NOW() + 600 });
+      const outcome = await Promise.race([
+        saved.then(() => 'saved'),
+        new Promise((resolve) => setTimeout(() => resolve('blocked'), 2_000))
+      ]);
+      expect(outcome).toBe('saved');
+    } finally {
+      release();
+      await holder;
+    }
+  });
+
+  // Without a client timeout, a statement on a half-open connection hangs for
+  // minutes, and the refresh flight with every call joined to it.
+  it('bounds each grant lock statement client-side above the lock wait, with TCP keepalive', async () => {
+    const store = await open(KEY_A);
+    const { options } = (store as unknown as { lockPool: pg.Pool & { options: Record<string, unknown> } }).lockPool;
+    expect(options).toMatchObject({ query_timeout: 25_000, keepAlive: true });
+  });
+
+  // The revoke of an unreadable grant read under the lock commits with the lock:
+  // rolled back, it did not happen, so it must not be logged.
+  it('logs the unreadable-token revoke under the grant lock only once it has committed', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    await admin.query(
+      `UPDATE oauth_grants SET hub_access_token = 'xoat_plain', hub_refresh_token = 'xort_plain' WHERE id = $1`,
+      [id]
+    );
+    const logText = captureLog();
+    await expect(
+      store.withGrantLock(id, async () => {
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    vi.restoreAllMocks();
+    expect(logText()).not.toContain('"event":"revoke"');
+    expect((await row(id)).hub_refresh_token).toBe('xort_plain'); // rolled back
+  });
+
+  // close() between the closing check and the checkout: the pool is already ended.
+  it('answers a grant lock attempt that meets an ended pool as restarting', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const id = await store.createGrant('c1', signIn());
+    const lockPool = (store as unknown as { lockPool: pg.Pool }).lockPool;
+    const connect = lockPool.connect.bind(lockPool) as () => Promise<pg.PoolClient>;
+    vi.spyOn(lockPool, 'connect').mockImplementationOnce((async () => {
+      await store.close();
+      return connect();
+    }) as never);
+    await expect(store.withGrantLock(id, async () => undefined)).rejects.toMatchObject({
+      kind: 'network',
+      message: 'The server is restarting.'
+    });
+    vi.restoreAllMocks();
+  });
+
+  // Shutdown: a waiter queued on another process's lock sends nothing, so it must
+  // not hold close() until its lock_timeout.
+  it('close() does not wait for a grant lock waiter, and refuses new lock attempts', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 15_000);
+    const id = await store.createGrant('c1', signIn());
+    const holder = await admin.connect();
+    await holder.query('BEGIN');
+    await holder.query('SELECT 1 FROM oauth_grants WHERE id = $1 FOR NO KEY UPDATE', [id]);
+    const waiter = store.withGrantLock(id, async () => undefined).catch(() => undefined);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    try {
+      await vi.waitFor(async () => expect(await lockWaiters(pool)).toBe(1), { timeout: 5_000 });
+      const started = Date.now();
+      await store.close();
+      expect(Date.now() - started).toBeLessThan(5_000);
+      await expect(store.withGrantLock(id, async () => undefined)).rejects.toMatchObject({
+        kind: 'network',
+        message: 'The server is restarting.'
+      });
+    } finally {
+      await holder.query('ROLLBACK');
+      holder.release();
+      await waiter;
+    }
+  });
+
+  // Server-side, under the pool's 10 s query_timeout: a statement the client gave
+  // up on must not wait on, then apply, an UPDATE later.
+  it('bounds the main pool\'s lock waits server-side below its query timeout', async () => {
+    const store = await open(KEY_A);
+    const pool = (store as unknown as { pool: pg.Pool }).pool;
+    expect((await pool.query<{ lock_timeout: string }>('SHOW lock_timeout')).rows[0]!.lock_timeout).toBe('9s');
+  });
+
+  it('clamps an out-of-range hub timeout, so the grant lock still sets valid limits', async () => {
+    const store = await PgOAuthStore.connect(PG_URL!, new TokenCipher(KEY_A), 1e21);
+    stores.push(store);
+    const id = await store.createGrant('c1', signIn());
+    expect(await store.withGrantLock(id, async (locked) => locked.grant?.id)).toBe(id);
+  });
+
+  it('rolls back what the grant lock holder wrote when it throws', async () => {
+    const store = await open(KEY_A);
+    const id = await store.createGrant('c1', signIn());
+    const next = { accessToken: 'xoat_2', refreshToken: 'xort_2', expiresAt: NOW() + 7200 };
+    await expect(
+      store.withGrantLock(id, async (locked) => {
+        await locked.rotate('xort_1', next);
+        throw new Error('boom');
+      })
+    ).rejects.toThrow('boom');
+    expect((await row(id)).hub_refresh_token_hash).toBe(hashToken('xort_1'));
+  });
+
   // An old dyno still serving during the deploy writes plain text.
   it('revokes a plaintext row on read, without logging the token', async () => {
     const store = await open(KEY_A);
@@ -854,7 +1069,7 @@ describe.skipIf(!PG_URL)('PgOAuthStore: hub tokens at rest', () => {
   // Only a TokenDecryptError means "unreadable": any other failure is a bug, not a reason to sign out.
   it('rejects, and revokes nothing, when decrypting fails with a plain error', async () => {
     const cipher = new TokenCipher(KEY_A);
-    const store = await PgOAuthStore.connect(PG_URL!, cipher);
+    const store = await PgOAuthStore.connect(PG_URL!, cipher, 15_000);
     stores.push(store);
     const id = await store.createGrant('c1', signIn());
     vi.spyOn(cipher, 'decrypt').mockImplementation(() => {

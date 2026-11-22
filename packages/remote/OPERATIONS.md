@@ -88,8 +88,8 @@ argument. A field without a value is left out.
 | --- | --- | --- |
 | `tool_call` | Every tool call that reaches a tool handler (calls the MCP library rejects first, for an unknown tool or invalid arguments, are not logged) | `connection`, `organization` (hub tenant id), `user` (hub user id) — OAuth mode only; `tool`; `endpoint` (catalog key of the hub request); `status` (final hub HTTP status; absent when there was no hub call, no answer, or a failed hub token refresh — see below); `outcome` (`ok` or `error`; a tool that throws is `error`); `duration_ms` |
 | `sign_in` | The end of a sign-in | `outcome`: `ok` (with `connection`, `organization`, `user`), `denied` (the user said no on our consent page or at the hub), `failed` (with `reason`, below); `client` (the registered client id) on `denied` and `failed` when the sign-in got far enough to know it |
-| `hub_refresh` | The server refreshes a hub token | `connection`, `organization`, `user`; `outcome`: `ok`, `rate_limited` (hub `429`, the connection is kept), `rejected` (other hub `4xx`, the connection is kept), `invalid_grant` (the hub chain is dead), `already_rotated` (hub said `invalid_grant` because another request rotated the token first; the connection is kept), `unknown` (timeout, network error, hub `5xx` or an unreadable answer: the connection ends); `hub_status` when known |
-| `revoke` | A connection ends | `connection`, `organization`, `user`; `reason`: `client` (the user disconnected), `invalid_grant` (the hub chain is dead), `refresh_unknown` (the refresh outcome was unknown), `unreadable_token` (its stored hub tokens could not be decrypted on read: an unknown key, a tampered or plain-text value). Not written for the operator's SQL cut-off, nor by a hub refresh that finds the connection already ended, nor per connection by the boot sweep of plain-text or malformed tokens (one `[xyte-mcp]` line with their count) or by schema version 2's one-time sign-out of every connection |
+| `hub_refresh` | The server refreshes a hub token | `connection`, `organization`, `user`; `outcome`: `ok`, `rate_limited` (hub `429`, the connection is kept), `rejected` (other hub `4xx`, the connection is kept), `invalid_grant` (the hub chain is dead), `unknown` (timeout, network error, hub `5xx` or an unreadable answer: the connection ends); `hub_status` when known |
+| `revoke` | A connection ends | `connection`, `organization`, `user`; `reason`: `client` (the user disconnected), `invalid_grant` (the hub chain is dead), `refresh_unknown` (the refresh outcome was unknown), `hub_save_failed` (the hub refresh worked but the new tokens could not be saved, after retries: the connection is revoked rather than left holding the old, now used token), `unreadable_token` (its stored hub tokens could not be decrypted on read: an unknown key, a tampered or plain-text value). Not written for the operator's SQL cut-off, nor by a hub refresh that finds the connection already ended, nor per connection by the boot sweep of plain-text or malformed tokens (one `[xyte-mcp]` line with their count) or by schema version 2's one-time sign-out of every connection |
 
 `sign_in` `failed` reasons:
 
@@ -108,7 +108,40 @@ argument. A field without a value is left out.
 
 When the hub rejects a tool call's token and the token refresh that follows fails, the
 `tool_call` line has `outcome` `error` and no `status`. The reason is on the `hub_refresh` line
-of the same `connection` just before it.
+of the same `connection` just before it; if there is none, look for that grant's
+`grant lock transaction failed for a hub refresh` line (below).
+
+One connection's hub refresh runs once at a time across all server processes (a Postgres row
+lock); a revoke of the connection waits for it too. A call that waits longer than the hub
+timeout plus 5 s (20 s by default) for the lock fails with a retryable error ("This Xyte
+sign-in is busy") and an `[xyte-mcp] error: grant <id>: grant lock transaction failed for a
+hub refresh (<code>)` line (`55P03` for the lock wait; another code when the lock's database
+transaction failed some other way); nothing was sent to the hub, and the connection is kept.
+When all 3 lock connections of the process are busy, the call first waits up to 10 s for one,
+so the worst case is about the hub timeout plus 15 s; a failed wait for a connection shows the
+code literally as `Error`. A disconnect that cannot get the lock in that time answers `500`,
+with an `[xyte-mcp] error: grant <id>: grant lock transaction failed for a revoke (<code>)`
+line; the connection is not revoked, and the client may retry. During shutdown a disconnect
+answers `400` `temporarily_unavailable`, with no log line.
+
+Saving the new tokens after a hub refresh is retried while the lock is held, and if every try
+fails the connection is revoked under the same lock (`hub_save_failed`). Only when the lock's
+own database connection or its commit fails is the lock released before the tokens are safe:
+the save is then retried outside it, and another process may meanwhile send the stored,
+already used token and end that connection. If the database is fully down, so that neither
+saving the new tokens nor revoking the connection works, the new tokens live only in that
+process's memory (an `[xyte-mcp] error: ERROR grant <id>: could not save rotated hub tokens`
+line) until a later refresh saves them; a restart before the save loses them.
+
+Two more `[xyte-mcp] error: ERROR grant <id>:` lines mean the stored token may be one hub has
+already used, so that connection may end on its next refresh:
+`could not revoke the grant after a failed hub refresh` (the hub refresh failed or its new
+tokens could not be saved, and the database refused the revoke too), and
+`rotated hub tokens lost at shutdown` (new tokens held in memory were never saved).
+
+Each server process holds up to 8 Postgres connections: 5 for requests and 3 for the refresh
+lock, plus one more briefly at boot for the schema migration. Size the Postgres plan's
+connection limit for that many per process before running more than one.
 
 ### Cleanup of old rows
 
@@ -153,7 +186,7 @@ it from production data**.
 | --- | --- | --- |
 | Server down | Uptime check on `GET /healthz` | Fails 2 checks in a row. Timeout about 25 s: with a hung database the check can take up to 20 s (connect + query timeout, 10 s each) before it answers `503`. Probes share one database check and reuse its answer for 2 s. |
 | 5xx rate | Router lines with `status>=500` (this includes our own `500` and `503` answers) | More than 5% of requests over 5 minutes, with at least 20 requests |
-| Hub refresh failures | `hub_refresh` with `outcome` other than `ok` or `already_rotated` | More than 5 in 15 minutes. Expect it to fire 90 days after a busy sign-in day ([the 90-day end](#the-90-day-end)). |
+| Hub refresh failures | `hub_refresh` with `outcome` other than `ok` | More than 5 in 15 minutes. Expect it to fire 90 days after a busy sign-in day ([the 90-day end](#the-90-day-end)). |
 | Revoke spike | `revoke` events, counted by `reason` | More than 10 with a reason other than `client` in 1 hour. Expect it to fire 90 days after a busy sign-in day ([the 90-day end](#the-90-day-end)). |
 | Rate-limit hits | Router lines with `status=429` (the limits on `/register`, `/token`, `/revoke`, `/authorize`), plus `hub_refresh` with `outcome=rate_limited`, plus `tool_call` with `status=429` | More than 10 in 15 minutes |
 
@@ -179,7 +212,8 @@ it from production data**.
 - **Revoke spike:** the `reason`. First rule out [the 90-day end](#the-90-day-end):
   `invalid_grant` on connections whose sign-in was about 90 days ago (find it on their
   `sign_in` `ok` line). Otherwise `invalid_grant` for many users at once often means a change
-  at the hub (for example the OAuth app was disabled there).
+  at the hub (for example the OAuth app was disabled there). `hub_save_failed` means database
+  trouble: the new hub tokens could not be saved, so look at the database first.
 - **Rate-limit hits:** which source. Router `429` on `/token` or `/register` from one IP is
   usually a client's backend. A hub `429` (`tool_call` `status=429` or `hub_refresh`
   `rate_limited`) usually means the hub's limit for this server's address, which every

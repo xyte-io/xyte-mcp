@@ -72,6 +72,15 @@ export const ABANDONED_GRANT_RETENTION_SECONDS = 97 * 24 * 60 * 60;
  */
 export const UNUSED_CLIENT_RETENTION_SECONDS = 30 * 24 * 60 * 60;
 
+/** A grant as read under its lock, and the writes that commit with the lock's release. */
+export interface LockedGrant {
+  grant: GrantRecord | undefined;
+  /** rotateHubTokens, inside the lock. */
+  rotate(previousRefreshToken: string, next: HubTokens): Promise<boolean>;
+  /** revokeGrant, inside the lock. */
+  revoke(): Promise<void>;
+}
+
 /** Rows one cleanup run deleted, per table. */
 export interface DeletedOAuthRowCounts {
   tokens: number;
@@ -111,8 +120,12 @@ export interface OAuthStore {
 
   createGrant(clientId: string, hub: HubSignIn): Promise<string>;
   getGrant(grantId: string): Promise<GrantRecord | undefined>;
-  /** Also drops the grant's hub tokens: nothing may use them after this. */
-  revokeGrant(grantId: string): Promise<void>;
+  /**
+   * Also drops the grant's hub tokens: nothing may use them after this. With
+   * `onlyIfRefreshToken`, only while the grant still holds that hub refresh
+   * token. True when this call revoked it.
+   */
+  revokeGrant(grantId: string, onlyIfRefreshToken?: string): Promise<boolean>;
   /**
    * Store a rotated hub token pair — only if the grant still holds
    * `previousRefreshToken`. False means someone else rotated first.
@@ -127,6 +140,16 @@ export interface OAuthStore {
    * revoked, and holding an unexpired access or refresh token.
    */
   hasLiveHubSibling(sub: string, tenantId: string, exceptGrantId: string): Promise<boolean>;
+  /**
+   * Runs `fn` holding the grant's lock, across every process on the store: the
+   * hub refresh and the revoke of one grant take turns, so a single-use hub
+   * refresh token is never sent twice. `fn` gets the grant read under the lock.
+   * Postgres only: its writes and the release are one commit, and a throw rolls
+   * them back (the memory store keeps what `fn` wrote before throwing). Inside
+   * `fn`, read and write the grant only through `locked`:
+   * getGrant or revokeGrant there would wait on the lock `fn` holds.
+   */
+  withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T>;
 
   saveToken(token: NewToken): Promise<void>;
   getToken(token: string, kind: TokenKind): Promise<TokenRecord | undefined>;
@@ -193,6 +216,8 @@ export class MemoryOAuthStore implements OAuthStore {
   private readonly grantRevokedAt = new Map<string, number>();
   private readonly tokens = new Map<string, TokenRecord>();
   private readonly pendingSignIns = new Map<string, PendingSignIn>();
+  /** Per grant, the tail of its lock holders' queue. */
+  private readonly grantLocks = new Map<string, Promise<unknown>>();
   private nextGrantId = 1;
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
@@ -219,13 +244,14 @@ export class MemoryOAuthStore implements OAuthStore {
     return grant && { ...grant };
   }
 
-  async revokeGrant(grantId: string): Promise<void> {
+  async revokeGrant(grantId: string, onlyIfRefreshToken?: string): Promise<boolean> {
     const grant = this.grants.get(grantId);
-    if (grant && !grant.revoked) {
-      this.grantRevokedAt.set(grantId, Math.floor(Date.now() / 1000));
-      grant.revoked = true;
-      delete grant.hub;
-    }
+    if (!grant || grant.revoked) return false;
+    if (onlyIfRefreshToken !== undefined && grant.hub?.refreshToken !== onlyIfRefreshToken) return false;
+    this.grantRevokedAt.set(grantId, Math.floor(Date.now() / 1000));
+    grant.revoked = true;
+    delete grant.hub;
+    return true;
   }
 
   async rotateHubTokens(
@@ -254,6 +280,25 @@ export class MemoryOAuthStore implements OAuthStore {
         grant.hub?.sub === sub &&
         grant.hub.tenantId === tenantId
     );
+  }
+
+  /** One process: a per-grant queue. No rollback, so a throw keeps what `fn` wrote. */
+  async withGrantLock<T>(grantId: string, fn: (locked: LockedGrant) => Promise<T>): Promise<T> {
+    const run = (this.grantLocks.get(grantId) ?? Promise.resolve()).then(async () =>
+      fn({
+        grant: await this.getGrant(grantId),
+        rotate: (previous, next) => this.rotateHubTokens(grantId, previous, next),
+        revoke: async () => {
+          await this.revokeGrant(grantId);
+        }
+      })
+    );
+    const tail = run.catch(() => undefined);
+    this.grantLocks.set(grantId, tail);
+    void tail.then(() => {
+      if (this.grantLocks.get(grantId) === tail) this.grantLocks.delete(grantId);
+    });
+    return run;
   }
 
   async saveToken({ token, ...record }: NewToken): Promise<void> {

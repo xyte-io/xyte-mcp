@@ -230,6 +230,25 @@
       "sourceFile": "Organization API/Devices/Get Device.bru"
     },
     {
+      "key": "organization.devices.getDeviceDetailsHistory",
+      "namespace": "organization",
+      "group": "devices",
+      "action": "getDeviceDetailsHistory",
+      "title": "Get Device Details History",
+      "description": "## Success\n**200 OK** — the device's current `details` and its earlier values, newest first.\n\nHistory starts at the later of the endpoint's release and the device's claim by your organization; earlier changes are not available, so a newly claimed device starts with empty history. Some frequently changing fields, set per device model, are not tracked: a change to only those fields adds no history entry and does not update `since`.\n```json\n{\n  \"current\": {\n    \"details\": { \"firmware\": \"3.0\" },\n    \"since\": \"2026-11-15T12:00:00.000Z\"\n  },\n  \"history\": [\n    {\n      \"details\": { \"firmware\": \"2.0\" },\n      \"valid_from\": \"2026-11-14T12:00:00.000Z\",\n      \"valid_until\": \"2026-11-15T12:00:00.000Z\",\n      \"slot\": \"latest\"\n    },\n    {\n      \"details\": { \"firmware\": \"1.0\" },\n      \"valid_from\": null,\n      \"valid_until\": \"2026-10-07T12:00:00.000Z\",\n      \"slot\": \"month\"\n    }\n  ]\n}\n```\n- `current.since` — when the current details replaced the previous value; `null` when no change has been recorded.\n- `history` — the last 5 recorded changes (`slot: \"latest\"`), plus at most one older value that was at least a week old (`week`) and one at least 30 days old (`month`) when the details last changed. Entries can have gaps between them, so read each entry's `valid_from` and `valid_until`. Empty when no change has been recorded.\n- `valid_from` / `valid_until` — when that value was in effect; `valid_from` is `null` when it is not known.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header, or the device does not exist or does not belong to the organization.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/devices/:device_id/details",
+      "pathParams": [
+        "device_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Devices/Get Device Details History.bru"
+    },
+    {
       "key": "organization.devices.getDevices",
       "namespace": "organization",
       "group": "devices",

@@ -15,6 +15,7 @@ import {
 } from '@xyteai/mcp/config.js';
 import { createToolContext, type ToolContext } from '@xyteai/mcp/context.js';
 import { createHttpClient } from '@xyteai/mcp/http/client.js';
+import { withRateBucketSecret } from '../hub-fetch.js';
 import { createHubOAuth } from '../oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
@@ -92,14 +93,15 @@ const HEALTH_CHECK_REUSE_MS = 2_000;
 const OAUTH_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Promise<Server> {
-  const { staticToken, oauth, port } = resolveHttpConfig(env);
+  const { staticToken, oauth, rateBucketSecret, port } = resolveHttpConfig(env);
   // OAuth requests carry their own hub token, so only the static-bearer
   // mode needs a process-level API key (resolveHttpConfig enforces that pair).
   const config = resolveConfig(env, { requireCredentials: !oauth, writesByDefault: false });
 
+  const hubFetch = withRateBucketSecret(config.baseUrls.hub, rateBucketSecret);
   // One HTTP client for every context: it holds the keep-alive pool and no
-  // credentials, so sharing it across identities is safe and cheap.
-  const upstream = createHttpClient({ timeoutMs: config.timeoutMs });
+  // user credentials, so sharing it across identities is safe and cheap.
+  const upstream = createHttpClient({ timeoutMs: config.timeoutMs, fetchImpl: hubFetch });
   const staticContext = staticToken
     ? withSecret(createToolContext(config, upstream), staticToken)
     : undefined;
@@ -170,7 +172,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         clientId: oauth.hubClient.id,
         clientSecret: oauth.hubClient.secret,
         redirectUri: `${oauth.issuerUrl}${CALLBACK_PATH}`,
-        timeoutMs: config.timeoutMs
+        timeoutMs: config.timeoutMs,
+        fetchImpl: hubFetch
       }),
       oauth.issuerUrl
     );
@@ -446,6 +449,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   if (config.baseUrls.hub !== DEFAULT_HUB_URL) {
     log(`hub base URL overridden: ${config.baseUrls.hub}`);
   }
+  // Set or not, never the value: the runbook's hub 429 checks start here.
+  log(`hub rate bucket secret: ${rateBucketSecret ? 'set' : 'not set'}`);
   if (config.allowWrites) {
     // Worth shouting about even when asked for: on stdio the blast radius is
     // one laptop, here it is whoever holds a token.

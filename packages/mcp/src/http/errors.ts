@@ -19,6 +19,9 @@ export type ErrorKind =
 export const APPLICATION_PAUSED_HINT =
   'This connection is temporarily paused. You are still signed in, so there is no need to reconnect. Try again later.';
 
+/** Hub answered 429; the hosted server and stdio both pass it on without a retry. */
+export const RATE_LIMITED_HINT = 'The Xyte API rate limit was reached. Wait a minute, then try again.';
+
 export class XyteError extends Error {
   constructor(
     readonly kind: ErrorKind,

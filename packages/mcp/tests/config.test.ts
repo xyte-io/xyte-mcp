@@ -136,6 +136,38 @@ describe('resolveHttpConfig', () => {
     expect(resolveHttpConfig(staticEnv).port).toBe(DEFAULT_HTTP_PORT);
   });
 
+  it('reads the rate bucket secret trimmed, and leaves it out when blank', () => {
+    expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: '  s3cret!~  ' }).rateBucketSecret).toBe(
+      's3cret!~'
+    );
+    for (const padded of ['secret\n', '\r\nsecret\r\n']) {
+      expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: padded }).rateBucketSecret).toBe('secret');
+    }
+    for (const blank of [undefined, '', '   ']) {
+      expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: blank })).not.toHaveProperty(
+        'rateBucketSecret'
+      );
+    }
+  });
+
+  // fetch's own "invalid header value" error would echo the value into a tool result,
+  // and here a bad value fails the release phase too.
+  it.each(['leaky-secret\nx', 'leaky-secret é', 'leaky secret', 'leaky\tsecret'])(
+    'refuses a rate bucket secret that is not visible ASCII (%j), without naming the value',
+    (secret) => {
+      let error: unknown;
+      try {
+        resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: secret });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(XyteError);
+      expect((error as XyteError).kind).toBe('config');
+      expect((error as XyteError).message).toContain(ENV.rateBucketSecret);
+      expect(JSON.stringify([(error as XyteError).message, (error as XyteError).hints])).not.toContain('leaky');
+    }
+  );
+
   // Serving with auth disabled would publish a live API key to anyone with the
   // URL, so missing auth must stop the boot rather than widen the server.
   it('refuses a config with no auth at all, naming both options', () => {

@@ -21,6 +21,8 @@ export const ENV = {
   tokenKey: 'XYTE_MCP_TOKEN_KEY',
   /** The key being rotated out; only decrypts. */
   previousTokenKey: 'XYTE_MCP_TOKEN_KEY_PREVIOUS',
+  /** Optional, hosted server only: sent on every hub call so hub rate-limits this server as one client, not per IP. */
+  rateBucketSecret: 'XYTE_MCP_RATE_BUCKET_SECRET',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;
@@ -69,6 +71,8 @@ export interface HttpConfig {
   /** Static bearer for dev/CI. Exactly one of this and `oauth` is set. */
   staticToken?: string;
   oauth?: OAuthConfig;
+  /** Sent on every hub call so hub rate-limits this server as one client; visible ASCII only. */
+  rateBucketSecret?: string;
   port: number;
 }
 
@@ -232,9 +236,21 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
     };
   }
 
+  // Not visible ASCII refuses the boot (and the release): fetch's own error for
+  // a bad header value quotes the value, and would reach a tool result.
+  const rateBucketSecret = trimmed(env[ENV.rateBucketSecret]);
+  if (rateBucketSecret && !/^[\x21-\x7e]+$/.test(rateBucketSecret)) {
+    throw new XyteError(
+      'config',
+      `${ENV.rateBucketSecret} must be visible ASCII only: leading and trailing whitespace is trimmed, but inner spaces, tabs, line breaks and non-ASCII characters are refused.`,
+      [`Set ${ENV.rateBucketSecret} to the value of MCP_RATE_BUCKET_SECRET on the hub, or unset it.`]
+    );
+  }
+
   return {
     ...(staticToken ? { staticToken } : {}),
     ...(oauth ? { oauth } : {}),
+    ...(rateBucketSecret ? { rateBucketSecret } : {}),
     port: parsePort(env[ENV.httpPort])
   };
 }

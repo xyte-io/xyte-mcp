@@ -242,6 +242,47 @@ failed:`; a connect or TLS failure has the outer prefix only.
 - A stack trace with no `[xyte-mcp]` line: a bug in the build. Roll forward with a fixed
   build; do not roll back past a breaking migration.
 
+## Hub rate limit
+
+`XYTE_MCP_RATE_BUCKET_SECRET` (optional) must equal `MCP_RATE_BUCKET_SECRET` on the hub. When
+it is set, the server sends it on every hub call, and the hub moves the API calls and the hub
+token, refresh and revoke calls from its per-IP limits to one shared bucket for this server,
+sized by `MCP_RATE_BUCKET_LIMIT_PER_MINUTE` on the hub. The token, refresh and revoke calls
+still count against the hub's per-client-per-IP limit on `/oauth/token` and `/oauth/revoke`
+(300 a minute for this server's OAuth client from each egress IP); the secret does not lift
+that one. When it is unset, the hub limits hosted traffic per IP. The value is never logged;
+the boot log says `hub rate bucket secret: set` or `not set`.
+
+Leading and trailing whitespace is trimmed. Inner spaces, tabs, line breaks or non-ASCII
+characters are a config error that names the variable but not the value, so it fails the
+release (see [A failed release](#a-failed-release)). The hub does not trim its value: set
+`MCP_RATE_BUCKET_SECRET` on the hub with no surrounding whitespace, or it never matches.
+
+While the secret is set, the server does not follow hub redirects, so `XYTE_HUB_URL` must be
+the final hub address. A redirect fails the call and shows up as:
+
+- `tool_call` with `status=302`;
+- `hub_refresh` with `outcome=rejected` and `hub_status=302`;
+- `hub code exchange failed: 302` on a sign-in;
+- `hub revoke failed: 302` on a disconnect.
+
+The fix is `XYTE_HUB_URL` pointing at the final address (the redirect's target).
+
+- **Rollout:** set the same value on both apps, in either order. Until both match, the hub
+  silently keeps the per-IP limits: nothing fails, and neither this server nor the hub logs
+  anything about it. The same holds for a typo. After a change, check the shared counter from
+  a hub Rails console while this server makes calls:
+
+  ```ruby
+  Rack::Attack.cache.store.read("rack::attack:#{Time.now.to_i / 60}:mcp/shared:hosted-mcp")
+  ```
+
+  It counts this minute's requests in the shared bucket, so it grows as the server makes hub
+  calls (it starts again each minute). If it stays `nil` while the server is busy, the secret
+  does not match.
+- **Rotation:** change the value on both apps together. Requests sent while the two differ fall
+  back to the per-IP limits.
+
 ## Alerts
 
 Written as log queries, so they fit any log tool. Every threshold is a **first guess; tune
@@ -291,7 +332,12 @@ it from production data**.
   at the hub (for example the OAuth app was disabled there). `hub_save_failed` means database
   trouble: the new hub tokens could not be saved, so look at the database first.
 - **Rate-limit hits:** which source. Router `429` on `/token` or `/register` from one IP is
-  usually a client's backend. A hub `429` (`tool_call` `status=429` or `hub_refresh`
-  `rate_limited`) usually means the hub's limit for this server's address, which every
-  organization on the server shares, not one tenant. Count the `organization` values before
-  chasing one.
+  usually a client's backend. A hub `429` is shared by every organization on the server, not
+  one tenant; count the `organization` values before chasing one
+  ([Hub rate limit](#hub-rate-limit)):
+  - `tool_call` `status=429`: the shared bucket when the secret is set, otherwise the per-IP
+    limit for this server's address. The boot line `hub rate bucket secret: set` or `not set`
+    says which.
+  - `hub_refresh` `rate_limited`: the same, or the hub's per-client-per-IP limit on
+    `/oauth/token` and `/oauth/revoke` (300 a minute per egress IP), which the secret does
+    not lift.

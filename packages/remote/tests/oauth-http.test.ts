@@ -68,6 +68,10 @@ let hubPairNumber = 1;
 let rejectNextHubCall = false;
 /** While set, the fake hub parks refresh requests here instead of answering. */
 let heldRefreshes: Array<() => void> | undefined;
+/** While set, the fake hub answers the next refresh 429, as its rate limit does. */
+let rateLimitNextRefresh = false;
+/** The server sends it on every hub call; it must never reach the log. */
+const RATE_BUCKET_SECRET = 'rate-bucket-test-secret-0123456789';
 
 /** Just enough hub: OAuth token + revoke, plus one org API read that echoes headers. */
 function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> } {
@@ -99,6 +103,12 @@ function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> }
             })
           );
         };
+        if (tokenForm.get('grant_type') === 'refresh_token' && rateLimitNextRefresh) {
+          rateLimitNextRefresh = false;
+          res.writeHead(429, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'rate_limited' }));
+          return;
+        }
         if (tokenForm.get('grant_type') === 'refresh_token' && heldRefreshes) {
           heldRefreshes.push(answer);
         } else {
@@ -135,6 +145,7 @@ let hubChallenge: string | undefined;
 let base = '';
 let hub: ReturnType<typeof fakeHub>;
 const stderr: string[] = [];
+const stdout: string[] = [];
 let serverEnv: NodeJS.ProcessEnv;
 let admin: pg.Pool | undefined;
 
@@ -166,7 +177,8 @@ beforeAll(async () => {
     XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
     XYTE_MCP_READ_ONLY: '1',
     DATABASE_URL: databaseUrl,
-    XYTE_MCP_TOKEN_KEY: randomBytes(32).toString('base64')
+    XYTE_MCP_TOKEN_KEY: randomBytes(32).toString('base64'),
+    XYTE_MCP_RATE_BUCKET_SECRET: RATE_BUCKET_SECRET
   };
   await startServer();
 }, 20_000);
@@ -185,6 +197,8 @@ async function startServer(): Promise<void> {
   });
   child.stderr?.setEncoding('utf8');
   child.stderr?.on('data', (chunk: string) => stderr.push(chunk));
+  child.stdout?.setEncoding('utf8');
+  child.stdout?.on('data', (chunk: string) => stdout.push(chunk));
 
   const deadline = Date.now() + 10_000;
   for (;;) {
@@ -499,6 +513,7 @@ describe('oauth over http, in order', () => {
     expect(response.status).toBe(200);
     const result = (await response.json()) as { result?: { isError?: boolean } };
     expect(result.result?.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(RATE_BUCKET_SECRET);
 
     await vi.waitFor(() => expect(events('tool_call')).toHaveLength(2));
     expect(events('tool_call')[1]).toMatchObject({
@@ -528,6 +543,59 @@ describe('oauth over http, in order', () => {
     refreshToken = tokens.refresh_token;
   });
 
+  it('refreshes the hub token when hub rejects it, sending the rate bucket secret', async () => {
+    rejectNextHubCall = true;
+    const before = hub.requests.length;
+    try {
+      const response = await mcp(accessToken, {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+      });
+      expect(response.status).toBe(200);
+      const result = (await response.json()) as { result?: { isError?: boolean } };
+      expect(result.result?.isError).toBeFalsy();
+    } finally {
+      rejectNextHubCall = false;
+    }
+    const sent = hub.requests.slice(before);
+    const refresh = sent.find(
+      (request) => new URLSearchParams(request.body as string).get('grant_type') === 'refresh_token'
+    )!;
+    expect(refresh).toBeDefined();
+    expect((refresh.headers as Record<string, string>)['x-mcp-rate-bucket-secret']).toBe(RATE_BUCKET_SECRET);
+    // The rejected call, then its retry with the refreshed token.
+    const apiCalls = sent.filter((request) => String(request.url).startsWith('/core/'));
+    expect(apiCalls).toHaveLength(2);
+    expect((apiCalls[1]!.headers as Record<string, string>)['x-mcp-rate-bucket-secret']).toBe(RATE_BUCKET_SECRET);
+  });
+
+  // A logged failure path for the final no-leak check; the grant survives a hub 429.
+  it('passes a hub 429 on the refresh on as a rate limit, keeping the connection', async () => {
+    rejectNextHubCall = true;
+    rateLimitNextRefresh = true;
+    try {
+      const response = await mcp(accessToken, {
+        jsonrpc: '2.0',
+        id: 8,
+        method: 'tools/call',
+        params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+      });
+      expect(response.status).toBe(200);
+      const result = (await response.json()) as { result?: { isError?: boolean } };
+      expect(result.result?.isError).toBe(true);
+      expect(JSON.stringify(result)).not.toContain(RATE_BUCKET_SECRET);
+    } finally {
+      rejectNextHubCall = false;
+      rateLimitNextRefresh = false;
+    }
+    await vi.waitFor(() =>
+      expect(events('hub_refresh').at(-1)).toMatchObject({ outcome: 'rate_limited', hub_status: 429 })
+    );
+    expect((await mcp(accessToken, { jsonrpc: '2.0', id: 9, method: 'tools/list' })).status).toBe(200);
+  });
+
   it('revocation kills the grant: both tokens stop working', async () => {
     const revoke = await fetch(`${base}/revoke`, {
       method: 'POST',
@@ -555,6 +623,8 @@ describe('oauth over http, in order', () => {
     expect(all).not.toContain('xort_');
     expect(all).not.toContain('xmcp_');
     expect(all).not.toContain('user@example.com');
+    expect(all).not.toContain(RATE_BUCKET_SECRET);
+    expect(stdout.join('')).not.toContain(RATE_BUCKET_SECRET);
   });
 
   it.skipIf(PG_URL)('warned at boot that the token store is in-memory', () => {
@@ -808,5 +878,22 @@ describe('oauth over http, in order', () => {
     expect(await exited).toBe(0);
     expect(stderr.join('')).toContain('SIGTERM');
     expect(stderr.join('')).not.toContain('lost at shutdown');
+  });
+
+  // Last: by now the fake hub has seen every kind of call the server makes.
+  it('sent the rate bucket secret on every hub call, and never logged it', () => {
+    const grantTypes = hub.requests.map((request) => new URLSearchParams(request.body as string).get('grant_type'));
+    expect(grantTypes).toContain('authorization_code');
+    expect(grantTypes).toContain('refresh_token');
+    const urls = hub.requests.map((request) => request.url as string);
+    expect(urls).toContain('/oauth/revoke');
+    expect(urls.some((url) => url.startsWith('/core/v1/organization/'))).toBe(true);
+    for (const request of hub.requests) {
+      expect((request.headers as Record<string, string>)['x-mcp-rate-bucket-secret'], String(request.url)).toBe(
+        RATE_BUCKET_SECRET
+      );
+    }
+    expect(stderr.join('')).not.toContain(RATE_BUCKET_SECRET);
+    expect(stdout.join('')).not.toContain(RATE_BUCKET_SECRET);
   });
 });

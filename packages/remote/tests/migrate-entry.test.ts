@@ -105,6 +105,17 @@ describe('migrate entry without a database', () => {
     expect(stderr).toContain('  - Unset XYTE_MCP_HTTP_TOKEN for OAuth');
     expect(stderr).not.toContain('migration failed');
   });
+
+  it('exits 1 on a rate bucket secret that is not visible ASCII, without logging the value', async () => {
+    const { code, stderr } = await runMigrate({
+      XYTE_MCP_HTTP_TOKEN: `xmcp_${'a'.repeat(32)}`,
+      XYTE_ORG_API_KEY: 'org-key',
+      XYTE_MCP_RATE_BUCKET_SECRET: 'leaky-secret\nx'
+    });
+    expect(code, stderr).toBe(1);
+    expect(stderr).toContain('[xyte-mcp] error: XYTE_MCP_RATE_BUCKET_SECRET must be visible ASCII');
+    expect(stderr).not.toContain('leaky');
+  });
 });
 
 describe.skipIf(!PG_URL)('migrate entry against Postgres', () => {

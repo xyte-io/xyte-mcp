@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { getEndpoint, suggestKeys } from '../catalog/catalog.js';
 import { buildRequest } from '../http/build-request.js';
-import { APPLICATION_PAUSED_HINT, XyteHttpError, isXyteError } from '../http/errors.js';
+import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteHttpError, isXyteError } from '../http/errors.js';
 import { redactValue } from '../redact.js';
 import { evaluateWritePolicy } from '../write-policy.js';
 import { defineTool, errorResult, textResult } from './types.js';
@@ -120,6 +120,9 @@ function toErrorResult(
       if (hint) hints.push(hint);
     } else if (error.status === 401 || error.status === 403) {
       hints.push('The API key may be invalid, revoked, or lack the required scope.');
+    }
+    if (error.status === 429) {
+      hints.push(RATE_LIMITED_HINT);
     }
     if (error.status === 404) {
       hints.push('Check the path parameter values — the resource may not exist.');

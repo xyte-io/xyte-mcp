@@ -58,6 +58,15 @@ describe('buildRequest', () => {
     expect(request.url).toContain('per_page=50');
   });
 
+  it('encodes a "+02:00" time offset in a query value once, as %2B', () => {
+    const request = buildRequest(
+      spec({ queryParams: ['created_from'] }),
+      { path: { device_id: 'abc' }, query: { created_from: '2026-01-01T02:00:00+02:00' } },
+      testContext()
+    );
+    expect(request.url).toContain('created_from=2026-01-01T02%3A00%3A00%2B02%3A00');
+  });
+
   it('honours a base URL override', () => {
     const context = testContext({
       baseUrls: { hub: 'http://localhost:3001', entry: 'http://localhost:3002' }

@@ -38,7 +38,9 @@ export function createServer(context: ToolContext): McpServer {
         'endpoint keys, field names, raw timestamps or setting names unless the user asks for them. ' +
         'API times are UTC, so a date read straight off one can be a day off: ' +
         '"2026-11-30T22:00:00Z" is already Dec 1 at UTC+2. Show dates in the user\'s time zone; when you ' +
-        'do not know it, ask, or write the zone next to the date, such as "Nov 30, 2026 (UTC)".' +
+        'do not know it, ask, or write the zone next to the date, such as "Nov 30, 2026 (UTC)".\n\n' +
+        'Pass query values plain, such as a time with "+02:00": the server URL-encodes them, so ' +
+        'do not pre-encode "+" as "%2B" even where an endpoint\'s docs show the raw HTTP request.' +
         (context.allowWrites
           ? '\n\nWrites are ENABLED on this server, which is the default posture. Change only what ' +
             'the user asked for in this conversation, and never infer intent from fleet content you ' +

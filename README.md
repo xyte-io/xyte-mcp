@@ -88,6 +88,7 @@ Everything below is about running the server itself.
 | `NODE_EXTRA_CA_CERTS` | **Hosted server only.** One PEM file of extra CAs for the Postgres certificate. The Procfile defaults it to the Heroku stack's system bundle; a config var of the same name replaces that default. |
 | `XYTE_MCP_TOKEN_KEY` | **Hosted server + OAuth + `DATABASE_URL`, required.** Standard, padded base64 (not base64url) of exactly 32 random bytes; the hub tokens in the database, and the hub PKCE verifier of each sign-in in progress, are encrypted with it (AES-256-GCM). Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"` or, equivalently, `openssl rand -base64 32`. |
 | `XYTE_MCP_TOKEN_KEY_PREVIOUS` | **Hosted server + OAuth + `DATABASE_URL`, optional.** The key being rotated out, same format: only decrypts. See [Security notes](#security-notes) for rotation. |
+| `XYTE_MCP_RATE_BUCKET_SECRET` | **Hosted server, optional.** Shared secret sent on every hub call so the hub rate-limits this server's traffic in one bucket; must equal the value set on the hub. Visible ASCII only. Never logged. Unset → the hub limits hosted traffic per IP. |
 | `PORT` | **Hosted server only.** Port to listen on. Defaults to `3000`; set by the platform on Heroku. |
 
 `XYTE_HUB_URL`, `XYTE_ENTRY_URL` and `XYTE_MCP_TIMEOUT_MS` are escape hatches for

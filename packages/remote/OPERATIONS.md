@@ -242,6 +242,16 @@ failed:`; a connect or TLS failure has the outer prefix only.
 - A stack trace with no `[xyte-mcp]` line: a bug in the build. Roll forward with a fixed
   build; do not roll back past a breaking migration.
 
+## Hub rate limit
+
+`XYTE_MCP_RATE_BUCKET_SECRET` (optional) must equal the value set on the hub for this server.
+When it is set, the server sends it on every hub call (API calls and the hub token, refresh
+and revoke calls), and the hub counts all of this server's traffic in one shared bucket. When
+it is unset, the hub limits hosted traffic per IP. The value is never logged. It must be
+visible ASCII (no spaces or line breaks); anything else stops the boot with a config error that
+names the variable but not the value. The release phase does not check it, so a bad value
+fails the web dynos' boot, not the release.
+
 ## Alerts
 
 Written as log queries, so they fit any log tool. Every threshold is a **first guess; tune
@@ -292,6 +302,7 @@ it from production data**.
   trouble: the new hub tokens could not be saved, so look at the database first.
 - **Rate-limit hits:** which source. Router `429` on `/token` or `/register` from one IP is
   usually a client's backend. A hub `429` (`tool_call` `status=429` or `hub_refresh`
-  `rate_limited`) usually means the hub's limit for this server's address, which every
-  organization on the server shares, not one tenant. Count the `organization` values before
-  chasing one.
+  `rate_limited`) usually means the hub's limit for this whole server, which every
+  organization on the server shares, not one tenant: the shared bucket when
+  `XYTE_MCP_RATE_BUCKET_SECRET` is set ([Hub rate limit](#hub-rate-limit)), otherwise the
+  limit for this server's address. Count the `organization` values before chasing one.

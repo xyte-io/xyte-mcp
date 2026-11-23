@@ -78,18 +78,18 @@ async function chain(call) {
 
   const orders = await call('partner.orders.getOrders', { query: { coupon_id: couponId } });
   if (!check(LINKS[0], orders.ok && rows(orders).length > 0, detail(orders, `${rows(orders).length} orders`))) {
-    return skipFrom(LINKS[1], 'no order for the coupon');
+    return skipFrom(LINKS[1], orders.ok ? 'no order for the coupon' : 'the order list failed');
   }
 
   // Prefer the order that reaches every later link: a store payment and a subscription item.
-  const score = (order) => (hasStorePayment(order) ? 2 : 0) + (order.items.some((item) => item.subscription_id) ? 1 : 0);
+  const score = (order) => (hasStorePayment(order) ? 2 : 0) + ((order.items ?? []).some((item) => item.subscription_id) ? 1 : 0);
   let order;
   for (const row of rows(orders)) {
     const one = await call('partner.orders.getOrder', { path: { order_id: row.id } });
     if (one.ok && (!order || score(one.data) > score(order))) order = one.data;
     if (order && score(order) === 3) break;
   }
-  if (!check(LINKS[1], order?.items.some((item) => item.coupon?.id === couponId), order ? `order ${order.short_id}` : 'no order could be read')) {
+  if (!check(LINKS[1], (order?.items ?? []).some((item) => item.coupon?.id === couponId), order ? `order ${order.short_id}` : 'no order could be read')) {
     return skipFrom(LINKS[2], 'no order with the coupon');
   }
 
@@ -98,10 +98,10 @@ async function chain(call) {
   else if (!hasStorePayment(order)) skip(LINKS[2], 'the order was paid offline');
   else {
     const payment = await call('partner.payments.getPayment', { path: { payment_id: order.payment.id } });
-    check(LINKS[2], payment.ok && payment.data.order_ids.includes(order.id), detail(payment));
+    check(LINKS[2], payment.ok && Boolean(payment.data?.order_ids?.includes(order.id)), detail(payment));
   }
 
-  const subscriptionId = order.items.find((item) => item.subscription_id)?.subscription_id;
+  const subscriptionId = (order.items ?? []).find((item) => item.subscription_id)?.subscription_id;
   if (!subscriptionId) skip(LINKS[3], 'no order item has a subscription');
   else {
     const subscription = await call('partner.subscriptions.getSubscription', { path: { subscription_id: subscriptionId } });
@@ -169,7 +169,7 @@ async function main() {
   await readOnly();
 
   const stderr = checkWriteLog();
-  check('no key in any server log or in this output', !stderr.includes(key) && !printed.some((line) => line.includes(key)));
+  check('no key in any server log or in the printed results', !stderr.includes(key) && !printed.some((line) => line.includes(key)));
   finish();
 }
 

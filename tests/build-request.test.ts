@@ -76,6 +76,18 @@ describe('buildRequest', () => {
     expect(request.url).toContain('created_from=2026-01-01T02%3A00%3A00%252B02%3A00');
   });
 
+  it('builds the catalog requests for approving an order and updating a tag note', () => {
+    const partner = testContext({ credentials: { partner: 'partner-key-abcdef123456' } });
+    const approve = buildRequest(getEndpoint('partner.orders.approveOrder')!, { path: { order_id: 'o1' } }, partner);
+    expect(approve.method).toBe('POST');
+    expect(approve.url).toMatch(/\/core\/v1\/partner\/orders\/o1\/approve$/);
+    const tagNote = getEndpoint('partner.organizationTags.updateOrganizationTag')!;
+    const path = Object.fromEntries(tagNote.pathParams.map((name) => [name, name]));
+    const update = buildRequest(tagNote, { path, body: { note: 'n' } }, partner);
+    expect(update.method).toBe('PATCH');
+    expect(update.url).toContain(tagNote.pathTemplate.replace(/:(\w+)/g, '$1'));
+  });
+
   it('honours a base URL override', () => {
     const context = testContext({
       baseUrls: { hub: 'http://localhost:3001', entry: 'http://localhost:3002' }

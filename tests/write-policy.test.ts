@@ -114,8 +114,22 @@ describe('evaluateWritePolicy on the Partner coupon and tag endpoints', () => {
     'partner.organizations.getOrganizations',
     'partner.organizationTags.getOrganizationTags',
     'partner.coupons.getCoupons',
-    'partner.storeListings.getStoreListings'
+    'partner.storeListings.getStoreListings',
+    'partner.orders.getOrders',
+    'partner.orders.getOrder',
+    'partner.payments.getPayments',
+    'partner.payments.getPayment',
+    'partner.products.getProducts',
+    'partner.products.getProduct',
+    'partner.soldProducts.getSoldProducts',
+    'partner.soldProducts.getSoldProduct',
+    'partner.storeListings.getStoreListing',
+    'partner.storeSettings.getStoreSettings',
+    'partner.subscriptions.getSubscriptions',
+    'partner.subscriptions.getSubscription',
+    'partner.subscriptions.getSubscriptionInvoiceItems'
   ];
+  const writesWithoutConfirm = ['partner.orders.approveOrder', 'partner.organizationTags.updateOrganizationTag'];
   const writes = [
     'partner.organizationTags.addOrganizationTag',
     'partner.organizationTags.removeOrganizationTag',
@@ -133,6 +147,10 @@ describe('evaluateWritePolicy on the Partner coupon and tag endpoints', () => {
 
   it.each(writes)('refuses the write %s when read-only', (key) => {
     expect(evaluateWritePolicy(real(key), key, false).allowed).toBe(false);
+  });
+
+  it.each(writesWithoutConfirm)('allows %s with writes on and no confirm', (key) => {
+    expect(evaluateWritePolicy(real(key), undefined, true)).toEqual({ allowed: true });
   });
 
   it.each(deletes)('requires confirm for %s', (key) => {

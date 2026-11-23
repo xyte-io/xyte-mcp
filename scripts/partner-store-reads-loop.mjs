@@ -56,14 +56,21 @@ const LINKS = [
   'chain: a sold product of the order'
 ];
 
-// A missing link skips itself and every later link.
+// A missing order skips every later link.
 function skipFrom(link, why) {
   for (const name of LINKS.slice(LINKS.indexOf(link))) skip(name, why);
 }
 
+// Get Payment answers 404 for a payment made outside the store.
+const hasStorePayment = (order) => Boolean(order.payment) && order.payment_method !== 'offline';
+
 async function chain(call) {
-  const couponId = env.XYTE_LOOP_COUPON_ID
-    ?? rows(await call('partner.coupons.getCoupons')).find((coupon) => coupon.used_in_orders === true)?.id;
+  let couponId = env.XYTE_LOOP_COUPON_ID;
+  if (!couponId) {
+    const coupons = await call('partner.coupons.getCoupons');
+    if (!coupons.ok) return check('chain: coupons: list', false, firstLine(coupons));
+    couponId = rows(coupons).find((coupon) => coupon.used_in_orders === true)?.id;
+  }
   if (!couponId) return skipFrom(LINKS[0], 'no coupon used in an order; set XYTE_LOOP_COUPON_ID');
 
   const orders = await call('partner.orders.getOrders', { query: { coupon_id: couponId } });
@@ -71,39 +78,48 @@ async function chain(call) {
     return skipFrom(LINKS[1], 'no order for the coupon');
   }
 
-  // Prefer the order that reaches every later link: a payment and a subscription item.
-  const details = [];
+  // Prefer the order that reaches every later link: a store payment and a subscription item.
+  const score = (order) => (hasStorePayment(order) ? 2 : 0) + (order.items.some((item) => item.subscription_id) ? 1 : 0);
+  let order;
   for (const row of rows(orders)) {
     const one = await call('partner.orders.getOrder', { path: { order_id: row.id } });
-    if (one.ok) details.push(one.data);
+    if (one.ok && (!order || score(one.data) > score(order))) order = one.data;
+    if (order && score(order) === 3) break;
   }
-  const score = (order) => (order.payment ? 2 : 0) + (order.items.some((item) => item.subscription_id) ? 1 : 0);
-  const order = details.sort((a, b) => score(b) - score(a))[0];
   if (!check(LINKS[1], order?.items.some((item) => item.coupon?.id === couponId), order ? `order ${order.short_id}` : 'no order could be read')) {
     return skipFrom(LINKS[2], 'no order with the coupon');
   }
 
-  if (!order.payment) return skipFrom(LINKS[2], 'the order has no payment');
-  // Get Payment answers 404 for a payment made outside the store.
-  if (order.payment_method === 'offline') return skipFrom(LINKS[2], 'the order was paid offline');
-  const payment = await call('partner.payments.getPayment', { path: { payment_id: order.payment.id } });
-  if (!check(LINKS[2], payment.ok && payment.data.order_ids.includes(order.id), detail(payment))) {
-    return skipFrom(LINKS[3], 'the payment does not list the order');
+  // The payment, subscription and sold product links each hang off the order only.
+  if (!order.payment) skip(LINKS[2], 'the order has no payment');
+  else if (!hasStorePayment(order)) skip(LINKS[2], 'the order was paid offline');
+  else {
+    const payment = await call('partner.payments.getPayment', { path: { payment_id: order.payment.id } });
+    check(LINKS[2], payment.ok && payment.data.order_ids.includes(order.id), detail(payment));
   }
 
   const subscriptionId = order.items.find((item) => item.subscription_id)?.subscription_id;
-  if (!subscriptionId) return skipFrom(LINKS[3], 'no order item has a subscription');
-  const subscription = await call('partner.subscriptions.getSubscription', { path: { subscription_id: subscriptionId } });
-  const invoiceItems = await call('partner.subscriptions.getSubscriptionInvoiceItems', { path: { subscription_id: subscriptionId } });
-  if (!check(LINKS[3], subscription.ok && subscription.data.order_id === order.id && invoiceItems.ok,
-    subscription.ok ? detail(invoiceItems, `${rows(invoiceItems).length} invoice items`) : firstLine(subscription))) {
-    return skipFrom(LINKS[4], 'the subscription does not match the order');
+  if (!subscriptionId) skip(LINKS[3], 'no order item has a subscription');
+  else {
+    const subscription = await call('partner.subscriptions.getSubscription', { path: { subscription_id: subscriptionId } });
+    const invoiceItems = await call('partner.subscriptions.getSubscriptionInvoiceItems', { path: { subscription_id: subscriptionId } });
+    // 404 when the partner sold another partner's product through its listing.
+    if (subscription.status === 404) skip(LINKS[3], "the subscription is for another partner's product");
+    else {
+      // Invoice item order_id is the order of the charge, renewals included; subscription order_id is only the first order.
+      check(LINKS[3], subscription.ok && invoiceItems.ok && rows(invoiceItems).some((item) => item.order_id === order.id),
+        subscription.ok ? detail(invoiceItems, `${rows(invoiceItems).length} invoice items`) : firstLine(subscription));
+    }
   }
 
-  const soldProduct = rows(await call('partner.soldProducts.getSoldProducts', { query: { order_id: order.id } }))[0];
-  if (!soldProduct) return skipFrom(LINKS[4], 'no sold product for the order');
-  const one = await call('partner.soldProducts.getSoldProduct', { path: { sold_product_id: soldProduct.id } });
-  check(LINKS[4], one.ok && one.data.order_id === order.id, detail(one));
+  const soldProducts = await call('partner.soldProducts.getSoldProducts', { query: { order_id: order.id } });
+  const soldProduct = rows(soldProducts)[0];
+  if (!soldProducts.ok) check(LINKS[4], false, firstLine(soldProducts));
+  else if (!soldProduct) skip(LINKS[4], 'no sold product for the order');
+  else {
+    const one = await call('partner.soldProducts.getSoldProduct', { path: { sold_product_id: soldProduct.id } });
+    check(LINKS[4], one.ok && one.data.order_id === order.id, detail(one));
+  }
 }
 
 async function timeFilter(call) {

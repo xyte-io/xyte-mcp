@@ -9,12 +9,15 @@ import { isJsonContentType } from '@modelcontextprotocol/sdk/shared/mediaType.js
 import { endpointCount } from '@xyteai/mcp/catalog/catalog.js';
 import {
   DEFAULT_HUB_URL,
+  ENV,
   resolveConfig,
   resolveHttpConfig,
   type ServerConfig
 } from '@xyteai/mcp/config.js';
 import { createToolContext, type ToolContext } from '@xyteai/mcp/context.js';
 import { createHttpClient } from '@xyteai/mcp/http/client.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
+import { withRateBucketSecret } from '../hub-fetch.js';
 import { createHubOAuth } from '../oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../oauth/provider.js';
 import { PgOAuthStore } from '../oauth/pg-store.js';
@@ -97,9 +100,10 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   // mode needs a process-level API key (resolveHttpConfig enforces that pair).
   const config = resolveConfig(env, { requireCredentials: !oauth, writesByDefault: false });
 
+  const hubFetch = withRateBucketSecret(config.baseUrls.hub, rateBucketSecretOf(env));
   // One HTTP client for every context: it holds the keep-alive pool and no
-  // credentials, so sharing it across identities is safe and cheap.
-  const upstream = createHttpClient({ timeoutMs: config.timeoutMs });
+  // user credentials, so sharing it across identities is safe and cheap.
+  const upstream = createHttpClient({ timeoutMs: config.timeoutMs, fetchImpl: hubFetch });
   const staticContext = staticToken
     ? withSecret(createToolContext(config, upstream), staticToken)
     : undefined;
@@ -170,7 +174,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
         clientId: oauth.hubClient.id,
         clientSecret: oauth.hubClient.secret,
         redirectUri: `${oauth.issuerUrl}${CALLBACK_PATH}`,
-        timeoutMs: config.timeoutMs
+        timeoutMs: config.timeoutMs,
+        fetchImpl: hubFetch
       }),
       oauth.issuerUrl
     );
@@ -581,6 +586,22 @@ function failFlow(res: Response, error: unknown): void {
 
 function sendSignInFailedPage(res: Response, status: number, nextStep: string): void {
   res.status(status).type('html').send(`<p>Sign-in failed. ${nextStep}</p>`);
+}
+
+/**
+ * Unset or blank → undefined. Anything but visible ASCII refuses the boot:
+ * fetch's own error for a bad header value quotes the value, and that error
+ * would reach a tool result. The message never includes the value.
+ */
+function rateBucketSecretOf(env: NodeJS.ProcessEnv): string | undefined {
+  const secret = env[ENV.rateBucketSecret]?.trim();
+  if (!secret) return undefined;
+  if (!/^[\x21-\x7e]+$/.test(secret)) {
+    throw new XyteError('config', `${ENV.rateBucketSecret} must be visible ASCII only: no spaces, line breaks or other characters.`, [
+      `Set ${ENV.rateBucketSecret} to the value configured on the hub, or unset it.`
+    ]);
+  }
+  return secret;
 }
 
 /**

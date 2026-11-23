@@ -21,6 +21,8 @@ export const ENV = {
   tokenKey: 'XYTE_MCP_TOKEN_KEY',
   /** The key being rotated out; only decrypts. */
   previousTokenKey: 'XYTE_MCP_TOKEN_KEY_PREVIOUS',
+  /** Optional, hosted server only: sent on every hub call so hub rate-limits this server as one client, not per IP. */
+  rateBucketSecret: 'XYTE_MCP_RATE_BUCKET_SECRET',
   /** Set by the platform (Heroku, Fly, …); the transport only reads it. */
   httpPort: 'PORT'
 } as const;

@@ -1,3 +1,6 @@
+import { ENV } from '@xyteai/mcp/config.js';
+import { XyteError } from '@xyteai/mcp/http/errors.js';
+
 /** Hub counts every request carrying the shared secret in one rate bucket for this server. */
 export const RATE_BUCKET_SECRET_HEADER = 'X-MCP-Rate-Bucket-Secret';
 
@@ -13,7 +16,12 @@ export function withRateBucketSecret(
   fetchImpl: typeof fetch = fetch
 ): typeof fetch {
   if (!secret) return fetchImpl;
-  const hubOrigin = new URL(hubUrl).origin;
+  let hubOrigin: string;
+  try {
+    hubOrigin = new URL(hubUrl).origin;
+  } catch {
+    throw new XyteError('config', `${ENV.hubUrl} is not a valid URL: ${hubUrl}`);
+  }
   return (input, init) => {
     if (new URL(String(input)).origin !== hubOrigin) return fetchImpl(input, init);
     const headers = new Headers(init?.headers);

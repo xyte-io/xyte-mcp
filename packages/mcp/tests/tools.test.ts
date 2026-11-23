@@ -207,8 +207,26 @@ describe('xyte_api_call', () => {
       testContext({ http, ...(credentials ? { credentials } : {}) })
     );
     expect(result.isError).toBe(true);
-    expect(result.content[0]?.text).toContain(RATE_LIMITED_HINT);
-    expect(result.content[0]?.text).not.toContain(API_KEY_HINT);
+    // Exactly one hint, the rate limit one: no API-key or sign-in hint.
+    expect(result.content[0]?.text).toBe(
+      `${READ_KEY} failed: 429 Too Many Requests\n\n{}\n\n- ${RATE_LIMITED_HINT}`
+    );
+  });
+
+  // A hub redirect (the secret set, XYTE_HUB_URL not the final address) is not an auth or rate problem.
+  it.each([
+    ['API key', undefined],
+    ['signed in', { organization: { accessToken: 'xoat_abcdef123456' } }]
+  ])('gives a hub 302 no hint (%s)', async (_mode, credentials) => {
+    const http = stubHttp(() => new XyteHttpError(302, 'Found', {}, READ_KEY));
+    const result = await apiCallTool.handler(
+      { key: READ_KEY },
+      testContext({ http, ...(credentials ? { credentials } : {}) })
+    );
+    expect(result.isError).toBe(true);
+    const text = result.content[0]?.text;
+    expect(text).toContain('302');
+    for (const hint of [RATE_LIMITED_HINT, API_KEY_HINT, ...SIGNED_IN_HINTS]) expect(text).not.toContain(hint);
   });
 
   describe('signed in with Xyte', () => {

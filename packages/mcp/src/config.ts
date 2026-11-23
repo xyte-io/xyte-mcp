@@ -242,8 +242,8 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
   if (rateBucketSecret && !/^[\x21-\x7e]+$/.test(rateBucketSecret)) {
     throw new XyteError(
       'config',
-      `${ENV.rateBucketSecret} must be visible ASCII only: no spaces, line breaks or other characters.`,
-      [`Set ${ENV.rateBucketSecret} to the value configured on the hub, or unset it.`]
+      `${ENV.rateBucketSecret} must be visible ASCII only: leading and trailing whitespace is trimmed, but inner spaces, tabs, line breaks and non-ASCII characters are refused.`,
+      [`Set ${ENV.rateBucketSecret} to the value of MCP_RATE_BUCKET_SECRET on the hub, or unset it.`]
     );
   }
 

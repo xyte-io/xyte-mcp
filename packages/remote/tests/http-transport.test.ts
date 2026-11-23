@@ -394,6 +394,7 @@ describe('http transport', () => {
     const server = await start();
     expect(server.stderr.join('')).toContain('writes: disabled');
     expect(server.stderr.join('')).not.toContain('WARNING');
+    expect(server.stderr.join('')).toContain('hub rate bucket secret: not set');
   });
 
   it('refuses to start with both the static token and OAuth configured', async () => {
@@ -625,6 +626,24 @@ describe('http transport: token store outage', () => {
 });
 
 describe('http transport: rate bucket secret', () => {
+  it('sends the secret on a static-token tool call, and says at boot that it is set', async () => {
+    const secret = 'rate-bucket-static-secret-0123';
+    const hub = await startFakeHub();
+    try {
+      const server = await start({ XYTE_HUB_URL: hub.url, XYTE_MCP_RATE_BUCKET_SECRET: secret });
+      const response = await server.call(1, 'tools/call', {
+        name: 'xyte_api_call',
+        arguments: { key: 'organization.devices.getDevices' }
+      });
+      expect((response.result as { isError?: boolean }).isError).toBeFalsy();
+      expect(hub.apiRateBucketSecrets).toEqual([secret]);
+      expect(server.stderr.join('')).toContain('hub rate bucket secret: set');
+      expect(server.stderr.join('')).not.toContain(secret);
+    } finally {
+      await hub.close();
+    }
+  });
+
   // The value checks themselves are resolveHttpConfig's (config.test.ts).
   it('refuses to boot on a secret that is not visible ASCII, without naming the value', async () => {
     const secret = 'leaky-secret\nx';

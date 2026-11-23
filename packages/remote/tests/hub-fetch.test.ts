@@ -2,8 +2,9 @@ import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
 import { createHttpClient } from '@xyteai/mcp/http/client.js';
-import { XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { RATE_BUCKET_SECRET_HEADER, withRateBucketSecret } from '../src/hub-fetch.js';
+import { createHubOAuth, HubRefreshError } from '../src/oauth/hub-oauth.js';
 
 const HUB = 'http://127.0.0.1:4100';
 const SECRET = 'bucket-secret-123';
@@ -32,7 +33,12 @@ describe('withRateBucketSecret', () => {
     expect(withRateBucketSecret(HUB, undefined, fetchImpl)).toBe(fetchImpl);
   });
 
-  it.each(['http://127.0.0.1:4101/x', 'http://localhost:4100/x', 'https://example.com/x'])(
+  it.each([
+    'http://127.0.0.1:4101/x',
+    'http://localhost:4100/x',
+    'https://127.0.0.1:4100/x',
+    'https://example.com/x'
+  ])(
     'passes a request to another origin (%s) through untouched',
     async (url) => {
       const fetchImpl = stubFetch();
@@ -41,6 +47,27 @@ describe('withRateBucketSecret', () => {
       expect(fetchImpl).toHaveBeenCalledWith(url, init);
     }
   );
+
+  it('matches the hub origin with its default port spelled out', async () => {
+    const fetchImpl = stubFetch();
+    await withRateBucketSecret('https://hub.example:443/base', SECRET, fetchImpl)(
+      'https://hub.example/core/v1/organization/devices'
+    );
+    expect(sent(fetchImpl).headers.get(RATE_BUCKET_SECRET_HEADER)).toBe(SECRET);
+  });
+
+  it('refuses a malformed hub URL as a config error naming XYTE_HUB_URL', () => {
+    let error: unknown;
+    try {
+      withRateBucketSecret('not a url', SECRET, stubFetch());
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(XyteError);
+    expect((error as XyteError).kind).toBe('config');
+    expect((error as XyteError).message).toContain('XYTE_HUB_URL');
+    expect((error as XyteError).message).not.toContain(SECRET);
+  });
 
   it('keeps the caller headers and the rest of the init', async () => {
     const fetchImpl = stubFetch();
@@ -77,6 +104,37 @@ describe('withRateBucketSecret', () => {
       expect(error).toBeInstanceOf(XyteHttpError);
       expect((error as XyteHttpError).status).toBe(302);
       expect(JSON.stringify([(error as XyteHttpError).message, (error as XyteHttpError).body])).not.toContain(SECRET);
+    });
+    expect(received).toEqual([]);
+  });
+
+  it('turns a hub redirect on the OAuth calls into a rejection, without the secret in it', async () => {
+    const received = await withRedirectingHub(async (hubUrl) => {
+      const hubOAuth = createHubOAuth({
+        hubUrl,
+        clientId: 'mcp-client',
+        clientSecret: 'mcp-secret',
+        redirectUri: 'https://mcp.example/oauth/callback',
+        timeoutMs: 5_000,
+        fetchImpl: withRateBucketSecret(hubUrl, SECRET)
+      });
+      const refreshError: unknown = await hubOAuth.refresh('xort_1').then(
+        (result) => result,
+        (rejection: unknown) => rejection
+      );
+      // Not invalid_grant: a 4xx 'auth' rejection, so the provider keeps the grant.
+      expect(refreshError).toBeInstanceOf(HubRefreshError);
+      expect((refreshError as HubRefreshError).status).toBe(302);
+      expect((refreshError as HubRefreshError).kind).toBe('auth');
+      expect((refreshError as HubRefreshError).message).not.toContain(SECRET);
+
+      const exchangeError: unknown = await hubOAuth.exchangeCode('code', 'verifier').then(
+        () => undefined,
+        (rejection: unknown) => rejection
+      );
+      expect(exchangeError).toBeInstanceOf(Error);
+      expect((exchangeError as Error).message).toContain('302');
+      expect((exchangeError as Error).message).not.toContain(SECRET);
     });
     expect(received).toEqual([]);
   });

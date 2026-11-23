@@ -449,6 +449,8 @@ export async function startHttpServer(env: NodeJS.ProcessEnv = process.env): Pro
   if (config.baseUrls.hub !== DEFAULT_HUB_URL) {
     log(`hub base URL overridden: ${config.baseUrls.hub}`);
   }
+  // Set or not, never the value: the runbook's hub 429 checks start here.
+  log(`hub rate bucket secret: ${rateBucketSecret ? 'set' : 'not set'}`);
   if (config.allowWrites) {
     // Worth shouting about even when asked for: on stdio the blast radius is
     // one laptop, here it is whoever holds a token.

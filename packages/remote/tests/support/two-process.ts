@@ -95,6 +95,8 @@ export interface FakeHub {
   revokes: string[];
   /** Authorization headers of the API calls. */
   apiAuth: string[];
+  /** X-MCP-Rate-Bucket-Secret headers of the API calls ('' when absent). */
+  apiRateBucketSecrets: string[];
   /** Lifetime, in seconds, of the next pair handed out. */
   expiresIn: number;
   /** While true, refresh POSTs are parked until releaseHeld or dropHeld. */
@@ -159,6 +161,7 @@ export async function startFakeHub(): Promise<FakeHub> {
         return;
       }
       hub.apiAuth.push(req.headers.authorization ?? '');
+      hub.apiRateBucketSecrets.push(String(req.headers['x-mcp-rate-bucket-secret'] ?? ''));
       json(res, 200, { devices: [] });
     });
   });
@@ -170,6 +173,7 @@ export async function startFakeHub(): Promise<FakeHub> {
     rotatedTo: [],
     revokes: [],
     apiAuth: [],
+    apiRateBucketSecrets: [],
     expiresIn: 3600,
     holdRefreshes: false,
     held: () => parked.length,

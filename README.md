@@ -10,7 +10,7 @@ read-only server.
 Xyte is a device management platform: connected device fleets, the spaces they live in,
 their telemetry and incidents, service tickets, commands, models, warranties and maintenance
 schedules, and for partners the store coupons they give their customers. This server
-puts that API in front of an agent as three tools instead of 97 hand-written ones — it can
+puts that API in front of an agent as three tools instead of 112 hand-written ones — it can
 discover the right endpoint, read its exact contract, and call it with arguments validated
 against that contract before a request goes out.
 
@@ -108,6 +108,8 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
   Before it proposes a delete or removal it reads that endpoint's contract, so its plan says
   what the API will refuse and what it will do instead. A create request that matches
   something existing is reported, not applied.
+- **Approving an order is not confirm-gated:** it is a `POST`, so it goes ahead like any
+  other write, though it cannot be undone (see DEV-8178).
 - **Other writes go ahead:** creates and updates you asked for are made without a second
   question, and the model makes every write the request needs — a change "for" a named
   customer is done only when that customer has it. It then reads those customers back and
@@ -151,18 +153,20 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 97 endpoints (74 organization, 23 partner). It
+`src/catalog/endpoints.generated.json` holds 112 endpoints (74 organization, 38 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.
 
-Partner endpoints cover devices, tickets and organizations, plus the store coupons a
-partner gives its customers: `partner.organizations.getOrganizations`,
-`partner.organizationTags.*` (add, remove, list organization tags), `partner.coupons.*`
-(create, list, update, delete coupons) and `partner.storeListings.getStoreListings`. A
-coupon reaches a customer by code or by an organization tag. Coupons need the Store plan
-feature and store coupons enabled for the partner; store listings need only the Store plan
-feature.
+Partner endpoints cover devices, tickets and organizations, plus the partner's store:
+`partner.organizations.getOrganizations`, `partner.organizationTags.*` (add, update, remove,
+list organization tags), `partner.coupons.*` (create, list, update, delete coupons),
+`partner.storeSettings.getStoreSettings`, `partner.products.*` and `partner.storeListings.*`
+(list, get one), `partner.orders.*` (list, get one, approve), `partner.payments.*` (list,
+get one), `partner.subscriptions.*` (list, get one, its invoice items) and
+`partner.soldProducts.*` (list, get one). A coupon reaches a customer by code or by an
+organization tag. Coupons need the Store plan feature and store coupons enabled for the
+partner; the other store endpoints need only the Store plan feature.
 
 Organization endpoints also gained `organization.edges.devices.changeModel`, maintenance schedules
 (`organization.maintenanceSchedules.*`) and incident notes (`organization.notes.*IncidentNote*`), picked up from hub with this
@@ -232,6 +236,31 @@ it) and keep the order above: later flows find the coupons and tags by run-id na
 
 A check whose optional variable is unset is skipped, not failed. The script exits 1 when any
 check fails.
+
+### Partner store reads loop
+
+`npm run loop:partner-store-reads` reads the partner store through the built server and checks
+each result: store settings, products and store listings (the list and the first one), and the
+order, payment, subscription and sold product lists. It then follows a coupon used in an order
+to that order, its payment, its subscription with the invoice items, and its sold product; a
+missing link (no used coupon, no payment, no subscription item, no sold product) is skipped
+with the reason, and so are the links after it. It also checks that a time filter with a
+`+02:00` offset passed plain is accepted and one without an offset is 422, that read-only mode
+reads but refuses to approve, and that the key appears in no server log and none of its own
+output.
+
+It is **read-only** unless `XYTE_LOOP_APPROVE_ORDER_ID` is set; then it approves that order,
+which cannot be undone. It refuses to start without an explicit `XYTE_HUB_URL` and refuses
+`hub.xyte.io`. Use a local or staging hub.
+
+| Variable | Needed | What it is |
+| --- | --- | --- |
+| `XYTE_HUB_URL` | yes | The hub to test, e.g. `http://localhost:3000`. |
+| `XYTE_PARTNER_API_KEY` | yes | Key of a partner with the Store plan. For the approve checks it must be a non-brand partner key (a brand partner key is read-only, 403). |
+| `XYTE_LOOP_COUPON_ID` | no | Coupon to follow to its order (default: the first coupon used in an order). |
+| `XYTE_LOOP_APPROVE_ORDER_ID` | no | An order waiting for approval; checks approving it, then approving it again. |
+
+The script exits 1 when any check fails.
 
 ## Development
 

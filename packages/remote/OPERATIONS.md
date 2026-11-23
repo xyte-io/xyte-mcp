@@ -245,11 +245,23 @@ failed:`; a connect or TLS failure has the outer prefix only.
 ## Hub rate limit
 
 `XYTE_MCP_RATE_BUCKET_SECRET` (optional) must equal the value set on the hub for this server.
-When it is set, the server sends it on every hub call (API calls and the hub token, refresh
-and revoke calls), and the hub counts all of this server's traffic in one shared bucket. When
-it is unset, the hub limits hosted traffic per IP. The value is never logged. It must be
-visible ASCII (no spaces or line breaks); anything else is a config error that names the
-variable but not the value, so it fails the release (see [A failed release](#a-failed-release)).
+When it is set, the server sends it on every hub call, and the hub moves the API calls and the
+hub token, refresh and revoke calls from its per-IP limits to one shared bucket for this
+server. The token, refresh and revoke calls still count against the hub's per-client limit
+for this server's OAuth client; the secret does not lift that one. When it is unset, the hub
+limits hosted traffic per IP. The value is never logged.
+
+It must be visible ASCII (no spaces or line breaks); anything else is a config error that
+names the variable but not the value, so it fails the release (see
+[A failed release](#a-failed-release)). While it is set, the server does not follow hub
+redirects, so `XYTE_HUB_URL` must be the final hub URL (a redirect fails the call).
+
+- **Rollout:** set the same value on both apps, in either order. Until both match, the hub
+  silently keeps the per-IP limits: nothing fails and this server logs nothing about it. The
+  same holds for a typo; the hub does not trim the value it compares. After a change, confirm
+  on the hub side that this server's requests reach the shared bucket.
+- **Rotation:** change the value on both apps together. Requests sent while the two differ fall
+  back to the per-IP limits.
 
 ## Alerts
 
@@ -300,8 +312,10 @@ it from production data**.
   at the hub (for example the OAuth app was disabled there). `hub_save_failed` means database
   trouble: the new hub tokens could not be saved, so look at the database first.
 - **Rate-limit hits:** which source. Router `429` on `/token` or `/register` from one IP is
-  usually a client's backend. A hub `429` (`tool_call` `status=429` or `hub_refresh`
-  `rate_limited`) usually means the hub's limit for this whole server, which every
-  organization on the server shares, not one tenant: the shared bucket when
-  `XYTE_MCP_RATE_BUCKET_SECRET` is set ([Hub rate limit](#hub-rate-limit)), otherwise the
-  limit for this server's address. Count the `organization` values before chasing one.
+  usually a client's backend. A hub `429` is shared by every organization on the server, not
+  one tenant; count the `organization` values before chasing one
+  ([Hub rate limit](#hub-rate-limit)):
+  - `tool_call` `status=429`: the shared bucket when `XYTE_MCP_RATE_BUCKET_SECRET` is set,
+    otherwise the per-IP limit for this server's address.
+  - `hub_refresh` `rate_limited`: the same, or the hub's per-client limit on its token
+    endpoint for this server's OAuth client, which the secret does not lift.

@@ -140,6 +140,9 @@ describe('resolveHttpConfig', () => {
     expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: '  s3cret!~  ' }).rateBucketSecret).toBe(
       's3cret!~'
     );
+    for (const padded of ['secret\n', '\r\nsecret\r\n']) {
+      expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: padded }).rateBucketSecret).toBe('secret');
+    }
     for (const blank of [undefined, '', '   ']) {
       expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: blank })).not.toHaveProperty(
         'rateBucketSecret'

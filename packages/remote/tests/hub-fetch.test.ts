@@ -1,6 +1,8 @@
 import { createServer, type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { describe, expect, it, vi } from 'vitest';
+import { createHttpClient } from '@xyteai/mcp/http/client.js';
+import { XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { RATE_BUCKET_SECRET_HEADER, withRateBucketSecret } from '../src/hub-fetch.js';
 
 const HUB = 'http://127.0.0.1:4100';
@@ -58,26 +60,46 @@ describe('withRateBucketSecret', () => {
 
   // Node's fetch keeps custom headers on a cross-origin redirect; hub never redirects these calls.
   it('never carries the secret across a hub redirect', async () => {
-    const received: IncomingHttpHeaders[] = [];
-    const other = createServer((req, res) => {
-      received.push(req.headers);
-      res.end('elsewhere');
-    });
-    const hub = createServer((_req, res) => {
-      res.writeHead(302, { Location: `http://127.0.0.1:${(other.address() as AddressInfo).port}/landing` });
-      res.end();
-    });
-    await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve));
-    await new Promise<void>((resolve) => hub.listen(0, '127.0.0.1', resolve));
-    try {
-      const hubUrl = `http://127.0.0.1:${(hub.address() as AddressInfo).port}`;
+    const received = await withRedirectingHub(async (hubUrl) => {
       const response = await withRateBucketSecret(hubUrl, SECRET)(`${hubUrl}/oauth/token`, { method: 'POST' });
       expect(response.status).toBe(302);
-      // Not followed at all, so the other server never sees the request (or the secret).
-      expect(received).toEqual([]);
-    } finally {
-      await new Promise<void>((resolve) => hub.close(() => resolve()));
-      await new Promise<void>((resolve) => other.close(() => resolve()));
-    }
+    });
+    // Not followed at all, so the other server never sees the request (or the secret).
+    expect(received).toEqual([]);
+  });
+
+  it('turns a hub redirect into an HTTP error for an API call, without the secret in it', async () => {
+    const received = await withRedirectingHub(async (hubUrl) => {
+      const http = createHttpClient({ fetchImpl: withRateBucketSecret(hubUrl, SECRET) });
+      const error: unknown = await http
+        .request({ method: 'GET', url: `${hubUrl}/core/v1/organization/devices`, headers: {}, endpointKey: 'k' })
+        .then(() => undefined, (rejection: unknown) => rejection);
+      expect(error).toBeInstanceOf(XyteHttpError);
+      expect((error as XyteHttpError).status).toBe(302);
+      expect(JSON.stringify([(error as XyteHttpError).message, (error as XyteHttpError).body])).not.toContain(SECRET);
+    });
+    expect(received).toEqual([]);
   });
 });
+
+/** Runs `use` against a hub that 302s everything to a second server; returns what that server received. */
+async function withRedirectingHub(use: (hubUrl: string) => Promise<void>): Promise<IncomingHttpHeaders[]> {
+  const received: IncomingHttpHeaders[] = [];
+  const other = createServer((req, res) => {
+    received.push(req.headers);
+    res.end('elsewhere');
+  });
+  const hub = createServer((_req, res) => {
+    res.writeHead(302, { Location: `http://127.0.0.1:${(other.address() as AddressInfo).port}/landing` });
+    res.end();
+  });
+  await new Promise<void>((resolve) => other.listen(0, '127.0.0.1', resolve));
+  await new Promise<void>((resolve) => hub.listen(0, '127.0.0.1', resolve));
+  try {
+    await use(`http://127.0.0.1:${(hub.address() as AddressInfo).port}`);
+  } finally {
+    await new Promise<void>((resolve) => hub.close(() => resolve()));
+    await new Promise<void>((resolve) => other.close(() => resolve()));
+  }
+  return received;
+}

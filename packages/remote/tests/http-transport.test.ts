@@ -626,29 +626,27 @@ describe('http transport: token store outage', () => {
 
 describe('http transport: rate bucket secret', () => {
   // The value checks themselves are resolveHttpConfig's (config.test.ts).
-  it.each(['leaky-secret\nx'])(
-    'refuses to boot on a secret that is not visible ASCII (%j), without naming the value',
-    async (secret) => {
-      const port = await freePort();
-      const booted = startHttpServer({
-        PORT: String(port),
-        XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
-        XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
-        XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
-        XYTE_MCP_RATE_BUCKET_SECRET: secret
-      });
-      const error = await booted.then(
-        (listener) => {
-          listener.close();
-          throw new Error('booted');
-        },
-        (rejection: unknown) => rejection as { kind: string; message: string }
-      );
-      expect(error.kind).toBe('config');
-      expect(error.message).toContain('XYTE_MCP_RATE_BUCKET_SECRET');
-      expect(error.message).not.toContain('leaky');
-    }
-  );
+  it('refuses to boot on a secret that is not visible ASCII, without naming the value', async () => {
+    const secret = 'leaky-secret\nx';
+    const port = await freePort();
+    const booted = startHttpServer({
+      PORT: String(port),
+      XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+      XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+      XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
+      XYTE_MCP_RATE_BUCKET_SECRET: secret
+    });
+    const error = await booted.then(
+      (listener) => {
+        listener.close();
+        throw new Error('booted');
+      },
+      (rejection: unknown) => rejection as { kind: string; message: string; hints: string[] }
+    );
+    expect(error.kind).toBe('config');
+    expect(error.message).toContain('XYTE_MCP_RATE_BUCKET_SECRET');
+    expect(JSON.stringify([error.message, error.hints])).not.toContain('leaky');
+  });
 });
 
 describe('cli', () => {

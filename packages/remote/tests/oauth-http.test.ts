@@ -137,6 +137,7 @@ let hubChallenge: string | undefined;
 let base = '';
 let hub: ReturnType<typeof fakeHub>;
 const stderr: string[] = [];
+const stdout: string[] = [];
 let serverEnv: NodeJS.ProcessEnv;
 let admin: pg.Pool | undefined;
 
@@ -188,6 +189,8 @@ async function startServer(): Promise<void> {
   });
   child.stderr?.setEncoding('utf8');
   child.stderr?.on('data', (chunk: string) => stderr.push(chunk));
+  child.stdout?.setEncoding('utf8');
+  child.stdout?.on('data', (chunk: string) => stdout.push(chunk));
 
   const deadline = Date.now() + 10_000;
   for (;;) {
@@ -502,6 +505,7 @@ describe('oauth over http, in order', () => {
     expect(response.status).toBe(200);
     const result = (await response.json()) as { result?: { isError?: boolean } };
     expect(result.result?.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(RATE_BUCKET_SECRET);
 
     await vi.waitFor(() => expect(events('tool_call')).toHaveLength(2));
     expect(events('tool_call')[1]).toMatchObject({
@@ -529,6 +533,27 @@ describe('oauth over http, in order', () => {
     expect(tokens.access_token).not.toBe(accessToken);
     accessToken = tokens.access_token;
     refreshToken = tokens.refresh_token;
+  });
+
+  it('refreshes the hub token when hub rejects it, sending the rate bucket secret', async () => {
+    rejectNextHubCall = true;
+    const before = hub.requests.length;
+    try {
+      const response = await mcp(accessToken, {
+        jsonrpc: '2.0',
+        id: 7,
+        method: 'tools/call',
+        params: { name: 'xyte_api_call', arguments: { key: 'organization.devices.getDevices' } }
+      });
+      expect(response.status).toBe(200);
+    } finally {
+      rejectNextHubCall = false;
+    }
+    const refresh = hub.requests
+      .slice(before)
+      .find((request) => new URLSearchParams(request.body as string).get('grant_type') === 'refresh_token')!;
+    expect(refresh).toBeDefined();
+    expect((refresh.headers as Record<string, string>)['x-mcp-rate-bucket-secret']).toBe(RATE_BUCKET_SECRET);
   });
 
   it('revocation kills the grant: both tokens stop working', async () => {
@@ -559,6 +584,7 @@ describe('oauth over http, in order', () => {
     expect(all).not.toContain('xmcp_');
     expect(all).not.toContain('user@example.com');
     expect(all).not.toContain(RATE_BUCKET_SECRET);
+    expect(stdout.join('')).not.toContain(RATE_BUCKET_SECRET);
   });
 
   it.skipIf(PG_URL)('warned at boot that the token store is in-memory', () => {
@@ -818,7 +844,7 @@ describe('oauth over http, in order', () => {
   it('sent the rate bucket secret on every hub call, and never logged it', () => {
     const grantTypes = hub.requests.map((request) => new URLSearchParams(request.body as string).get('grant_type'));
     expect(grantTypes).toContain('authorization_code');
-    if (process.platform !== 'win32') expect(grantTypes).toContain('refresh_token'); // the SIGTERM test's refresh
+    expect(grantTypes).toContain('refresh_token');
     const urls = hub.requests.map((request) => request.url as string);
     expect(urls).toContain('/oauth/revoke');
     expect(urls.some((url) => url.startsWith('/core/v1/organization/'))).toBe(true);
@@ -828,5 +854,6 @@ describe('oauth over http, in order', () => {
       );
     }
     expect(stderr.join('')).not.toContain(RATE_BUCKET_SECRET);
+    expect(stdout.join('')).not.toContain(RATE_BUCKET_SECRET);
   });
 });

@@ -227,25 +227,6 @@
       "sourceFile": "Organization API/Devices/Get Device.bru"
     },
     {
-      "key": "organization.devices.getDeviceDetailsHistory",
-      "namespace": "organization",
-      "group": "devices",
-      "action": "getDeviceDetailsHistory",
-      "title": "Get Device Details History",
-      "description": "## Success\n**200 OK** — the device's current `details` and its earlier values, newest first.\n\nHistory starts at the later of the endpoint's release and the device's claim by your organization; earlier changes are not available, so a newly claimed device starts with empty history. Some frequently changing fields, set per device model, are not tracked: a change to only those fields adds no history entry and does not update `since`.\n```json\n{\n  \"current\": {\n    \"details\": { \"firmware\": \"3.0\" },\n    \"since\": \"2026-11-15T12:00:00.000Z\"\n  },\n  \"history\": [\n    {\n      \"details\": { \"firmware\": \"2.0\" },\n      \"valid_from\": \"2026-11-14T12:00:00.000Z\",\n      \"valid_until\": \"2026-11-15T12:00:00.000Z\",\n      \"slot\": \"latest\"\n    },\n    {\n      \"details\": { \"firmware\": \"1.0\" },\n      \"valid_from\": null,\n      \"valid_until\": \"2026-10-07T12:00:00.000Z\",\n      \"slot\": \"month\"\n    }\n  ]\n}\n```\n- `current.since` — when the current details replaced the previous value; `null` when no change has been recorded.\n- `history` — the last 5 recorded changes (`slot: \"latest\"`), plus at most one older value that was at least a week old (`week`) and one at least 30 days old (`month`) when the details last changed. Entries can have gaps between them, so read each entry's `valid_from` and `valid_until`. Empty when no change has been recorded.\n- `valid_from` / `valid_until` — when that value was in effect; `valid_from` is `null` when it is not known.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header, or the device does not exist or does not belong to the organization.",
-      "method": "GET",
-      "base": "hub",
-      "pathTemplate": "/core/v1/organization/devices/:device_id/details",
-      "pathParams": [
-        "device_id"
-      ],
-      "queryParams": [],
-      "authScope": "organization",
-      "bodyType": "none",
-      "mutating": false,
-      "sourceFile": "Organization API/Devices/Get Device Details History.bru"
-    },
-    {
       "key": "organization.devices.getDevices",
       "namespace": "organization",
       "group": "devices",
@@ -956,6 +937,26 @@
       "sourceFile": "Organization API/Notes/Create Device Note.bru"
     },
     {
+      "key": "organization.notes.createIncidentNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "createIncidentNote",
+      "title": "Create Incident Note",
+      "description": "The note is attributed to the calling API key and shows up on the incident in the portal as `API · <key name>`. Called with an OAuth2 bearer token, it is attributed to the user who signed in for the token, as if they wrote it in the portal.\n\n## Success\n**200 OK** — the created note (same fields as **Get Incident Notes**).\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**403 Forbidden** — The call was made with an OAuth2 bearer token that no user signed in for.\n**404 Not Found** — No such incident in the organization.\n**422 Unprocessable Entity** — `content` is blank or longer than 2,000 characters.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents/:incident_id/notes",
+      "pathParams": [
+        "incident_id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"content\": \"Vendor ticket #4821 opened, waiting on a replacement unit.\"\n}",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Create Incident Note.bru"
+    },
+    {
       "key": "organization.notes.createSpaceNote",
       "namespace": "organization",
       "group": "notes",
@@ -992,6 +993,26 @@
       "bodyType": "none",
       "mutating": true,
       "sourceFile": "Organization API/Notes/Delete Device Note.bru"
+    },
+    {
+      "key": "organization.notes.deleteIncidentNote",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "deleteIncidentNote",
+      "title": "Delete Incident Note",
+      "description": "An API key can delete only the notes it wrote itself; an OAuth2 bearer token only the notes of the user who signed in for it.\n\n## Success\n**200 OK** — `{ \"success\": true }`\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**403 Forbidden** — The note was written by someone other than the caller (a portal user, another API key, or another user's bearer token).\n**404 Not Found** — No such incident in the organization, or no such note on the incident.",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents/:incident_id/notes/:id",
+      "pathParams": [
+        "incident_id",
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Organization API/Notes/Delete Incident Note.bru"
     },
     {
       "key": "organization.notes.deleteSpaceNote",
@@ -1032,6 +1053,26 @@
       "sourceFile": "Organization API/Notes/Get All Device Notes.bru"
     },
     {
+      "key": "organization.notes.getAllIncidentNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getAllIncidentNotes",
+      "title": "Get All Incident Notes",
+      "description": "## Query params\n- `page` — page number, starting at `1` (default `1`).\n- `per_page` — notes per page (default `20`, max `500`; larger values are capped at `500`).\n\n## Success\n**200 OK** — the notes of every incident in the organization, newest first (same shape as **Get Incident Notes**). `has_next_page` is `true` while more pages follow.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents/notes",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get All Incident Notes.bru"
+    },
+    {
       "key": "organization.notes.getAllSpaceNotes",
       "namespace": "organization",
       "group": "notes",
@@ -1070,6 +1111,28 @@
       "bodyType": "none",
       "mutating": false,
       "sourceFile": "Organization API/Notes/Get Device Notes.bru"
+    },
+    {
+      "key": "organization.notes.getIncidentNotes",
+      "namespace": "organization",
+      "group": "notes",
+      "action": "getIncidentNotes",
+      "title": "Get Incident Notes",
+      "description": "## Query params\n- `page` — page number, starting at `1` (default `1`).\n- `per_page` — notes per page (default `20`, max `500`; larger values are capped at `500`).\n\n## Success\n**200 OK** — the incident's notes, newest first.\n```json\n{\n  \"items\": [\n    {\n      \"id\": \"5b0f6a1e-8c3d-4f2a-9e71-2d4c8b6a0f13\",\n      \"content\": \"Vendor ticket #4821 opened, waiting on a replacement unit.\",\n      \"notable_type\": \"Incident\",\n      \"notable_id\": \"a2c9e4f0-3b7d-4e18-8f56-0c1d2e3f4a5b\",\n      \"created_by\": null,\n      \"author\": \"API · Ops bot\",\n      \"api_key_id\": \"e7d3b2a1-6c5f-4d8e-9a0b-1c2d3e4f5a6b\",\n      \"created_at\": \"2026-10-29T10:00:00Z\",\n      \"updated_at\": \"2026-10-29T10:00:00Z\"\n    }\n  ],\n  \"has_next_page\": false\n}\n```\n- `author` — the portal user's name, or `API · <key name>` for a note written through the API (`API` when the key has no name, or for an internal integration key). `null` once the author is gone.\n- `created_by` — the portal user who wrote the note; `null` for API notes.\n- `api_key_id` — the API key that wrote the note; `null` for portal notes and internal integration keys.\n- `has_next_page` — `true` while more pages follow.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header.\n**404 Not Found** — No such incident in the organization.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/incidents/:incident_id/notes",
+      "pathParams": [
+        "incident_id"
+      ],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Notes/Get Incident Notes.bru"
     },
     {
       "key": "organization.notes.getSpaceNotes",
@@ -1394,6 +1457,83 @@
       "sourceFile": "Organization API/Users/Resend Welcome Email.bru"
     },
     {
+      "key": "partner.coupons.createCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "createCoupon",
+      "title": "Create Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Body\n- `name` — required.\n- `code` and/or `organization_tag_id` — at least one. A code is redeemed by the customer; a tag hands the coupon to every organization carrying it.\n- `discount_type` — `percent` with `percent_off` (1-100), or `fixed_amount` with `amount_off` and `currency`.\n- `amount_off` — in major units of `currency` (12.34 USD, 500 JPY); more decimals than the currency has is rejected, never rounded. `currency` must be one of the store currencies.\n- `store_listing_id` — optional; omitted means the whole store.\n- `starts_at` / `ends_at` — optional ISO 8601 exact instants with a UTC offset; `ends_at` is exclusive. See \"Dates\" below.\n- `active` — defaults to true.\n\n## Dates\nThe Partner portal shows dates in the viewer's time zone. To match \"valid from <first day> through <last day>\":\n- `starts_at` — midnight that starts the first day, in the user's time zone. Example: `2026-12-01T00:00:00-05:00`.\n- `ends_at` — the last millisecond of the last day, in the same time zone. Example: `2026-12-31T23:59:59.999-05:00`. This is what the portal stores for \"through Dec 31\".\n- Do not send midnight of the next day (`2027-01-01T00:00:00`). The portal then shows Jan 1 as the end date.\n- If you do not know the user's time zone, ask for it.\n\n## How coupons apply\n- A customer gets the coupons of its organization tags plus the coupons it redeemed by code.\n- Per product, price interval and currency, the store applies one coupon: the one with the largest discount. Coupons never add up. On a tie, the older coupon wins.\n- A coupon applies only while it is active, after `starts_at` and before `ends_at`.\n\n## Free and minimum prices\nThe coupon is checked against every price it targets: every listing for a whole-store coupon, or the one listing. A `fixed_amount` coupon checks only prices in its currency.\n- **422** `Coupon would make the <interval> price of '<listing name>' free` — the discount is equal to or larger than a monthly or yearly price.\n- **422** `Coupon would bring the <interval> price of '<listing name>' below the minimum charge` — the price left is above 0 but below the minimum charge (the equivalent of 0.70 USD).\n- One-time prices may become free (0). They may not end between 0 and the minimum charge.\n- Create the coupon first. Add the tag to organizations only after the coupon exists.\n\n## Success\n**201 Created** — the new coupon, in the shape of Get Coupons.\n\n**200 OK** — an identical coupon of the partner already exists (a safe retry). It is returned in the same shape and nothing is created.\n\n## Errors\n- **404** — `organization_tag_id` or `store_listing_id` is not the partner's.\n- **422** — validation, e.g. `Code is not available` (the code is taken, including by this partner's coupon with different fields), `amount_off has too many decimal places for USD`.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold 10\",\n  \"discount_type\": \"fixed_amount\",\n  \"amount_off\": 12.34,\n  \"currency\": \"USD\",\n  \"organization_tag_id\": \"....-d75e0abec7d2\",\n  \"store_listing_id\": \"....-c3\",\n  \"starts_at\": \"2026-03-01T00:00:00Z\",\n  \"ends_at\": \"2026-03-31T23:59:59.999Z\",\n  \"active\": true\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Create Coupon.bru"
+    },
+    {
+      "key": "partner.coupons.deleteCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "deleteCoupon",
+      "title": "Delete Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\nDeletes the coupon and every redemption of it, so no organization gets it any more.\n\nA coupon used in orders cannot be deleted: the orders keep pointing at it. Stop it instead with Update Coupon and `\"active\": false`.\n\n## Success\n**204 No Content**.\n\n## Errors\n- **403** — `Deactivate the coupon instead; it was used in orders`.\n- **404** — the coupon is not the partner's, or it was already deleted.",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Delete Coupon.bru"
+    },
+    {
+      "key": "partner.coupons.getCoupons",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "getCoupons",
+      "title": "Get Coupons",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Success\n**200 OK** — the partner's coupons, newest first.\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 500. Any other value returns **422** with `{ \"error\": \"...\" }`.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"name\": \"Gold 10\",\n      \"code\": null,\n      \"discount_type\": \"fixed_amount\",\n      \"percent_off\": null,\n      \"amount_off\": 12.34,\n      \"currency\": \"USD\",\n      \"active\": true,\n      \"status\": \"active\",\n      \"starts_at\": \"2026-03-01T00:00:00.000Z\",\n      \"ends_at\": null,\n      \"organization_tag\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"Gold\" },\n      \"store_listing\": { \"id\": \"....-c3\", \"name\": \"Pro plan\" },\n      \"tagged_organizations_count\": 12,\n      \"redemptions_count\": 0,\n      \"used_in_orders\": true,\n      \"created_at\": \"2026-02-20T10:00:00.000Z\"\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `amount_off` — in major units of `currency` (12.34 USD, 500 JPY).\n- `status` — `active`, `scheduled` (before `starts_at`), `expired` (from `ends_at` on) or `inactive`.\n- `starts_at` / `ends_at` — exact instants; `ends_at` is exclusive. The portal stores \"through Dec 31\" as `ends_at` = Dec 31, 23:59:59.999 in the user's time zone (see Create Coupon).\n- Per product, interval and currency, the store applies one coupon: the one with the largest discount. Coupons never add up.\n- `redemptions_count` — code redemptions only, so always 0 for a tag-only coupon. `tagged_organizations_count` — organizations carrying the coupon's tag.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Coupons/Get Coupons.bru"
+    },
+    {
+      "key": "partner.coupons.updateCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "updateCoupon",
+      "title": "Update Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Body\nTakes the fields of Create Coupon. Only the fields sent change:\n- An omitted field keeps its value.\n- A field sent as `null` is cleared, e.g. `\"code\": null`, `\"store_listing_id\": null` (the whole store) or `\"ends_at\": null`.\n- `active: false` stops the coupon at once; `active` cannot be `null`.\n- `amount_off` without `currency` is in the coupon's currency.\n- `currency` without `amount_off` keeps the amount in major units, e.g. 5 USD becomes 5 JPY. If the amount does not fit the new currency's decimals, send `amount_off` too.\n- Changing `discount_type` clears the other type's fields: `percent_off` on a switch to `fixed_amount`, `amount_off` and `currency` on a switch to `percent`.\n- Dates follow the rules of Create Coupon. For \"valid through Dec 31\", send `ends_at` as `2026-12-31T23:59:59.999` with the user's UTC offset.\n- When a discount field changes, the free and minimum-price checks of Create Coupon run again.\n\nSending the same body again changes nothing and returns the same coupon.\n\n## Success\n**200 OK** — the coupon, in the shape of Get Coupons.\n\n## Errors\n- **404** — the coupon, `organization_tag_id` or `store_listing_id` is not the partner's.\n- **422** — validation, e.g. `Code is not available`, `active must be true or false`, `percent_off must be a whole number`.",
+      "method": "PATCH",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold 15\",\n  \"percent_off\": 15,\n  \"ends_at\": null,\n  \"active\": false\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Update Coupon.bru"
+    },
+    {
       "key": "partner.devices.deleteDevice",
       "namespace": "partner",
       "group": "devices",
@@ -1551,6 +1691,108 @@
       "bodyExample": "{\n  \"name\": \"Acme Corp\",\n  \"admin_contact_email\": \"admin@acme.com\",\n  \"admin_contact_name\": \"Alice Smith\",\n  \"finance_contact_email\": \"finance@acme.com\",\n  \"finance_contact_name\": \"Bob Jones\"\n}",
       "mutating": true,
       "sourceFile": "Partner API/Organizations/Create Organization.bru"
+    },
+    {
+      "key": "partner.organizations.getOrganizations",
+      "namespace": "partner",
+      "group": "organizations",
+      "action": "getOrganizations",
+      "title": "Get Organizations",
+      "description": "## Query\n- `name` — optional, case-insensitive substring of the organization name.\n- `tag` — optional, exact organization tag name of the partner, case-insensitive.\n- `page` — starts at 1. Organizations are ordered by name.\n- `per_page` — optional, 1-500, default 500. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\nTo find a customer by name, filter with `name`. Do not page through all organizations.\n\n## Success\n**200 OK** — the organizations visible to the partner, with the partner's tags and the coupons reaching each.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"name\": \"Acme Corp\",\n      \"store_visible\": true,\n      \"tags\": [{ \"id\": \"....-d75e0abec7d2\", \"name\": \"Gold\", \"note\": \"Renewed in May\" }],\n      \"coupons\": [\n        { \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\", \"source\": \"tag\" },\n        { \"id\": \"....-b2\", \"name\": \"Spring\", \"status\": \"expired\", \"source\": \"code\" }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `store_visible` — whether the organization sees the partner's store: a tag coupon discounts the customer only when `store_visible` is true.\n- `coupons` — `source: tag` for a coupon of one of the organization's tags, `source: code` for one the organization redeemed by code; a coupon reached both ways is listed once, as `code`. `status` is `active`, `scheduled`, `expired` or `inactive`. Empty when `store_visible` is false or store coupons are not enabled for the partner.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "name",
+        "tag"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Organizations/Get Organizations.bru"
+    },
+    {
+      "key": "partner.organizationTags.addOrganizationTag",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "addOrganizationTag",
+      "title": "Add Organization Tag",
+      "description": "Attaches a partner organization tag to an organization, creating the tag on first use. Tag names are case-insensitive; up to 50 tags per organization.\n\n- Tags cannot be deleted. They can only be removed from organizations.\n- A tag added with an API key shows no \"added by\" person in the Partner portal.\n- To give a tag a coupon, create the coupon first (Create Coupon). Add the tag to organizations after that.\n\n## Success\n**200 OK** — the tag is attached. If it was already attached, the existing note is kept.\n```json\n{\n  \"id\": \"....-d75e0abec7d2\",\n  \"name\": \"Gold\",\n  \"note\": \"Renewed in May\",\n  \"store_visible\": true,\n  \"coupons\": [{ \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\", \"source\": \"tag\" }]\n}\n```\n- `id` — the organization tag id, used as `organization_tag_id` when creating a coupon.\n- `coupons` — every coupon now applied to the organization (same list as GET organizations: `source` `tag` or `code`, empty without the Store plan feature or the `store_coupons` flag); a tag coupon discounts the customer only when `store_visible` is true.\n\n## Errors\n- **404** — the organization is not visible to the partner.\n- **422** — `name` is blank, or the organization already has 50 tags.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations/:organization_id/tags",
+      "pathParams": [
+        "organization_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold\",\n  \"note\": \"Renewed in May\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Organization Tags/Add Organization Tag.bru"
+    },
+    {
+      "key": "partner.organizationTags.getOrganizationTags",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "getOrganizationTags",
+      "title": "Get Organization Tags",
+      "description": "The partner's organization tags, by name. Tags cannot be deleted. To stop using a tag, remove it from each organization (Remove Organization Tag).\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 500. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-d75e0abec7d2\",\n      \"name\": \"Gold\",\n      \"organizations_count\": 12,\n      \"coupons\": [\n        { \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\" }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n\n- `organizations_count` — organizations visible to the partner that carry the tag.\n- `coupons` — the partner's coupons handed out by the tag. `status` is `active`, `scheduled`, `expired` or `inactive`. Empty without the Store plan feature or store coupons.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organization_tags",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Organization Tags/Get Organization Tags.bru"
+    },
+    {
+      "key": "partner.organizationTags.removeOrganizationTag",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "removeOrganizationTag",
+      "title": "Remove Organization Tag",
+      "description": "Removes one of the partner's tags from an organization. The tag itself stays. Tags cannot be deleted.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"coupons_removed\": [\n    { \"id\": \"....-a1\", \"name\": \"Gold 10\" }\n  ]\n}\n```\n\n`coupons_removed` lists the coupons the organization got through this tag and no longer gets. A coupon that still reaches it through another tag, or that it redeemed by code, is not listed. It is empty without the Store plan feature or store coupons, or when the organization is not `store_visible`.\n\n## Errors\n- **404** — the organization is not visible to the partner, or the tag is not attached to it (including a second remove of the same tag).",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations/:organization_id/tags/:tag_id",
+      "pathParams": [
+        "organization_id",
+        "tag_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Organization Tags/Remove Organization Tag.bru"
+    },
+    {
+      "key": "partner.storeListings.getStoreListings",
+      "namespace": "partner",
+      "group": "storeListings",
+      "action": "getStoreListings",
+      "title": "Get Store Listings",
+      "description": "Requires the Store plan feature (403 otherwise). The partner's store listings, in store order. Use an `id` as a coupon's `store_listing_id`.\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 500. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-c3\",\n      \"name\": \"Remote care\",\n      \"status\": \"published\",\n      \"pricing_model\": \"standard\",\n      \"prices\": [\n        { \"currency\": \"USD\", \"one_time_price\": 10.5, \"monthly_price\": 20, \"yearly_price\": null }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n\n- `status` — `draft`, `published` or `archived`.\n- `pricing_model` — a coupon can target only a `standard` listing.\n- `prices` — one row per currency; amounts in major units, `null` when the listing has no such price.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/store_listings",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Store Listings/Get Store Listings.bru"
     },
     {
       "key": "partner.tickets.addComment",

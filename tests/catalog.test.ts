@@ -84,16 +84,24 @@ describe('listEndpoints', () => {
     expect(reads.some((endpoint) => endpoint.mutating)).toBe(false);
   });
 
-  it('searches case-insensitively across key, title and path', () => {
+  it('searches case-insensitively across key, title, path and description', () => {
     const results = listEndpoints({ search: 'INCIDENT' });
     expect(results.length).toBeGreaterThan(0);
     expect(
       results.every((endpoint) =>
-        `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate}`
+        `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate} ${endpoint.description ?? ''}`
           .toLowerCase()
           .includes('incident')
       )
     ).toBe(true);
+  });
+
+  it('finds an endpoint by a word only its description uses', () => {
+    // An agent asked to "give 20% off" searches "discount"; only the coupon descriptions say it.
+    const createCoupon = getEndpoint('partner.coupons.createCoupon');
+    expect(`${createCoupon?.key} ${createCoupon?.title} ${createCoupon?.pathTemplate}`.toLowerCase()).not.toContain('discount');
+    const keys = listEndpoints({ search: 'discount' }).map((endpoint) => endpoint.key);
+    expect(keys).toContain('partner.coupons.createCoupon');
   });
 
   it('combines filters conjunctively', () => {

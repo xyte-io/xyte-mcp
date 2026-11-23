@@ -21,7 +21,7 @@ export function startLoop(loopName) {
 
   const env = process.env;
   const hubUrl = env.XYTE_HUB_URL?.trim();
-  if (!hubUrl) fail('set XYTE_HUB_URL to the hub to test; this loop writes, so it never uses the default.');
+  if (!hubUrl) fail('set XYTE_HUB_URL to the hub to test; this loop can write, so it never uses the default.');
   let hubHost;
   try {
     hubHost = new URL(hubUrl).hostname.replace(/\.$/, '');

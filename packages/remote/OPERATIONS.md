@@ -248,9 +248,8 @@ failed:`; a connect or TLS failure has the outer prefix only.
 When it is set, the server sends it on every hub call (API calls and the hub token, refresh
 and revoke calls), and the hub counts all of this server's traffic in one shared bucket. When
 it is unset, the hub limits hosted traffic per IP. The value is never logged. It must be
-visible ASCII (no spaces or line breaks); anything else stops the boot with a config error that
-names the variable but not the value. The release phase does not check it, so a bad value
-fails the web dynos' boot, not the release.
+visible ASCII (no spaces or line breaks); anything else is a config error that names the
+variable but not the value, so it fails the release (see [A failed release](#a-failed-release)).
 
 ## Alerts
 

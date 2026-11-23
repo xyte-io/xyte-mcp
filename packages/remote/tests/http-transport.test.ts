@@ -625,8 +625,8 @@ describe('http transport: token store outage', () => {
 });
 
 describe('http transport: rate bucket secret', () => {
-  // fetch's own "invalid header value" error would echo the value into a tool result.
-  it.each(['leaky-secret\nx', 'leaky-secret é', 'leaky secret'])(
+  // The value checks themselves are resolveHttpConfig's (config.test.ts).
+  it.each(['leaky-secret\nx'])(
     'refuses to boot on a secret that is not visible ASCII (%j), without naming the value',
     async (secret) => {
       const port = await freePort();

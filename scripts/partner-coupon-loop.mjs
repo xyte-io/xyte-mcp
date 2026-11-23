@@ -140,8 +140,9 @@ async function main() {
       const created = await call('partner.coupons.createCoupon', {
         body: { name: NAME.wholeStore, discount_type: 'percent', percent_off: 10, organization_tag_id: silverId }
       });
-      check('flow 1: percent coupon for the whole store', created.ok && created.data.percent_off === 10 && created.data.store_listing === null,
-        created.ok ? `status ${created.data.status}` : created.text);
+      check('flow 1: percent coupon for the whole store',
+        created.ok && created.status === 201 && created.data.percent_off === 10 && created.data.store_listing === null,
+        created.ok ? `HTTP ${created.status}, status ${created.data.status}` : created.text);
     }
 
     if (run('2')) {
@@ -187,7 +188,9 @@ async function main() {
       check('flow 4: tag coupon attached to five customers', first.ok && tagged.every((response) => response.ok && response.data.id === goldId),
         first.ok ? `tag ${goldId}` : first.text);
       const goldCoupons = rows(await call('partner.coupons.getCoupons')).filter((coupon) => coupon.name === NAME.gold);
-      check('repeat-safe: create coupon twice leaves one coupon', again.ok && again.data.id === first.data?.id && goldCoupons.length === 1);
+      check('repeat-safe: create coupon twice leaves one coupon (201, then 200)',
+        first.status === 201 && again.ok && again.status === 200 && again.data.id === first.data?.id && goldCoupons.length === 1,
+        `HTTP ${first.status}, then ${again.status}`);
       const goldRows = rows(await call('partner.organizations.getOrganizations', { query: { tag: NAME.goldTag } }));
       check('repeat-safe: attach tag twice leaves one tag link', retag.ok && goldRows.filter((row) => row.id === targets[0].id).length === 1
         && retag.data.coupons.some((coupon) => coupon.id === first.data?.id));

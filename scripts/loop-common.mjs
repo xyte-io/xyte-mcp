@@ -32,7 +32,6 @@ export function startLoop(loopName) {
   if (hubHost === PRODUCTION_HOST) fail('refusing to run against production.');
   const key = env.XYTE_PARTNER_API_KEY?.trim();
   if (!key) fail('set XYTE_PARTNER_API_KEY to the partner key under test.');
-  if (!existsSync(ENTRY)) fail(`not built; run npm run build (missing ${ENTRY}).`);
 
   const results = [];
   const servers = [];
@@ -73,7 +72,9 @@ export function startLoop(loopName) {
     return stderr;
   }
 
+  // Checked here, after the caller's own env checks, so those run without a build.
   async function startMcpServerClient(partnerApiKey, extraEnv = {}) {
+    if (!existsSync(ENTRY)) fail(`not built; run npm run build (missing ${ENTRY}).`);
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [ENTRY],

@@ -65,10 +65,13 @@ function skipFrom(link, why) {
 const hasStorePayment = (order) => Boolean(order.payment) && order.payment_method !== 'offline';
 
 async function chain(call) {
-  let couponId = env.XYTE_LOOP_COUPON_ID?.toLowerCase();
+  let couponId = env.XYTE_LOOP_COUPON_ID?.trim().toLowerCase();
   if (!couponId) {
     const coupons = await call('partner.coupons.getCoupons');
-    if (!coupons.ok) return check('chain: coupons: list', false, firstLine(coupons));
+    if (!coupons.ok) {
+      check('chain: coupons: list', false, firstLine(coupons));
+      return skipFrom(LINKS[0], 'coupon list failed; set XYTE_LOOP_COUPON_ID');
+    }
     couponId = rows(coupons).find((coupon) => coupon.used_in_orders === true)?.id;
   }
   if (!couponId) return skipFrom(LINKS[0], 'no coupon used in an order; set XYTE_LOOP_COUPON_ID');

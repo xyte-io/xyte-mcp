@@ -108,8 +108,9 @@ parameter name produces a precise message instead of an opaque HTTP 4xx.
   Before it proposes a delete or removal it reads that endpoint's contract, so its plan says
   what the API will refuse and what it will do instead. A create request that matches
   something existing is reported, not applied.
-- **Approving an order is not confirm-gated:** it is a `POST`, so it goes ahead like any
-  other write, though it cannot be undone (see DEV-8178).
+- **Approving an order is not confirm-gated:** it cannot be undone, so the model is told to
+  ask for your yes first, but the server does not require `confirm` for it as it does for a
+  `DELETE`. Run with `XYTE_MCP_READ_ONLY=1` to refuse it outright.
 - **Other writes go ahead:** creates and updates you asked for are made without a second
   question, and the model makes every write the request needs — a change "for" a named
   customer is done only when that customer has it. It then reads those customers back and
@@ -183,7 +184,9 @@ git diff src/catalog/endpoints.generated.json    # review, then commit
 ```
 
 CI cannot regenerate this (it has no hub checkout), so refreshing it is a maintainer step
-in the release checklist. `--check` verifies a committed file matches a fresh generation:
+in the release checklist. Never hand-merge a conflict in the generated file: take either
+side, regenerate from hub master and commit that. `--check` verifies a committed file matches
+a fresh generation:
 
 ```bash
 node scripts/generate-catalog.mjs --hub-path ../hub --check
@@ -242,9 +245,10 @@ check fails.
 `npm run loop:partner-store-reads` reads the partner store through the built server and checks
 each result: store settings, products and store listings (the list and the first one), and the
 order, payment, subscription and sold product lists. It then follows a coupon used in an order
-to that order, its payment, its subscription with the invoice items, and its sold product; a
-missing link (no used coupon, no payment, no subscription item, no sold product) is skipped
-with the reason, and so are the links after it. It also checks that a time filter with a
+to that order, its payment, its subscription with the invoice items, and its sold product. No
+used coupon or no order skips every later link; after the order, the payment, subscription and
+sold product are each checked or skipped on their own, with the reason (no payment, paid
+offline, no subscription item, another partner's product, no sold product). It also checks that a time filter with a
 `+02:00` offset passed plain is accepted and one without an offset is 422, that read-only mode
 reads but refuses to approve, and that the key appears in no server log and none of its own
 output.

@@ -30,12 +30,12 @@ describe('partner store reads loop guard', () => {
   it('refuses to run against production', () => {
     const result = run({ XYTE_HUB_URL: 'https://hub.xyte.io/', XYTE_PARTNER_API_KEY: 'k' });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('production');
+    expect(result.stderr).toContain('partner store reads loop: refusing to run against production.');
   });
 
   it('refuses to run without the partner key', () => {
     const result = run({ XYTE_HUB_URL: 'http://localhost:3000' });
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain('XYTE_PARTNER_API_KEY');
+    expect(result.stderr).toContain('partner store reads loop: set XYTE_PARTNER_API_KEY');
   });
 });

@@ -49,7 +49,8 @@ export function createServer(context: ToolContext): McpServer {
             'when that customer has it. When you finish, read back the customers you were asked ' +
             'about and tell the user what each one now gets, including anything else that applies ' +
             'to them.\n' +
-            '- Before any DELETE, any removal (such as taking a tag off an organization) and any ' +
+            '- Before any DELETE, any removal (such as taking a tag off an organization), approving ' +
+            'an order (it cannot be undone) and any ' +
             'change to something that already exists and is active or scheduled (such as a live ' +
             'coupon): first tell the user in plain words what will change and what the customer ' +
             "loses, then stop and wait for the user's explicit yes in the conversation. Make no " +

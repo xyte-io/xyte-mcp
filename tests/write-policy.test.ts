@@ -121,7 +121,9 @@ describe('evaluateWritePolicy on the Partner coupon and tag endpoints', () => {
     'partner.organizationTags.removeOrganizationTag',
     'partner.coupons.createCoupon',
     'partner.coupons.updateCoupon',
-    'partner.coupons.deleteCoupon'
+    'partner.coupons.deleteCoupon',
+    'partner.orders.approveOrder',
+    'partner.organizationTags.updateOrganizationTag'
   ];
   const deletes = ['partner.coupons.deleteCoupon', 'partner.organizationTags.removeOrganizationTag'];
 

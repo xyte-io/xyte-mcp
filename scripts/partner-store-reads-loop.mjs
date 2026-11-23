@@ -65,7 +65,7 @@ function skipFrom(link, why) {
 const hasStorePayment = (order) => Boolean(order.payment) && order.payment_method !== 'offline';
 
 async function chain(call) {
-  let couponId = env.XYTE_LOOP_COUPON_ID;
+  let couponId = env.XYTE_LOOP_COUPON_ID?.toLowerCase();
   if (!couponId) {
     const coupons = await call('partner.coupons.getCoupons');
     if (!coupons.ok) return check('chain: coupons: list', false, firstLine(coupons));

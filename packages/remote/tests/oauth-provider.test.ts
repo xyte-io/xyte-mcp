@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Request, Response as ExpressResponse } from 'express';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { HttpClient, HttpRequest, HttpResponse } from '@xyteai/mcp/http/client.js';
-import { APPLICATION_PAUSED_HINT, XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
+import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteError, XyteHttpError } from '@xyteai/mcp/http/errors.js';
 import { TemporarilyUnavailableError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { createHubOAuth } from '../src/oauth/hub-oauth.js';
 import { hubIdentityOf, XyteOAuthProvider } from '../src/oauth/provider.js';
@@ -2235,7 +2235,7 @@ describe('XyteOAuthProvider: log events', () => {
     ]);
   });
 
-  it('a hub 429 on refresh keeps the grant and logs rate_limited with the status', async () => {
+  it('a hub 429 on refresh keeps the grant, logs rate_limited with the status and hints to wait', async () => {
     const { provider, hub } = makeProvider();
     hub.expiresIn = 30;
     const client = await registeredClient(provider);
@@ -2243,7 +2243,8 @@ describe('XyteOAuthProvider: log events', () => {
     hub.onRefresh = () => json(429, { error: 'rate_limited' });
     const stderr = await captureStderr(() =>
       expect(provider.hubHttp(grantId, stubHttp(() => ({ data: {} }))).request(get)).rejects.toMatchObject({
-        kind: 'auth'
+        kind: 'auth',
+        hints: [RATE_LIMITED_HINT]
       })
     );
     expect(eventsIn(stderr)).toEqual([

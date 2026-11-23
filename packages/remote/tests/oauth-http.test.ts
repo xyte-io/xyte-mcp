@@ -68,6 +68,8 @@ let hubPairNumber = 1;
 let rejectNextHubCall = false;
 /** While set, the fake hub parks refresh requests here instead of answering. */
 let heldRefreshes: Array<() => void> | undefined;
+/** The server sends it on every hub call; it must never reach the log. */
+const RATE_BUCKET_SECRET = 'rate-bucket-test-secret-0123456789';
 
 /** Just enough hub: OAuth token + revoke, plus one org API read that echoes headers. */
 function fakeHub(): { server: Server; requests: Array<Record<string, unknown>> } {
@@ -166,7 +168,8 @@ beforeAll(async () => {
     XYTE_HUB_URL: `http://127.0.0.1:${hubPort}`,
     XYTE_MCP_READ_ONLY: '1',
     DATABASE_URL: databaseUrl,
-    XYTE_MCP_TOKEN_KEY: randomBytes(32).toString('base64')
+    XYTE_MCP_TOKEN_KEY: randomBytes(32).toString('base64'),
+    XYTE_MCP_RATE_BUCKET_SECRET: RATE_BUCKET_SECRET
   };
   await startServer();
 }, 20_000);
@@ -555,6 +558,7 @@ describe('oauth over http, in order', () => {
     expect(all).not.toContain('xort_');
     expect(all).not.toContain('xmcp_');
     expect(all).not.toContain('user@example.com');
+    expect(all).not.toContain(RATE_BUCKET_SECRET);
   });
 
   it.skipIf(PG_URL)('warned at boot that the token store is in-memory', () => {
@@ -808,5 +812,21 @@ describe('oauth over http, in order', () => {
     expect(await exited).toBe(0);
     expect(stderr.join('')).toContain('SIGTERM');
     expect(stderr.join('')).not.toContain('lost at shutdown');
+  });
+
+  // Last: by now the fake hub has seen every kind of call the server makes.
+  it('sent the rate bucket secret on every hub call, and never logged it', () => {
+    const grantTypes = hub.requests.map((request) => new URLSearchParams(request.body as string).get('grant_type'));
+    expect(grantTypes).toContain('authorization_code');
+    if (process.platform !== 'win32') expect(grantTypes).toContain('refresh_token'); // the SIGTERM test's refresh
+    const urls = hub.requests.map((request) => request.url as string);
+    expect(urls).toContain('/oauth/revoke');
+    expect(urls.some((url) => url.startsWith('/core/v1/organization/'))).toBe(true);
+    for (const request of hub.requests) {
+      expect((request.headers as Record<string, string>)['x-mcp-rate-bucket-secret'], String(request.url)).toBe(
+        RATE_BUCKET_SECRET
+      );
+    }
+    expect(stderr.join('')).not.toContain(RATE_BUCKET_SECRET);
   });
 });

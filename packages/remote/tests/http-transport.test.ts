@@ -624,6 +624,33 @@ describe('http transport: token store outage', () => {
   });
 });
 
+describe('http transport: rate bucket secret', () => {
+  // fetch's own "invalid header value" error would echo the value into a tool result.
+  it.each(['leaky-secret\nx', 'leaky-secret é', 'leaky secret'])(
+    'refuses to boot on a secret that is not visible ASCII (%j), without naming the value',
+    async (secret) => {
+      const port = await freePort();
+      const booted = startHttpServer({
+        PORT: String(port),
+        XYTE_MCP_ISSUER_URL: `http://127.0.0.1:${port}`,
+        XYTE_MCP_HUB_OAUTH_CLIENT_ID: 'mcp-client',
+        XYTE_MCP_HUB_OAUTH_CLIENT_SECRET: 'mcp-secret',
+        XYTE_MCP_RATE_BUCKET_SECRET: secret
+      });
+      const error = await booted.then(
+        (listener) => {
+          listener.close();
+          throw new Error('booted');
+        },
+        (rejection: unknown) => rejection as { kind: string; message: string }
+      );
+      expect(error.kind).toBe('config');
+      expect(error.message).toContain('XYTE_MCP_RATE_BUCKET_SECRET');
+      expect(error.message).not.toContain('leaky');
+    }
+  );
+});
+
 describe('cli', () => {
   it('rejects an unknown argument with exit code 2', async () => {
     const { code, stderr } = await runToExit(['--bogus'], {});

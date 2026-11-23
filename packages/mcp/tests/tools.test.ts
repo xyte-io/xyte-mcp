@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { apiCallTool } from '../src/tools/api-call.js';
 import { endpointDescribeTool } from '../src/tools/endpoint-describe.js';
 import { endpointsListTool } from '../src/tools/endpoints-list.js';
-import { APPLICATION_PAUSED_HINT, XyteHttpError } from '../src/http/errors.js';
+import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteHttpError } from '../src/http/errors.js';
 import { REDACTED } from '../src/redact.js';
 import { stubHttp, testContext } from './support/context.js';
 
@@ -196,6 +196,20 @@ describe('xyte_api_call', () => {
       for (const hint of SIGNED_IN_HINTS) expect(text).not.toContain(hint);
     }
   );
+
+  it.each([
+    ['API key', undefined],
+    ['signed in', { organization: { accessToken: 'xoat_abcdef123456' } }]
+  ])('tells the model to wait on a hub 429 (%s)', async (_mode, credentials) => {
+    const http = stubHttp(() => new XyteHttpError(429, 'Too Many Requests', {}, READ_KEY));
+    const result = await apiCallTool.handler(
+      { key: READ_KEY },
+      testContext({ http, ...(credentials ? { credentials } : {}) })
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain(RATE_LIMITED_HINT);
+    expect(result.content[0]?.text).not.toContain(API_KEY_HINT);
+  });
 
   describe('signed in with Xyte', () => {
     const signedIn = (error: XyteHttpError) =>

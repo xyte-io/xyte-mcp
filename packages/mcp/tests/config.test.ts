@@ -359,6 +359,19 @@ describe('resolveHttpConfig', () => {
     ).toThrow(new RegExp(ENV.hubOAuthClientSecret));
   });
 
+  // The hint's register command must turn on the signed-in user's access, or every member gets the organization's.
+  it('hints a hub registration that acts with the signed-in user\'s access', () => {
+    let caught: unknown;
+    try {
+      resolveHttpConfig({ [ENV.issuerUrl]: 'https://mcp.example.com/' });
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as XyteError).hints.join(' ')).toContain(
+      'ACTS_AS_SIGNED_IN_USER=true GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://mcp.example.com/oauth/callback]"'
+    );
+  });
+
   // A shared static bearer next to the per-user sign-in on one public URL.
   it('refuses static + OAuth together, naming both variables', () => {
     expect(() =>

@@ -133,4 +133,24 @@ describe('discovery helpers', () => {
   it('returns no suggestions for nonsense', () => {
     expect(suggestKeys('zzzzzzzz')).toEqual([]);
   });
+  // DEV-8263: the MCP rejects undeclared query params, so every paginated list
+  // must declare `page` or MCP users only ever see the first page.
+  it.each([
+    ['partner.devices.getDevices', ['page', 'model_id', 'sn', 'mac']],
+    ['partner.devices.getCommands', ['page', 'status']],
+    ['partner.devices.getStateHistory', ['page', 'from', 'to', 'status']],
+    ['partner.devices.getStateHistoryMultiDevices', ['page', 'from', 'to', 'status']],
+    ['organization.commands.getCommands', ['page', 'per_page', 'status']],
+    ['organization.tickets.getTickets', ['page', 'per_page']]
+  ])('%s accepts its pagination and filter params', (key, params) => {
+    expect(getEndpoint(key)?.queryParams).toEqual(expect.arrayContaining(params));
+  });
+
+  it('declares page on every endpoint documented as paginated', () => {
+    const missing = allEndpoints()
+      .filter((endpoint) => /page_info/.test(endpoint.description ?? ''))
+      .filter((endpoint) => !endpoint.queryParams.includes('page'))
+      .map((endpoint) => endpoint.key);
+    expect(missing).toEqual([]);
+  });
 });

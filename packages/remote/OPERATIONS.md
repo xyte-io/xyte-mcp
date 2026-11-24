@@ -14,9 +14,10 @@ client (for example, one person's claude.ai connector). It is not the hub's org-
 ## Before launch
 
 - On the hub, set the hub OAuth application of this server to act with each signed-in user's
-  own access: `rake "oauth:set_signed_in_user_access[<client id>,on,<your name>]"` (or pass
-  `ACTS_AS_SIGNED_IN_USER=true` to `oauth:register_application`). Then read it back with
-  `rake "oauth:show[<client id>]"` and check `acts_with_signed_in_user_access: true` before
+  own access: `rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"` (or pass
+  `ACTS_AS_SIGNED_IN_USER=true` to `oauth:register_application`). The hub OAuth client id is the
+  value of `XYTE_MCP_HUB_OAUTH_CLIENT_ID`. Then read it back with
+  `rake "oauth:show[<hub OAuth client id>]"` and check `acts_with_signed_in_user_access: true` before
   you open sign-in. Without it, every member who signs in gets the organization's full authority.
 
 ## Kill switch: stop the whole server

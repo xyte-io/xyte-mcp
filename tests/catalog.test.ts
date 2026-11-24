@@ -146,14 +146,15 @@ describe('discovery helpers', () => {
     ['partner.devices.getStateHistory', ['page', 'from', 'to', 'status']],
     ['partner.devices.getStateHistoryMultiDevices', ['page', 'from', 'to', 'status']],
     ['organization.commands.getCommands', ['page', 'per_page', 'status']],
-    ['organization.tickets.getTickets', ['page', 'per_page']]
+    ['organization.tickets.getTickets', ['page', 'per_page']],
+    ['organization.incidents.deleteIncident', ['closed_reason']]
   ])('%s accepts its pagination and filter params', (key, params) => {
     expect(getEndpoint(key)?.queryParams).toEqual(expect.arrayContaining(params));
   });
 
-  it('declares page on every endpoint documented as paginated', () => {
+  it('declares page on every endpoint whose docs show page_info or next_page', () => {
     const missing = allEndpoints()
-      .filter((endpoint) => /page_info/.test(endpoint.description ?? ''))
+      .filter((endpoint) => /page_info|next_page/.test(endpoint.description ?? ''))
       .filter((endpoint) => !endpoint.queryParams.includes('page'))
       .map((endpoint) => endpoint.key);
     expect(missing).toEqual([]);

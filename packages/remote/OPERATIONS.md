@@ -16,20 +16,20 @@ client (for example, one person's claude.ai connector). It is not the hub's org-
 
 Needs a hub console in the hub environment this server talks to, once per environment.
 
-- The hub OAuth application of this server (its client id is the value of
-  `XYTE_MCP_HUB_OAUTH_CLIENT_ID`) must act with each signed-in user's own access. Turn it on with
+- First check you have the right application: `rake "oauth:show[<hub OAuth client id>]"` (its
+  client id is the value of `XYTE_MCP_HUB_OAUTH_CLIENT_ID`). Its `redirect_uris` must hold the
+  origin of `XYTE_MCP_ISSUER_URL` (no trailing slash) + `/oauth/callback`. If not, it is the wrong
+  application: fix the client id before you change anything.
+- Turn on each signed-in user's own access with
   `rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"`; a new
   registration can set it at once (see "Registering at hub" in the
   [README](../../README.md#oauth-21)).
-- Read it back with `rake "oauth:show[<hub OAuth client id>]"` before you open sign-in to
-  non-administrators. It must print `acts_with_signed_in_user_access: true`, and its
-  `redirect_uris` must hold the origin of `XYTE_MCP_ISSUER_URL` (no trailing slash) +
-  `/oauth/callback`. If it prints `false`, run the first step again. If `redirect_uris` does not
-  match, you checked the wrong application: check `XYTE_MCP_HUB_OAUTH_CLIENT_ID` and run both
-  steps again with the right client id.
+- Read it back with `oauth:show` before you open sign-in to non-administrators. It must print
+  `acts_with_signed_in_user_access: true`; if it prints `false`, run the previous step again.
 - This read-back is the only gate: the server does not check the setting, and sign-in and the
-  health check work without it. Without it, every member who signs in gets the organization's
-  full authority. Check again after any hub-side change to the app.
+  health check work without it. Without it, every member the connection's sign-in policy admits
+  acts as the organization (admin-only actions included). Check again after any hub-side change
+  to the app; a new registration gets a new client id with the setting off.
 - These rake tasks come with the hub's hosted-MCP release. On an older hub, turn the setting on
   and read it back in a Rails console instead (see "Registering at hub" in the
   [README](../../README.md#oauth-21)).

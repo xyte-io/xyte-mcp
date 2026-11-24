@@ -13,6 +13,11 @@ describe('generated catalog', () => {
     expect(endpointCount()).toBeGreaterThan(50);
   });
 
+  it('marks exactly the non-get actions as mutating, which the live loops count writes by', () => {
+    const mismatched = allEndpoints().filter((endpoint) => endpoint.mutating === endpoint.action.startsWith('get'));
+    expect(mismatched.map((endpoint) => endpoint.key)).toEqual([]);
+  });
+
   it('has unique keys', () => {
     const keys = allEndpoints().map((endpoint) => endpoint.key);
     expect(new Set(keys).size).toBe(keys.length);

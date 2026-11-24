@@ -582,7 +582,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 **Registering at hub.** Once per hub environment, from a hub console:
 
 ```bash
-GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://<host>/oauth/callback]"
+ACTS_AS_SIGNED_IN_USER=true GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://<host>/oauth/callback]"
 ```
 
 It prints the client id and secret for `XYTE_MCP_HUB_OAUTH_CLIENT_ID` /
@@ -592,15 +592,23 @@ that organization has to connect (approve) the app on hub's consent screen first
 then hub denies with `error_reason=org_not_approved`.
 
 The app must also have the hub setting "acts with the signed-in user's access" turned on;
-the command above leaves it off. To turn it on, run this in the same hub console:
+`ACTS_AS_SIGNED_IN_USER=true` above turns it on. For an app registered without it, run this
+in the same hub console:
+
+```bash
+rake "oauth:set_signed_in_user_access[<client id>,on,<your name>]"
+```
+
+Then check it: `rake "oauth:show[<client id>]"` must print
+`acts_with_signed_in_user_access: true`, and its `redirect_uris` must hold the callback above
+(so you checked the app this server uses). Without the setting every signed-in user gets the
+organization's full access and the consent page text is not true, so do not open sign-in to
+non-administrators until it is on. These rake tasks come with the hub's hosted-MCP release;
+on a hub without them, turn the setting on in a Rails console instead:
 
 ```ruby
 Oauth::Application.find_by!(client_id: '<client id>').update!(acts_with_signed_in_user_access: true)
 ```
-
-Without it every signed-in user gets the organization's
-full access and the consent page text is not true, so do not open sign-in to
-non-administrators until it is on.
 
 The static-bearer mode is the alternative, not an addition: unset the issuer to use it.
 Setting both refuses to start — a shared bearer mapping to the process keys has no place on

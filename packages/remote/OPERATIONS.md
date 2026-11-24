@@ -11,6 +11,14 @@ targets are in the internal runbook, not here.
 client (for example, one person's claude.ai connector). It is not the hub's org-level
 "connected app". The `connection` field in the logs is the grant's id.
 
+## Before launch
+
+- On the hub, set the hub OAuth application of this server to act with each signed-in user's
+  own access: `rake "oauth:set_signed_in_user_access[<client id>,on,<your name>]"` (or pass
+  `ACTS_AS_SIGNED_IN_USER=true` to `oauth:register_application`). Then read it back with
+  `rake "oauth:show[<client id>]"` and check `acts_with_signed_in_user_access: true` before
+  you open sign-in. Without it, every member who signs in gets the organization's full authority.
+
 ## Kill switch: stop the whole server
 
 ```bash

@@ -596,18 +596,25 @@ The app must also have the hub setting "acts with the signed-in user's access" t
 in the same hub console:
 
 ```bash
-rake "oauth:set_signed_in_user_access[<client id>,on,<your name>]"
+rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"
 ```
 
-Then check it: `rake "oauth:show[<client id>]"` must print
-`acts_with_signed_in_user_access: true`, and its `redirect_uris` must hold the callback above
-(so you checked the app this server uses). Without the setting every signed-in user gets the
-organization's full access and the consent page text is not true, so do not open sign-in to
-non-administrators until it is on. These rake tasks come with the hub's hosted-MCP release;
-on a hub without them, turn the setting on in a Rails console instead:
+`<hub OAuth client id>` is the value of `XYTE_MCP_HUB_OAUTH_CLIENT_ID`, not a client registered
+at this server. After either path, check it: `rake "oauth:show[<hub OAuth client id>]"` must
+print `acts_with_signed_in_user_access: true`, and its `redirect_uris` must hold the callback
+above (so you checked the app this server uses). Without the setting every signed-in user who
+is not an organization administrator gets the organization's full access and the consent page
+text is not true, so do not open sign-in to non-administrators until it is on.
+
+The `set_signed_in_user_access` and `show` tasks and `ACTS_AS_SIGNED_IN_USER` come with the
+hub's hosted-MCP release. An older hub has no such tasks and ignores `ACTS_AS_SIGNED_IN_USER`,
+so the register command leaves the setting off there. On such a hub, turn it on and check it
+in a Rails console instead, and note who ran it (the console writes no log line naming you):
 
 ```ruby
-Oauth::Application.find_by!(client_id: '<client id>').update!(acts_with_signed_in_user_access: true)
+app = Oauth::Application.find_by!(client_id: '<hub OAuth client id>')
+app.update!(acts_with_signed_in_user_access: true)
+app.slice(:acts_with_signed_in_user_access, :redirect_uris)
 ```
 
 The static-bearer mode is the alternative, not an addition: unset the issuer to use it.

@@ -194,7 +194,7 @@ export function resolveHttpConfig(env: NodeJS.ProcessEnv = process.env): HttpCon
         `${ENV.issuerUrl} is set but ${ENV.hubOAuthClientId} / ${ENV.hubOAuthClientSecret} ` +
           'are not.',
         [
-          'Register this server at hub: GLOBAL=true rake ' +
+          'Register this server at hub: ACTS_AS_SIGNED_IN_USER=true GLOBAL=true rake ' +
             `"oauth:register_application[Xyte MCP,,${stripTrailingSlash(issuerUrl)}/oauth/callback]"`
         ]
       );

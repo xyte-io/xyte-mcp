@@ -4,8 +4,9 @@ The one hub setting to check before launch, how to stop the hosted MCP server, h
 one organization or one connection, what it logs, and which alerts to set up. It assumes the
 Heroku deployment from the [README](../../README.md#deploy-it). `<app>` is the Heroku app name.
 
-Who acts: the on-call engineer with access to the hosting app. The names and the alert
-targets are in the internal runbook, not here.
+Who acts: the on-call engineer with access to the hosting app; "Before launch" also needs
+someone with a hub console in that hub environment. The names and the alert targets are in the
+internal runbook, not here.
 
 **Connection** in this document means one MCP grant: one user who signed in through one
 client (for example, one person's claude.ai connector). It is not the hub's org-level
@@ -20,15 +21,18 @@ Needs a hub console in the hub environment this server talks to, once per enviro
   `rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"`; a new
   registration can set it at once (see "Registering at hub" in the
   [README](../../README.md#oauth-21)).
-- Read it back with `rake "oauth:show[<hub OAuth client id>]"` before you open sign-in. It must
-  print `acts_with_signed_in_user_access: true`, and its `redirect_uris` must hold
-  `XYTE_MCP_ISSUER_URL` + `/oauth/callback`, so you checked the app this server uses. If it
-  prints `false`, run the first step again.
+- Read it back with `rake "oauth:show[<hub OAuth client id>]"` before you open sign-in to
+  non-administrators. It must print `acts_with_signed_in_user_access: true`, and its
+  `redirect_uris` must hold the origin of `XYTE_MCP_ISSUER_URL` (no trailing slash) +
+  `/oauth/callback`. If it prints `false`, run the first step again. If `redirect_uris` does not
+  match, you checked the wrong application: check `XYTE_MCP_HUB_OAUTH_CLIENT_ID` and run both
+  steps again with the right client id.
 - This read-back is the only gate: the server does not check the setting, and sign-in and the
   health check work without it. Without it, every member who signs in gets the organization's
   full authority. Check again after any hub-side change to the app.
-- These rake tasks come with the hub's hosted-MCP release. On a hub without them, use the
-  console step in the README.
+- These rake tasks come with the hub's hosted-MCP release. On an older hub, turn the setting on
+  and read it back in a Rails console instead (see "Registering at hub" in the
+  [README](../../README.md#oauth-21)).
 
 ## Kill switch: stop the whole server
 

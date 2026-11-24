@@ -173,6 +173,18 @@ describe('buildRequest', () => {
     expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_');
   });
 
+  it('accepts the room_status filter on organization.spaces.getSpaces', () => {
+    const endpoint = getEndpoint('organization.spaces.getSpaces');
+    expect(endpoint).toBeDefined();
+    if (!endpoint) return;
+    const request = buildRequest(
+      endpoint,
+      { query: { room_status: 'error' } },
+      testContext({ credentials: { organization: 'org-key-abcdef123456' } })
+    );
+    expect(new URL(request.url).searchParams.get('room_status')).toBe('error');
+  });
+
   it('builds a request for every catalog endpoint without throwing', () => {
     // Catches any generated spec whose template and pathParams disagree.
     const context = testContext({

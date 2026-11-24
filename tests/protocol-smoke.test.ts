@@ -136,6 +136,8 @@ describe('stdio protocol', () => {
     expect(response.result?.instructions).toContain('API times are UTC');
     expect(response.result?.instructions).toContain('Before you propose any DELETE or removal');
     expect(response.result?.instructions).toContain('no ids');
+    expect(response.result?.instructions).toContain('do not pre-encode "+" as "%2B"');
+    expect(response.result?.instructions).toContain('approving an order (it cannot be undone)');
     expect(response.result?.instructions).not.toContain('XYTE_');
   });
 

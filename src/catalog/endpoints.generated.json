@@ -141,13 +141,18 @@
       "group": "commands",
       "action": "getCommands",
       "title": "Get Commands",
+      "description": "## Query parameters\n- `page` — page number (default `1`).\n- `per_page` — results per page (default `100`, **max `500`**).\n- `status` — optional, one or more of `scheduled`, `pending`, `in_progress`, `done`, `failed`, `aborted`; comma-separated (`status=done,failed`).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/:device_id/commands",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "status"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
@@ -698,13 +703,16 @@
       "group": "incidents",
       "action": "deleteIncident",
       "title": "Delete Incident",
+      "description": "## Query parameters\n- `closed_reason` — optional, free-text reason recorded on the closed incident.",
       "method": "DELETE",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/incidents/:id",
       "pathParams": [
         "id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "closed_reason"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": true,
@@ -1298,11 +1306,15 @@
       "group": "tickets",
       "action": "getTickets",
       "title": "Get Tickets",
+      "description": "## Query parameters\n- `page` — page number (default `1`).\n- `per_page` — results per page (default `100`, **max `100`**).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/tickets",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
@@ -1558,13 +1570,17 @@
       "group": "devices",
       "action": "getCommands",
       "title": "Get Commands",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `status` — optional, one of `scheduled`, `pending`, `in_progress`, `done`, `failed`, `aborted` — a single value; a comma-separated list matches nothing.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/:device_id/commands",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1613,12 +1629,17 @@
       "group": "devices",
       "action": "getDevices",
       "title": "Get Devices",
-      "description": "## Success\n**200 OK** — paginated list of the partner's devices.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 32 }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the group primary's row. On every other row — standalone or merged shadow — it mirrors that device's own `effective_status`.",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `model_id` — optional, device model id (UUID).\n- `sn` — optional, exact serial number match.\n- `mac` — optional, exact MAC address match.\n\n## Success\n**200 OK** — paginated list of the partner's devices.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 32 }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the group primary's row. On every other row — standalone or merged shadow — it mirrors that device's own `effective_status`.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "model_id",
+        "sn",
+        "mac"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1630,13 +1651,19 @@
       "group": "devices",
       "action": "getStateHistory",
       "title": "Get State History",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `from` — optional, ISO 8601 datetime (default 1 day ago). Its date must be no earlier than one month ago (start of that day).\n- `to` — optional, ISO 8601 datetime (default now). `from` and `to` must be at most 7 calendar days apart.\n- `status` — optional, keep only states whose `status` equals this value (e.g. `online`, `offline`, `error`).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/:device_id/history",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "from",
+        "to",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1648,11 +1675,17 @@
       "group": "devices",
       "action": "getStateHistoryMultiDevices",
       "title": "Get State History (multi-devices)",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `from` — optional, ISO 8601 datetime (default 1 day ago). Its date must be no earlier than one month ago (start of that day).\n- `to` — optional, ISO 8601 datetime (default now). `from` and `to` must be at most 7 calendar days apart.\n- `status` — optional, keep only states whose `status` equals this value (e.g. `online`, `offline`, `error`).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/histories",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "from",
+        "to",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,

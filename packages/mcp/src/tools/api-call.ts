@@ -1,7 +1,11 @@
 import { z } from 'zod';
 import { getEndpoint, suggestKeys } from '../catalog/catalog.js';
+import type { EndpointSpec } from '../catalog/types.js';
+import type { ToolContext } from '../context.js';
 import { buildRequest } from '../http/build-request.js';
+import type { HttpRequest, HttpResponse } from '../http/client.js';
 import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteHttpError, isXyteError } from '../http/errors.js';
+import { log } from '../log.js';
 import { redactValue } from '../redact.js';
 import { evaluateWritePolicy } from '../write-policy.js';
 import { defineTool, errorResult, textResult } from './types.js';
@@ -25,7 +29,11 @@ const inputSchema = {
   confirm: z
     .string()
     .optional()
-    .describe('Required for DELETE endpoints: pass the endpoint key verbatim to acknowledge.')
+    .describe(
+      'DELETE only: the endpoint key verbatim. Set it only after you told the user what will be ' +
+        "lost and the user gave an explicit yes in the conversation to this exact item — never " +
+        'on your own. A yes for one item does not cover others.'
+    )
 };
 
 const outputSchema = {
@@ -42,7 +50,9 @@ export const apiCallTool = defineTool({
   description:
     'Invoke a Xyte platform API endpoint by key. Use xyte_endpoint_describe first if ' +
     'you are unsure of the parameters. Mutating endpoints run unless the server was ' +
-    'started read-only; DELETE additionally requires confirm.',
+    'started read-only. Before a DELETE, a removal, or a change to something active or ' +
+    "scheduled, tell the user what changes and wait for the user's explicit yes; DELETE " +
+    'additionally requires confirm.',
   inputSchema,
   outputSchema,
   annotations: (context) => ({
@@ -79,8 +89,9 @@ export const apiCallTool = defineTool({
         },
         context
       );
-      const response = await context.http.request(request);
-      const data = redactValue(response.data, context.secrets);
+      const response = await sendRequest(endpoint, request, context);
+      // A 204 has no body; null keeps `data` in the structured result, which the output schema requires.
+      const data = redactValue(response.data ?? null, context.secrets);
 
       const structured = {
         key: endpoint.key,
@@ -106,6 +117,35 @@ export const apiCallTool = defineTool({
   }
 });
 
+/**
+ * Sends the request; a mutating call also writes one line to stderr, so an operator can tell
+ * later what the agent changed. The line holds the key, method, status and duration only —
+ * never the API key, the request body or the response body. `status=error` means no HTTP
+ * status came back (timeout, network), so the write may still have landed. Skipped when the host
+ * logs every tool call itself (the hosted server), which also names the connection.
+ */
+async function sendRequest(
+  endpoint: EndpointSpec,
+  request: HttpRequest,
+  context: ToolContext
+): Promise<HttpResponse> {
+  if (!endpoint.mutating || context.toolCallsLoggedByHost) return context.http.request(request);
+
+  const startedAt = performance.now();
+  let status: number | 'error' = 'error';
+  try {
+    const response = await context.http.request(request);
+    status = response.status;
+    return response;
+  } catch (error) {
+    if (error instanceof XyteHttpError) status = error.status;
+    throw error;
+  } finally {
+    const durationMs = Math.round(performance.now() - startedAt);
+    log(`write ${endpoint.key} ${endpoint.method} status=${status} duration_ms=${durationMs}`);
+  }
+}
+
 function toErrorResult(
   error: unknown,
   endpointKey: string,
@@ -124,7 +164,10 @@ function toErrorResult(
     if (error.status === 429) {
       hints.push(RATE_LIMITED_HINT);
     }
-    if (error.status === 404) {
+    if (error.status === 404 && /Requested path .* does not exist/.test(JSON.stringify(error.body))) {
+      // Hub's catch-all route: the hub is older than this catalog, not a missing record.
+      hints.push('This endpoint is not available on this hub yet. Tell the user; do not retry with other ids.');
+    } else if (error.status === 404) {
       hints.push('Check the path parameter values — the resource may not exist.');
     }
     if (error.status === 422 || error.status === 400) {

@@ -129,6 +129,16 @@ describe('stdio protocol', () => {
     expect(response.result?.serverInfo).toMatchObject({ name: 'xyte-mcp' });
     // Writes are the default posture, and the host is told so.
     expect(response.result?.instructions).toContain('ENABLED');
+    // D4: no destructive change or removal before the user's own yes in the conversation.
+    expect(response.result?.instructions).toContain("explicit yes");
+    expect(response.result?.instructions).toContain('already exists');
+    expect(response.result?.instructions).toContain('read back the customers');
+    expect(response.result?.instructions).toContain('API times are UTC');
+    expect(response.result?.instructions).toContain('Before you propose any DELETE or removal');
+    expect(response.result?.instructions).toContain('no ids');
+    expect(response.result?.instructions).toContain('do not pre-encode "+" as "%2B"');
+    expect(response.result?.instructions).toContain('approving an order (it cannot be undone)');
+    expect(response.result?.instructions).not.toContain('XYTE_');
   });
 
   it('advertises exactly the three tools, with schemas', async () => {
@@ -156,6 +166,8 @@ describe('stdio protocol', () => {
     // Default server: the host should be told the tool can mutate, so it prompts.
     expect(apiCall?.annotations?.readOnlyHint).toBe(false);
     expect(apiCall?.annotations?.destructiveHint).toBe(true);
+    const confirm = apiCall?.inputSchema.properties?.confirm as { description?: string };
+    expect(confirm.description).toContain('explicit yes');
   });
 
   it('runs a discovery tool end to end', async () => {
@@ -210,6 +222,9 @@ describe('stdio protocol', () => {
     const server = start({ XYTE_MCP_READ_ONLY: '1' });
     const response = await server.handshake();
     expect(response.result?.instructions).toContain('READ-ONLY');
+    // The user is told the connection only looks; settings names stay out of the answer.
+    expect(response.result?.instructions).toContain('set up to look only');
+    expect(response.result?.instructions).not.toContain('XYTE_');
   });
 
   // Upgrading from 0.1.x must not widen a server an operator pinned shut.

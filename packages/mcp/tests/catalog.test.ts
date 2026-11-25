@@ -13,6 +13,11 @@ describe('generated catalog', () => {
     expect(endpointCount()).toBeGreaterThan(50);
   });
 
+  it('marks exactly the non-get actions as mutating, which the live loops count writes by', () => {
+    const mismatched = allEndpoints().filter((endpoint) => endpoint.mutating === endpoint.action.startsWith('get'));
+    expect(mismatched.map((endpoint) => endpoint.key)).toEqual([]);
+  });
+
   it('has unique keys', () => {
     const keys = allEndpoints().map((endpoint) => endpoint.key);
     expect(new Set(keys).size).toBe(keys.length);
@@ -84,16 +89,24 @@ describe('listEndpoints', () => {
     expect(reads.some((endpoint) => endpoint.mutating)).toBe(false);
   });
 
-  it('searches case-insensitively across key, title and path', () => {
+  it('searches case-insensitively across key, title, path and description', () => {
     const results = listEndpoints({ search: 'INCIDENT' });
     expect(results.length).toBeGreaterThan(0);
     expect(
       results.every((endpoint) =>
-        `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate}`
+        `${endpoint.key} ${endpoint.title} ${endpoint.pathTemplate} ${endpoint.description ?? ''}`
           .toLowerCase()
           .includes('incident')
       )
     ).toBe(true);
+  });
+
+  it('finds an endpoint by a word only its description uses', () => {
+    // An agent asked to "give 20% off" searches "discount"; only the coupon descriptions say it.
+    const createCoupon = getEndpoint('partner.coupons.createCoupon');
+    expect(`${createCoupon?.key} ${createCoupon?.title} ${createCoupon?.pathTemplate}`.toLowerCase()).not.toContain('discount');
+    const keys = listEndpoints({ search: 'discount' }).map((endpoint) => endpoint.key);
+    expect(keys).toContain('partner.coupons.createCoupon');
   });
 
   it('combines filters conjunctively', () => {
@@ -124,5 +137,26 @@ describe('discovery helpers', () => {
 
   it('returns no suggestions for nonsense', () => {
     expect(suggestKeys('zzzzzzzz')).toEqual([]);
+  });
+  // DEV-8263: the MCP rejects undeclared query params, so every paginated list
+  // must declare `page` or MCP users only ever see the first page.
+  it.each([
+    ['partner.devices.getDevices', ['page', 'model_id', 'sn', 'mac']],
+    ['partner.devices.getCommands', ['page', 'status']],
+    ['partner.devices.getStateHistory', ['page', 'from', 'to', 'status']],
+    ['partner.devices.getStateHistoryMultiDevices', ['page', 'from', 'to', 'status']],
+    ['organization.commands.getCommands', ['page', 'per_page', 'status']],
+    ['organization.tickets.getTickets', ['page', 'per_page']],
+    ['organization.incidents.deleteIncident', ['closed_reason']]
+  ])('%s accepts its pagination and filter params', (key, params) => {
+    expect(getEndpoint(key)?.queryParams).toEqual(expect.arrayContaining(params));
+  });
+
+  it('declares page on every endpoint whose docs show page_info or next_page', () => {
+    const missing = allEndpoints()
+      .filter((endpoint) => /page_info|next_page/.test(endpoint.description ?? ''))
+      .filter((endpoint) => !endpoint.queryParams.includes('page'))
+      .map((endpoint) => endpoint.key);
+    expect(missing).toEqual([]);
   });
 });

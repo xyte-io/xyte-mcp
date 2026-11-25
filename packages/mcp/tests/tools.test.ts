@@ -325,6 +325,20 @@ describe('xyte_api_call', () => {
       expect(text).not.toContain(API_KEY_HINT);
     });
 
+    it('says the endpoint is not on this hub for the catch-all 404, with no other hint', async () => {
+      const error = new XyteHttpError(
+        404,
+        'Not Found',
+        { error: 'Requested path /core/v1/organization/x does not exist' },
+        READ_KEY
+      );
+      const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
+      const text = result.content[0]?.text;
+      expect(text).toContain('This endpoint is not available on this hub yet.');
+      expect(text).not.toContain('Check the path parameter values');
+      for (const hint of [API_KEY_HINT, ...SIGNED_IN_HINTS]) expect(text).not.toContain(hint);
+    });
+
     it('keeps the path-parameter hint on 404', async () => {
       const error = new XyteHttpError(404, 'Not Found', { error: 'x' }, READ_KEY);
       const result = await apiCallTool.handler({ key: READ_KEY }, signedIn(error));
@@ -425,6 +439,43 @@ describe('xyte_api_call write log line', () => {
 
     expect(stderr).toHaveLength(1);
     expect(stderr[0]).toMatch(/ write partner\.coupons\.deleteCoupon DELETE status=204 duration_ms=\d+\n$/);
+  });
+
+  it('keeps the sign-in token out of the line for a signed-in write', async () => {
+    const token = 'xoat_abcdef123456';
+    const http = stubHttp(() => ({ status: 201, data: { id: 'cmd1' } }));
+    await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
+      testContext({ http, credentials: { organization: { accessToken: token } } })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ POST status=201 duration_ms=\d+\n$/);
+    expect(stderr[0]).not.toContain(token);
+  });
+
+  it('logs status=429 for a rate-limited write and still gives the wait hint', async () => {
+    const http = stubHttp(() => new XyteHttpError(429, 'Too Many Requests', { error: 'x' }, WRITE_KEY));
+    const result = await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
+      testContext({ http })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ POST status=429 duration_ms=\d+\n$/);
+    expect(result.content[0]?.text).toContain(RATE_LIMITED_HINT);
+  });
+
+  it('writes nothing when the host logs every tool call itself', async () => {
+    const http = stubHttp(() => ({ status: 201, data: { id: 'cmd1' } }));
+    const result = await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
+      testContext({ http, toolCallsLoggedByHost: true })
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(http.calls).toHaveLength(1);
+    expect(stderr).toEqual([]);
   });
 
   it('writes nothing for a read, a refused write or a write that fails validation', async () => {

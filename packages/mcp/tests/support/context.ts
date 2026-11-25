@@ -38,6 +38,9 @@ export function testContext(overrides: Partial<ToolContext> = {}): ToolContext {
     allowWrites: overrides.allowWrites ?? true,
     secrets:
       overrides.secrets ??
-      Object.values(credentials).filter((value): value is string => typeof value === 'string')
+      Object.values(credentials).filter((value): value is string => typeof value === 'string'),
+    ...(overrides.toolCallsLoggedByHost === undefined
+      ? {}
+      : { toolCallsLoggedByHost: overrides.toolCallsLoggedByHost })
   };
 }

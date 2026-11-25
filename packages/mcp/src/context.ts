@@ -17,6 +17,11 @@ export interface ToolContext {
   readonly allowWrites: boolean;
   /** Literal secret values to strip from anything returned to the caller. */
   readonly secrets: readonly string[];
+  /**
+   * True when the host records every tool call itself (the hosted server's `tool_call` event,
+   * which also names the connection), so xyte_api_call skips its own plain stderr write line.
+   */
+  readonly toolCallsLoggedByHost?: boolean;
 }
 
 export function createToolContext(config: ServerConfig, http?: HttpClient): ToolContext {

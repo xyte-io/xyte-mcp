@@ -207,7 +207,10 @@ describe('buildRequest', () => {
       caught = error;
     }
     expect((caught as XyteError).message).toMatch(/not available through a Xyte sign-in/);
-    expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_PARTNER_API_KEY');
+    expect((caught as XyteError).hints).toEqual([
+      'Use an organization endpoint, or a local server configured with a partner API key.'
+    ]);
+    expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_');
   });
 
   it('sends a hub OAuth token as a Bearer with X-Xyte-Client, never as a bare key', () => {

@@ -121,14 +121,15 @@ export const apiCallTool = defineTool({
  * Sends the request; a mutating call also writes one line to stderr, so an operator can tell
  * later what the agent changed. The line holds the key, method, status and duration only —
  * never the API key, the request body or the response body. `status=error` means no HTTP
- * status came back (timeout, network), so the write may still have landed.
+ * status came back (timeout, network), so the write may still have landed. Skipped when the host
+ * logs every tool call itself (the hosted server), which also names the connection.
  */
 async function sendRequest(
   endpoint: EndpointSpec,
   request: HttpRequest,
   context: ToolContext
 ): Promise<HttpResponse> {
-  if (!endpoint.mutating) return context.http.request(request);
+  if (!endpoint.mutating || context.toolCallsLoggedByHost) return context.http.request(request);
 
   const startedAt = performance.now();
   let status: number | 'error' = 'error';

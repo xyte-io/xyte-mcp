@@ -43,6 +43,7 @@
       "group": "assets",
       "action": "getAsset",
       "title": "Get Asset",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for an asset they cannot view; an asset outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/assets/:asset_id",
@@ -53,8 +54,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Assets/Get Asset.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for an asset they cannot view; an asset outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Assets/Get Asset.bru"
     },
     {
       "key": "organization.assets.getAssetLabels",
@@ -81,6 +81,7 @@
       "group": "assets",
       "action": "getAssets",
       "title": "Get Assets",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the assets they can view only; pagination (`next_page`) covers those only. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/assets",
@@ -95,8 +96,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Assets/Get Assets.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the assets they can view only; pagination (`next_page`) covers those only. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Assets/Get Assets.bru"
     },
     {
       "key": "organization.assets.updateAsset",
@@ -1049,6 +1049,7 @@
       "group": "notes",
       "action": "getAllDeviceNotes",
       "title": "Get All Device Notes",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the devices they can view only. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/notes",
@@ -1060,8 +1061,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get All Device Notes.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the devices they can view only. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Notes/Get All Device Notes.bru"
     },
     {
       "key": "organization.notes.getAllIncidentNotes",
@@ -1089,6 +1089,7 @@
       "group": "notes",
       "action": "getAllSpaceNotes",
       "title": "Get All Space Notes",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the spaces they can view only (an ancestor of such a space does not count). Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/spaces/notes",
@@ -1100,8 +1101,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get All Space Notes.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the spaces they can view only (an ancestor of such a space does not count). Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Notes/Get All Space Notes.bru"
     },
     {
       "key": "organization.notes.getDeviceNotes",
@@ -1109,6 +1109,7 @@
       "group": "notes",
       "action": "getDeviceNotes",
       "title": "Get Device Notes",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/:device_id/notes",
@@ -1122,8 +1123,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get Device Notes.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Notes/Get Device Notes.bru"
     },
     {
       "key": "organization.notes.getIncidentNotes",
@@ -1153,6 +1153,7 @@
       "group": "notes",
       "action": "getSpaceNotes",
       "title": "Get Space Notes",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a space they can view only: **403** `no_access_to_resource` for another space, including an ancestor of a space they can view; a space outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/spaces/:space_id/notes",
@@ -1166,8 +1167,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get Space Notes.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a space they can view only: **403** `no_access_to_resource` for another space, including an ancestor of a space they can view; a space outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Notes/Get Space Notes.bru"
     },
     {
       "key": "organization.spaces.createSpace",
@@ -1294,6 +1294,7 @@
       "group": "tickets",
       "action": "getTicket",
       "title": "Get Ticket",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for a ticket of a device they cannot view, or whose device was deleted; a ticket outside the organization answers **401** as before. Their ticket carries no `user_name` and `user_email`. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/tickets/:ticket_id",
@@ -1304,8 +1305,7 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Tickets/Get Ticket.bru",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for a ticket of a device they cannot view, or whose device was deleted; a ticket outside the organization answers **401** as before. Their ticket carries no `user_name` and `user_email`. Administrators, API keys and other applications are unaffected."
+      "sourceFile": "Organization API/Tickets/Get Ticket.bru"
     },
     {
       "key": "organization.tickets.getTickets",

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -143,6 +143,34 @@ describe('createServer onToolCall', () => {
       () => callWithHook(testContext(), 'test_tool', {})
     );
     expect(records).toMatchObject([{ tool: 'test_tool', endpoint: 'first', status: 200, isError: true }]);
+  });
+});
+
+describe('createServer write log line', () => {
+  const WRITE = { key: 'organization.commands.sendCommand', path: { device_id: 'd1' }, body: { name: 'reboot' } };
+
+  async function writeLines(hooks: boolean): Promise<string[]> {
+    const lines: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      const context = testContext({ http: stubHttp(() => ({ status: 201, data: {} })) });
+      const server = hooks ? createServer(context, { onToolCall: () => undefined }) : createServer(context);
+      await callTool(server, 'xyte_api_call', WRITE);
+    } finally {
+      spy.mockRestore();
+    }
+    return lines.filter((line) => line.includes('] write '));
+  }
+
+  it('leaves the write to the host when it logs every tool call (the hosted server)', async () => {
+    expect(await writeLines(true)).toEqual([]);
+  });
+
+  it('writes the line itself without a hook (stdio)', async () => {
+    expect(await writeLines(false)).toHaveLength(1);
   });
 });
 

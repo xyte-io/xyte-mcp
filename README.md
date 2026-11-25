@@ -101,7 +101,7 @@ the upgrade. Where the two disagree, the restrictive one wins. New stdio configu
 use `XYTE_MCP_READ_ONLY`; on the hosted server, `XYTE_MCP_ALLOW_WRITES=1` is the one way to turn
 writes on (`XYTE_MCP_READ_ONLY=0` alone does not).
 
-From 0.6.0, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
+From the first release after 0.5.1, `@xyteai/mcp` resolves only `.` and the subpaths listed in its
 `package.json` `exports`; deep imports into `dist/` no longer resolve.
 
 ## Tools

@@ -911,7 +911,7 @@
       "group": "models",
       "action": "getModels",
       "title": "Get Models",
-      "description": "## Success\n**200 OK** — paginated list of the models the organization can claim.\n```json\n{\n  \"items\": [\n    {\n      \"id\": \"3f2a9c1e-...\",\n      \"vendor\": \"Acme\",\n      \"model\": \"Acme Sensor 100\",\n      \"aliases\": [\"Acme Sensor 100 Rev B\"],\n      \"release_stage\": \"public\",\n      \"parameters\": [\n        { \"name\": \"SNMP community\", \"type\": \"text\", \"required\": true }\n      ]\n    }\n  ],\n  \"next_page\": null\n}\n```\n- `release_stage` — the vendor's release stage: `alpha`, `beta` or `public`. It limits who can claim a model only while the model is unpublished, and this list holds published models, so here it is informational.",
+      "description": "## Success\n**200 OK** — paginated list of the models the organization can claim.\n```json\n{\n  \"items\": [\n    {\n      \"id\": \"3f2a9c1e-...\",\n      \"vendor\": \"Acme\",\n      \"model\": \"Acme Sensor 100\",\n      \"aliases\": [\"Acme Sensor 100 Rev B\"],\n      \"release_stage\": \"public\",\n      \"parameters\": [\n        { \"name\": \"SNMP community\", \"type\": \"text\", \"required\": true }\n      ]\n    }\n  ],\n  \"next_page\": null\n}\n```\n- `release_stage` — the vendor's release stage: `alpha`, `beta` or `public`. Published models are listed for every organization. The list can also hold unpublished models: beta or alpha models when the organization has access to that stage, and its own vendor's models for lab organizations. Use `release_stage` to tell them apart.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/models",

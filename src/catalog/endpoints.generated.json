@@ -533,6 +533,42 @@
       "sourceFile": "Organization API/Edges/Get Edges.bru"
     },
     {
+      "key": "organization.exports.getExport",
+      "namespace": "organization",
+      "group": "exports",
+      "action": "getExport",
+      "title": "Get Export",
+      "description": "Returns the nightly data export of one UTC day, with a download URL for each file.\n\n## Path parameters\n- `date` — the UTC day, `YYYY-MM-DD` (a `date` from Get Exports).\n\n## Success\n**200 OK**\n```json\n{\n  \"organization_id\": \"5b1d3c0e-8f2a-4c6b-9d1e-...\",\n  \"date\": \"2026-11-22\",\n  \"schema_version\": 1,\n  \"generated_at\": \"2026-11-23T01:03:12Z\",\n  \"files\": [\n    {\n      \"name\": \"devices.ndjson.gz\",\n      \"rows\": 412,\n      \"bytes\": 58213,\n      \"url\": \"https://<bucket>.s3.amazonaws.com/exports/.../2026-11-22/devices.ndjson.gz?X-Amz-Expires=900&...\",\n      \"expires_at\": \"2026-11-23T01:30:00Z\"\n    }\n  ]\n}\n```\n- `files` — one gzipped NDJSON file (one JSON object per line) per dataset:\n  - `devices.ndjson.gz` — every device, in the shape of Get Devices.\n  - `spaces.ndjson.gz` — every space, in the shape of Get Spaces.\n  - `device_models.ndjson.gz` — the device models the organization's devices use, in the shape of Get Models.\n  - `incidents.ndjson.gz` — incidents created or updated that day, plus every incident still active, in the shape of Get Incidents.\n  - `state_history.ndjson.gz` — one line per device status change that day: `device_id`, `timestamp` (UTC), `from_status` (`null` when the previous status is unknown, i.e. older than 48 hours), `to_status`. Covers devices on Xyte's current telemetry platform only; other devices have no lines.\n- `rows` / `bytes` — the line count and compressed size of the file.\n- `url` — a pre-signed download URL, valid until `expires_at` (15 minutes). Call this endpoint again for fresh URLs.\n- `schema_version` — changes when the file format changes incompatibly.\n\n## Errors\n**401 Unauthorized** — the `Authorization` header is missing, or the API key or token is invalid.\n\n**403 Forbidden** — the organization's pricing plan does not include data export.\n```json\n{ \"error\": \"This feature is not supported under your pricing plan\" }\n```\n\n**404 Not Found** — no export exists for that date, or the export is turned off for the organization.\n```json\n{ \"error\": \"Export not found\" }\n```\n\n**422 Unprocessable Entity** — `date` is not a valid `YYYY-MM-DD` date.\n```json\n{ \"error\": \"date must be YYYY-MM-DD\" }\n```\n\n**503 Service Unavailable** — data export is not available right now; try again later.\n```json\n{ \"error\": \"Data export is temporarily unavailable\" }\n```",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/exports/:date",
+      "pathParams": [
+        "date"
+      ],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Exports/Get Export.bru"
+    },
+    {
+      "key": "organization.exports.getExports",
+      "namespace": "organization",
+      "group": "exports",
+      "action": "getExports",
+      "title": "Get Exports",
+      "description": "Lists the organization's 7 most recent nightly data exports, newest first.\n\nEvery night at 01:00 UTC, Xyte exports the organization's data for the previous UTC day: devices, spaces, device models, incidents and device status changes, as gzipped NDJSON files. Use Get Export to download the files of a day.\n\nOff by default: every call answers `403 Forbidden` until Xyte enables data export for the organization's pricing plan. An organization administrator then turns the export on in the portal; until then the list is empty.\n\n## Success\n**200 OK**\n```json\n{\n  \"items\": [\n    { \"date\": \"2026-11-22\", \"generated_at\": \"2026-11-23T01:03:12Z\" },\n    { \"date\": \"2026-11-21\", \"generated_at\": \"2026-11-22T01:02:47Z\" }\n  ]\n}\n```\n- `date` — the UTC day the export covers (`YYYY-MM-DD`).\n- `generated_at` — when the export finished.\n\n## Errors\n**401 Unauthorized** — the `Authorization` header is missing, or the API key or token is invalid.\n\n**403 Forbidden** — the organization's pricing plan does not include data export.\n```json\n{ \"error\": \"This feature is not supported under your pricing plan\" }\n```\n\n**503 Service Unavailable** — data export is not available right now; try again later.\n```json\n{ \"error\": \"Data export is temporarily unavailable\" }\n```",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/organization/exports",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "organization",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Organization API/Exports/Get Exports.bru"
+    },
+    {
       "key": "organization.getOrganizationInfo",
       "namespace": "organization",
       "group": "",

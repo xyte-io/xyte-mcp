@@ -183,6 +183,7 @@
       "group": "devices",
       "action": "claimDevice",
       "title": "Claim Device",
+      "description": "## Success\n**200 OK** — the claimed device, as the same device object Get Device returns (see Get Device for every field).\n- `merged_effective_status_updated_at` is `null` for a just-claimed device: its merged status has not changed yet.",
       "method": "POST",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/claim",

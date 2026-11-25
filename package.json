@@ -1,64 +1,19 @@
 {
-  "name": "@xyteai/mcp",
-  "version": "0.5.1",
-  "description": "MCP server for the Xyte platform API",
-  "license": "Apache-2.0",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/xyte-io/xyte-mcp.git"
-  },
-  "bugs": {
-    "url": "https://github.com/xyte-io/xyte-mcp/issues"
-  },
-  "homepage": "https://github.com/xyte-io/xyte-mcp#readme",
-  "keywords": [
-    "xyte",
-    "mcp",
-    "model-context-protocol",
-    "agent"
-  ],
+  "name": "xyte-mcp-workspace",
+  "private": true,
   "type": "module",
   "engines": {
     "node": ">=22"
   },
-  "publishConfig": {
-    "access": "public"
-  },
-  "bin": {
-    "xyte-mcp": "dist/index.js"
-  },
-  "main": "dist/server.js",
-  "types": "dist/server.d.ts",
-  "files": [
-    "dist",
-    "README.md"
+  "workspaces": [
+    "packages/mcp",
+    "packages/remote"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "test": "npm run build && vitest run",
-    "test:unit": "vitest run",
-    "lint": "eslint src tests scripts",
-    "catalog:generate": "node scripts/generate-catalog.mjs",
-    "smoke:live": "npm run build && node scripts/live-smoke.mjs",
-    "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
-    "loop:partner-coupons": "npm run build && node scripts/partner-coupon-loop.mjs",
-    "loop:partner-store-reads": "npm run build && node scripts/partner-store-reads-loop.mjs",
-    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
-    "prepare": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run smoke:pack-install"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.1.13"
-  },
-  "devDependencies": {
-    "@eslint/js": "^9.39.5",
-    "@types/node": "^22.10.2",
-    "@usebruno/lang": "^0.38.0",
-    "eslint": "^9.17.0",
-    "typescript": "^5.7.2",
-    "typescript-eslint": "^8.18.1",
-    "vitest": "^4.1.4"
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run build -w @xyteai/mcp && npm run typecheck --workspaces",
+    "test": "npm run build && npm run test:unit --workspaces",
+    "lint": "eslint packages",
+    "start": "node packages/remote/dist/index.js"
   }
 }

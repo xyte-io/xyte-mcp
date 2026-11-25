@@ -1,0 +1,439 @@
+import { describe, expect, it } from 'vitest';
+import {
+  DEFAULT_ENTRY_URL,
+  DEFAULT_HTTP_PORT,
+  DEFAULT_HUB_URL,
+  ENV,
+  resolveConfig,
+  resolveHttpConfig
+} from '../src/config.js';
+import { XyteError } from '../src/http/errors.js';
+
+const withOrgKey = { [ENV.orgKey]: 'org-key-abcdef123456' };
+
+describe('resolveConfig', () => {
+  it('requires at least one key and says which to set', () => {
+    const error = (() => {
+      try {
+        resolveConfig({});
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(XyteError);
+    expect((error as XyteError).kind).toBe('config');
+    expect((error as XyteError).message).toContain(ENV.orgKey);
+    expect((error as XyteError).message).toContain(ENV.partnerKey);
+  });
+
+  it('accepts an organization key alone', () => {
+    const config = resolveConfig(withOrgKey);
+    expect(config.credentials).toEqual({ organization: 'org-key-abcdef123456' });
+  });
+
+  it('accepts a partner key alone', () => {
+    const config = resolveConfig({ [ENV.partnerKey]: 'partner-key-abcdef' });
+    expect(config.credentials).toEqual({ partner: 'partner-key-abcdef' });
+  });
+
+  it('accepts both', () => {
+    const config = resolveConfig({ ...withOrgKey, [ENV.partnerKey]: 'partner-key-abcdef' });
+    expect(Object.keys(config.credentials).sort()).toEqual(['organization', 'partner']);
+  });
+
+  it('ignores whitespace-only keys', () => {
+    expect(() => resolveConfig({ [ENV.orgKey]: '   ' })).toThrow(XyteError);
+  });
+
+  it('defaults to production hosts', () => {
+    const config = resolveConfig(withOrgKey);
+    expect(config.baseUrls.hub).toBe(DEFAULT_HUB_URL);
+    expect(config.baseUrls.entry).toBe(DEFAULT_ENTRY_URL);
+  });
+
+  it('overrides and normalises base URLs', () => {
+    const config = resolveConfig({ ...withOrgKey, [ENV.hubUrl]: 'http://localhost:3001/' });
+    expect(config.baseUrls.hub).toBe('http://localhost:3001');
+  });
+
+  it('defaults writes to on', () => {
+    expect(resolveConfig(withOrgKey).allowWrites).toBe(true);
+  });
+
+  it.each(['1', 'true', 'TRUE', 'yes'])('goes read-only for %s', (value) => {
+    expect(resolveConfig({ ...withOrgKey, [ENV.readOnly]: value }).allowWrites).toBe(false);
+  });
+
+  it.each(['0', 'false', 'no', '', 'maybe', 'on'])(
+    'keeps writes on when read-only is %s',
+    (value) => {
+      expect(resolveConfig({ ...withOrgKey, [ENV.readOnly]: value }).allowWrites).toBe(true);
+    }
+  );
+
+  // 0.1.x was read-only by default and this was the only switch, so anyone who
+  // set it decided deliberately. Upgrading must not widen their posture.
+  describe('the legacy allow-writes variable', () => {
+    it.each(['0', 'false', 'no', '', 'maybe'])('still forces read-only for %s', (value) => {
+      expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(false);
+    });
+
+    it.each(['1', 'true', 'yes'])('still permits writes for %s', (value) => {
+      expect(resolveConfig({ ...withOrgKey, [ENV.allowWrites]: value }).allowWrites).toBe(true);
+    });
+
+    it('loses to an explicit read-only request', () => {
+      const config = resolveConfig({
+        ...withOrgKey,
+        [ENV.allowWrites]: '1',
+        [ENV.readOnly]: '1'
+      });
+      expect(config.allowWrites).toBe(false);
+    });
+  });
+
+  // The HTTP transport: read-only unless writes are asked for explicitly.
+  describe('with writesByDefault: false', () => {
+    const http = (env: Record<string, string>) =>
+      resolveConfig({ ...withOrgKey, ...env }, { writesByDefault: false }).allowWrites;
+
+    it('defaults writes to off, and read-only=0 alone does not turn them on', () => {
+      expect(http({})).toBe(false);
+      expect(http({ [ENV.readOnly]: '0' })).toBe(false);
+    });
+
+    it('turns writes on only for an explicit allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1' })).toBe(true);
+      expect(http({ [ENV.allowWrites]: '0' })).toBe(false);
+    });
+
+    it('still lets an explicit read-only win over allow-writes', () => {
+      expect(http({ [ENV.allowWrites]: '1', [ENV.readOnly]: '1' })).toBe(false);
+    });
+  });
+
+  it('defaults and validates the timeout', () => {
+    expect(resolveConfig(withOrgKey).timeoutMs).toBe(15_000);
+    expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '5000' }).timeoutMs).toBe(5000);
+    expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: '-1' }).timeoutMs).toBe(15_000);
+    expect(resolveConfig({ ...withOrgKey, [ENV.timeoutMs]: 'abc' }).timeoutMs).toBe(15_000);
+  });
+});
+
+describe('resolveHttpConfig', () => {
+  const token = 'xmcp_test_token_0123456789abcdef';
+  const staticEnv = { [ENV.httpToken]: token, [ENV.orgKey]: 'org-key' };
+
+  it('reads the static token and the platform port', () => {
+    expect(resolveHttpConfig({ ...staticEnv, [ENV.httpPort]: '5001' })).toEqual({
+      staticToken: token,
+      port: 5001
+    });
+  });
+
+  it('defaults the port', () => {
+    expect(resolveHttpConfig(staticEnv).port).toBe(DEFAULT_HTTP_PORT);
+  });
+
+  it('reads the rate bucket secret trimmed, and leaves it out when blank', () => {
+    expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: '  s3cret!~  ' }).rateBucketSecret).toBe(
+      's3cret!~'
+    );
+    for (const padded of ['secret\n', '\r\nsecret\r\n']) {
+      expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: padded }).rateBucketSecret).toBe('secret');
+    }
+    for (const blank of [undefined, '', '   ']) {
+      expect(resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: blank })).not.toHaveProperty(
+        'rateBucketSecret'
+      );
+    }
+  });
+
+  // fetch's own "invalid header value" error would echo the value into a tool result,
+  // and here a bad value fails the release phase too.
+  it.each(['leaky-secret\nx', 'leaky-secret é', 'leaky secret', 'leaky\tsecret'])(
+    'refuses a rate bucket secret that is not visible ASCII (%j), without naming the value',
+    (secret) => {
+      let error: unknown;
+      try {
+        resolveHttpConfig({ ...staticEnv, [ENV.rateBucketSecret]: secret });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeInstanceOf(XyteError);
+      expect((error as XyteError).kind).toBe('config');
+      expect((error as XyteError).message).toContain(ENV.rateBucketSecret);
+      expect(JSON.stringify([(error as XyteError).message, (error as XyteError).hints])).not.toContain('leaky');
+    }
+  );
+
+  // Serving with auth disabled would publish a live API key to anyone with the
+  // URL, so missing auth must stop the boot rather than widen the server.
+  it('refuses a config with no auth at all, naming both options', () => {
+    const error = (() => {
+      try {
+        resolveHttpConfig({});
+        return undefined;
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(error).toBeInstanceOf(XyteError);
+    expect((error as XyteError).kind).toBe('config');
+    expect((error as XyteError).message).toContain(ENV.httpToken);
+    expect((error as XyteError).message).toContain(ENV.issuerUrl);
+  });
+
+  it('refuses a whitespace-only token', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: '   ' })).toThrow(XyteError);
+  });
+
+  it('refuses a guessably short token', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: 'short', [ENV.orgKey]: 'k' })).toThrow(
+      /too short/
+    );
+  });
+
+  it('refuses a static token with no API key behind it', () => {
+    expect(() => resolveHttpConfig({ [ENV.httpToken]: token })).toThrow(/no API key/);
+  });
+
+  const hubClientEnv = {
+    [ENV.hubOAuthClientId]: 'hub-id',
+    [ENV.hubOAuthClientSecret]: 'hub-secret'
+  };
+  const hubClient = { id: 'hub-id', secret: 'hub-secret' };
+
+  it('enables OAuth from the issuer URL, with a database, or without one on localhost', () => {
+    const issuer = 'https://mcp.example.com';
+    // Normalized as the SDK normalizes the resource clients send back.
+    expect(
+      resolveHttpConfig({ ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.issuerUrl]: 'https://MCP.example.com:443' })
+        .oauth?.issuerUrl
+    ).toBe(issuer);
+    expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'http://localhost:3000/' }).oauth).toEqual({
+      issuerUrl: 'http://localhost:3000',
+      hubClient
+    });
+    expect(
+      resolveHttpConfig({
+        ...hubClientEnv,
+        [ENV.issuerUrl]: issuer,
+        [ENV.databaseUrl]: 'postgres://x',
+        [ENV.tokenKey]: tokenKey
+      }).oauth
+    ).toEqual({
+      issuerUrl: issuer,
+      databaseUrl: 'postgres://x',
+      hubClient,
+      tokenKey: Buffer.from(tokenKey, 'base64')
+    });
+  });
+
+  // Fixed bytes whose base64 holds '+' and '/', so the base64url case below differs.
+  const tokenKeyBytes = Buffer.from(Array.from({ length: 32 }, (_, i) => (i * 37 + 251) % 256));
+  const tokenKey = tokenKeyBytes.toString('base64');
+  const previousTokenKey = Buffer.from(tokenKeyBytes.map((byte) => byte ^ 0x5a)).toString('base64');
+  const pgOAuthEnv = {
+    ...hubClientEnv,
+    [ENV.issuerUrl]: 'https://mcp.example.com',
+    [ENV.databaseUrl]: 'postgres://x'
+  };
+  /** The in-memory store: a local run only. */
+  const localMemoryOAuthEnv = { ...hubClientEnv, [ENV.issuerUrl]: 'http://127.0.0.1:8080' };
+
+  // The stored hub tokens are encrypted under it; without one they would sit in plain text.
+  it('refuses a Postgres token store without a valid token key, never echoing the value', () => {
+    // The two cases below only test the re-encode check if they still decode to 32 bytes.
+    expect(Buffer.from(`${tokenKey.slice(0, 10)}!${tokenKey.slice(10)}`, 'base64')).toHaveLength(32);
+    expect(tokenKeyBytes.toString('base64url')).not.toBe(tokenKey);
+    expect(Buffer.from(tokenKeyBytes.toString('base64url'), 'base64')).toHaveLength(32);
+    for (const bad of [
+      undefined,
+      '',
+      Buffer.alloc(16, 7).toString('base64'), // too short
+      Buffer.alloc(33, 7).toString('base64'), // too long
+      `${tokenKey.slice(0, 10)}!${tokenKey.slice(10)}`, // a character base64 silently drops
+      tokenKey.replace(/=$/, ''), // unpadded
+      tokenKeyBytes.toString('base64url'), // base64url, not standard base64
+      Buffer.alloc(32, 7).toString('base64'), // a placeholder: one byte value repeated
+      Buffer.alloc(32).toString('base64') // all zeros
+    ]) {
+      const env = { ...pgOAuthEnv, ...(bad === undefined ? {} : { [ENV.tokenKey]: bad }) };
+      expect(() => resolveHttpConfig(env), String(bad)).toThrow(XyteError);
+      expect(() => resolveHttpConfig(env)).toThrow(new RegExp(ENV.tokenKey));
+      try {
+        resolveHttpConfig(env);
+      } catch (error) {
+        const { message, hints } = error as XyteError;
+        expect(message + JSON.stringify(hints)).toContain("randomBytes(32).toString('base64')");
+        if (bad) expect(message + JSON.stringify(hints)).not.toContain(bad);
+      }
+    }
+  });
+
+  it('takes an optional previous token key, validated the same way', () => {
+    expect(
+      resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: ` ${tokenKey} `,
+        [ENV.previousTokenKey]: previousTokenKey
+      }).oauth
+    ).toMatchObject({
+      tokenKey: Buffer.from(tokenKey, 'base64'),
+      previousTokenKey: Buffer.from(previousTokenKey, 'base64')
+    });
+    for (const badPrevious of ['not-a-key', Buffer.alloc(32, 9).toString('base64')]) {
+      const env = { ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.previousTokenKey]: badPrevious };
+      expect(() => resolveHttpConfig(env)).toThrow(new RegExp(ENV.previousTokenKey));
+      expect(() => resolveHttpConfig(env)).not.toThrow(badPrevious);
+    }
+  });
+
+  it('treats an empty or whitespace previous token key as unset', () => {
+    for (const blank of ['', '   ']) {
+      const oauth = resolveHttpConfig({
+        ...pgOAuthEnv,
+        [ENV.tokenKey]: tokenKey,
+        [ENV.previousTokenKey]: blank
+      }).oauth;
+      expect(oauth).toMatchObject({ tokenKey: Buffer.from(tokenKey, 'base64') });
+      expect(oauth).not.toHaveProperty('previousTokenKey');
+    }
+  });
+
+  // Same key twice is a rotation step done wrong (KEY changed, PREVIOUS not, or vice versa).
+  it('refuses a previous token key equal to the current one, never echoing it', () => {
+    const env = { ...pgOAuthEnv, [ENV.tokenKey]: tokenKey, [ENV.previousTokenKey]: ` ${tokenKey}` };
+    expect(() => resolveHttpConfig(env)).toThrow(
+      new RegExp(`${ENV.previousTokenKey} must differ from ${ENV.tokenKey}`)
+    );
+    expect(() => resolveHttpConfig(env)).not.toThrow(tokenKey);
+  });
+
+  it('ignores the previous token key for the in-memory store, even an invalid one', () => {
+    const oauth = resolveHttpConfig({
+      ...localMemoryOAuthEnv,
+      [ENV.previousTokenKey]: 'not-a-key'
+    }).oauth;
+    expect(oauth).not.toHaveProperty('previousTokenKey');
+    expect(oauth).not.toHaveProperty('tokenKey');
+  });
+
+  it('needs no token key for the in-memory store, and ignores an invalid one', () => {
+    expect(resolveHttpConfig(localMemoryOAuthEnv).oauth).toEqual({
+      issuerUrl: 'http://127.0.0.1:8080',
+      hubClient
+    });
+    expect(
+      resolveHttpConfig({ ...localMemoryOAuthEnv, [ENV.tokenKey]: 'not-a-key' }).oauth
+    ).toEqual({ issuerUrl: 'http://127.0.0.1:8080', hubClient });
+  });
+
+  // The in-memory store loses every sign-in on a restart and shares none
+  // between instances: only a local run may use it.
+  it('refuses a public issuer without DATABASE_URL, and allows localhost and 127.0.0.1', () => {
+    for (const blank of [{}, { [ENV.databaseUrl]: '' }, { [ENV.databaseUrl]: '  ' }]) {
+      const env = { ...hubClientEnv, [ENV.issuerUrl]: 'https://mcp.example.com', ...blank };
+      expect(() => resolveHttpConfig(env)).toThrow(XyteError);
+      expect(() => resolveHttpConfig(env)).toThrow(
+        new RegExp(`${ENV.issuerUrl} is not local, so ${ENV.databaseUrl} is required`)
+      );
+    }
+    for (const local of ['http://localhost:3000', 'https://localhost', 'http://127.0.0.1:8080']) {
+      expect(resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: local }).oauth).toEqual({
+        issuerUrl: local,
+        hubClient
+      });
+    }
+    // A local issuer with a database still needs the key.
+    expect(() =>
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'https://localhost', [ENV.databaseUrl]: 'postgres://x' })
+    ).toThrow(new RegExp(`${ENV.tokenKey} must be the base64`));
+  });
+
+  it('refuses OAuth without the hub client credentials', () => {
+    expect(() =>
+      resolveHttpConfig({ [ENV.issuerUrl]: 'https://mcp.example.com', [ENV.hubOAuthClientId]: 'x' })
+    ).toThrow(new RegExp(ENV.hubOAuthClientSecret));
+  });
+
+  // The hint's register command must turn on the signed-in user's access, or every member gets the organization's.
+  it('hints a hub registration that acts with the signed-in user\'s access', () => {
+    let caught: unknown;
+    try {
+      resolveHttpConfig({ [ENV.issuerUrl]: 'https://mcp.example.com/' });
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as XyteError).hints.join(' ')).toContain(
+      'ACTS_AS_SIGNED_IN_USER=true GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://mcp.example.com/oauth/callback]"'
+    );
+  });
+
+  // A shared static bearer next to the per-user sign-in on one public URL.
+  it('refuses static + OAuth together, naming both variables', () => {
+    expect(() =>
+      resolveHttpConfig({ ...staticEnv, ...hubClientEnv, [ENV.issuerUrl]: 'https://mcp.example.com' })
+    ).toThrow(new RegExp(`${ENV.httpToken} and ${ENV.issuerUrl} are both set`));
+  });
+
+  // Tokens minted under a plain-http issuer are readable by every hop; only
+  // localhost (tests, local runs) is exempt, mirroring the SDK's rule.
+  it('refuses a non-https issuer except localhost', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'http://mcp.example.com' })).toThrow(
+      /https/
+    );
+    expect(
+      resolveHttpConfig({ ...hubClientEnv, [ENV.issuerUrl]: 'http://127.0.0.1:8080' }).oauth
+        ?.issuerUrl
+    ).toBe('http://127.0.0.1:8080');
+  });
+
+  it('refuses an issuer with a query or fragment', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'https://a.example?x=1' })).toThrow(
+      XyteError
+    );
+  });
+
+  // Routes are mounted at the root: a path would send every sign-in to a 404.
+  it('refuses an issuer with a path', () => {
+    expect(() => resolveHttpConfig({ [ENV.issuerUrl]: 'https://a.example/xyte' })).toThrow(
+      /must not have a path/
+    );
+  });
+
+  // An org key alongside the token keeps these valid once OAuth lands.
+  const withKey = { [ENV.orgKey]: 'org-key' };
+
+  it('puts the length floor at 24 characters, after trimming', () => {
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(23) })).toThrow(
+      /too short/
+    );
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: ` ${'a'.repeat(23)} ` })).toThrow(
+      /too short/
+    );
+    // Field-name agnostic, so it survives the token field's rename for OAuth.
+    expect(Object.values(resolveHttpConfig({ ...withKey, [ENV.httpToken]: ` ${token} ` }))).toContain(
+      token
+    );
+    expect(() => resolveHttpConfig({ ...withKey, [ENV.httpToken]: 'a'.repeat(24) })).not.toThrow();
+  });
+
+  // The xmcp_ prefix is a scanner marker; it adds nothing to guess.
+  it('does not count the xmcp_ prefix toward the floor', () => {
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(23)}` })
+    ).toThrow(/too short/);
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: `xmcp_${'a'.repeat(24)}` })
+    ).not.toThrow();
+  });
+
+  it.each(['abc', '0', '-1', '3000.5', '70000'])('refuses PORT=%s', (port) => {
+    expect(() =>
+      resolveHttpConfig({ ...withKey, [ENV.httpToken]: token, [ENV.httpPort]: port })
+    ).toThrow(/PORT must be an integer/);
+  });
+});

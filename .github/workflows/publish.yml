@@ -77,7 +77,7 @@ jobs:
       - run: npm ci --ignore-scripts
 
       - name: Secretless packaged install smoke
-        run: npm run smoke:pack-install
+        run: npm run smoke:pack-install -w @xyteai/mcp
 
   publish:
     needs: [meta, packaged-install-smoke]
@@ -101,15 +101,15 @@ jobs:
       - run: npm ci --ignore-scripts
 
       # The check that stops a mistagged release: the tag is what users will
-      # ask npm for, package.json is what npm records.
+      # ask npm for, packages/mcp/package.json is what npm records.
       - name: Validate package version matches tag
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          PACKAGE_VERSION="$(node -p "require('./packages/mcp/package.json').version")"
           TAG_VERSION="${{ needs.meta.outputs.version }}"
           if [[ "${PACKAGE_VERSION}" != "${TAG_VERSION}" ]]; then
-            echo "::error::package.json version (${PACKAGE_VERSION}) does not match tag (${TAG_VERSION})."
+            echo "::error::packages/mcp/package.json version (${PACKAGE_VERSION}) does not match tag (${TAG_VERSION})."
             exit 1
           fi
 
@@ -117,14 +117,16 @@ jobs:
       - run: npm run lint
       - run: npm run build
       # After the build: the protocol test spawns the real server from dist/.
-      - run: npx vitest run
+      - run: npm run test:unit -w @xyteai/mcp
+      - run: node packages/mcp/scripts/assert-pack-no-pg.mjs
 
-      # Same gate as CI: only what ships. A devDependency advisory must not
-      # block a release of unaffected shipped code.
+      # Only what this release ships: @xyteai/mcp's runtime dependencies. A
+      # devDependency or hosted-server (express, pg) advisory must not block a
+      # release of unaffected shipped code; CI audits those.
       - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=high
+        run: npm audit --omit=dev --audit-level=high -w @xyteai/mcp
 
       - name: Publish to npm
-        run: npm publish --access public --tag latest --provenance
+        run: npm publish -w @xyteai/mcp --access public --tag latest --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

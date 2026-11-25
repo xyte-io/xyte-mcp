@@ -1,0 +1,108 @@
+{
+  "name": "@xyteai/mcp",
+  "version": "0.5.1",
+  "description": "MCP server for the Xyte platform API",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xyte-io/xyte-mcp.git",
+    "directory": "packages/mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/xyte-io/xyte-mcp/issues"
+  },
+  "homepage": "https://github.com/xyte-io/xyte-mcp#readme",
+  "keywords": [
+    "xyte",
+    "mcp",
+    "model-context-protocol",
+    "agent"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "xyte-mcp": "dist/index.js"
+  },
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./catalog/catalog.js": {
+      "types": "./dist/catalog/catalog.d.ts",
+      "default": "./dist/catalog/catalog.js"
+    },
+    "./config.js": {
+      "types": "./dist/config.d.ts",
+      "default": "./dist/config.js"
+    },
+    "./context.js": {
+      "types": "./dist/context.d.ts",
+      "default": "./dist/context.js"
+    },
+    "./http/client.js": {
+      "types": "./dist/http/client.d.ts",
+      "default": "./dist/http/client.js"
+    },
+    "./http/errors.js": {
+      "types": "./dist/http/errors.d.ts",
+      "default": "./dist/http/errors.js"
+    },
+    "./log.js": {
+      "types": "./dist/log.d.ts",
+      "default": "./dist/log.js"
+    },
+    "./redact.js": {
+      "types": "./dist/redact.d.ts",
+      "default": "./dist/redact.js"
+    },
+    "./server.js": {
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./version.js": {
+      "types": "./dist/version.d.ts",
+      "default": "./dist/version.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && vitest run",
+    "test:unit": "vitest run",
+    "lint": "eslint src tests scripts",
+    "catalog:generate": "node scripts/generate-catalog.mjs --hub-path ../../../hub",
+    "smoke:live": "npm run build && node scripts/live-smoke.mjs",
+    "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
+    "loop:partner-coupons": "npm run build && node scripts/partner-coupon-loop.mjs",
+    "loop:partner-store-reads": "npm run build && node scripts/partner-store-reads-loop.mjs",
+    "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run smoke:pack-install && node scripts/assert-pack-no-pg.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^22.10.2",
+    "@usebruno/lang": "^0.38.0",
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.1",
+    "vitest": "^4.1.4"
+  }
+}

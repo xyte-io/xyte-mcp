@@ -22,9 +22,42 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run build
-      # Includes the protocol smoke test, which spawns a real stdio server.
-      - run: npx vitest run
-      - run: npm pack --dry-run
+      # Both packages. Includes the protocol smoke test, which spawns a real
+      # stdio server, and the transport tests, which spawn the hosted server.
+      - run: npm run test:unit --workspaces
+      - run: npm pack --dry-run -w @xyteai/mcp
+      # The published package must not carry the hosted server's code or its
+      # pg dependency. One OS is enough: the tarball is the same everywhere.
+      - name: Packed @xyteai/mcp has no pg and no hosted-server code
+        if: matrix.os == 'ubuntu-latest'
+        run: node packages/mcp/scripts/assert-pack-no-pg.mjs
+
+  pg-store:
+    # The OAuth store contract against a real Postgres. Service containers only
+    # run on Linux runners, so this is its own job rather than a matrix leg.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # The remote package imports the shared modules from @xyteai/mcp's dist;
+      # oauth-http.test.ts spawns the built remote server (its dist/index.js).
+      - run: npm run build -w @xyteai/mcp -w @xyteai/mcp-remote
+      # The whole remote suite, so no Postgres test is ever skipped here.
+      - run: npm run test:unit -w @xyteai/mcp-remote
 
   catalog-shape:
     # The generator needs a hub checkout, which CI does not have, so validate the
@@ -37,12 +70,17 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --ignore-scripts
+      # GitHub shows the root copies, npm the package copies; keep them identical.
+      - name: Root README and LICENSE match the published package's copies
+        run: |
+          cmp README.md packages/mcp/README.md
+          cmp LICENSE packages/mcp/LICENSE
       - name: Validate committed catalog
         run: |
           node --input-type=module -e '
             import { readFileSync } from "node:fs";
             const { catalogVersion, endpoints } = JSON.parse(
-              readFileSync("src/catalog/endpoints.generated.json", "utf8")
+              readFileSync("packages/mcp/src/catalog/endpoints.generated.json", "utf8")
             );
             const fail = (m) => { console.error("FAIL " + m); process.exit(1); };
 
@@ -81,19 +119,15 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
 
-      # Gate on what actually ships. Only @modelcontextprotocol/sdk and zod are
-      # runtime dependencies, and `files` publishes just dist/ + README, so a
-      # devDependency advisory cannot reach a user of this package.
+      # Gate on what actually ships: the runtime dependencies of both packages
+      # (the published @xyteai/mcp: @modelcontextprotocol/sdk and zod; the
+      # hosted server adds express and pg). `files` publishes just dist/ +
+      # README, so a devDependency advisory cannot reach a user.
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 
       # Dev-tree advisories still matter for our own supply chain, so keep them
       # visible — but they must not block a release of unaffected shipped code.
-      # Known outstanding: brace-expansion <=5.0.7 (DoS) reaches us only via
-      # eslint -> @eslint/config-array -> minimatch@3, and the only clean fix is
-      # a breaking eslint major. Left to Dependabot rather than forcing
-      # brace-expansion@5 into minimatch@3, which would risk silently wrong
-      # glob matching in the linter.
       - name: Audit dev dependencies (report only)
         continue-on-error: true
         run: npm audit --audit-level=high

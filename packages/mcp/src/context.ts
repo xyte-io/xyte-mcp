@@ -1,0 +1,40 @@
+import { createHttpClient, type HttpClient } from './http/client.js';
+import type { Credentials, ServerConfig } from './config.js';
+
+/**
+ * Everything a tool is allowed to depend on.
+ *
+ * Tools receive this and nothing else — no `process.env`, no transport, no
+ * global state. Swapping stdio for an HTTP/OAuth transport means building this
+ * object differently (per-request credentials instead of per-process ones),
+ * with no change to any tool.
+ */
+export interface ToolContext {
+  readonly http: HttpClient;
+  readonly credentials: Credentials;
+  readonly baseUrls: { readonly hub: string; readonly entry: string };
+  /** When false, only GET/HEAD endpoints may be called. */
+  readonly allowWrites: boolean;
+  /** Literal secret values to strip from anything returned to the caller. */
+  readonly secrets: readonly string[];
+  /**
+   * True when the host records every tool call itself (the hosted server's `tool_call` event,
+   * which also names the connection), so xyte_api_call skips its own plain stderr write line.
+   */
+  readonly toolCallsLoggedByHost?: boolean;
+}
+
+export function createToolContext(config: ServerConfig, http?: HttpClient): ToolContext {
+  return {
+    http: http ?? createHttpClient({ timeoutMs: config.timeoutMs }),
+    credentials: config.credentials,
+    baseUrls: config.baseUrls,
+    allowWrites: config.allowWrites,
+    // A credential is either a bare API key or a hub OAuth token; in both
+    // shapes the token values must never reach the caller.
+    secrets: Object.values(config.credentials).flatMap((value) => {
+      if (typeof value === 'string') return value.length > 0 ? [value] : [];
+      return value ? [value.accessToken] : [];
+    })
+  };
+}

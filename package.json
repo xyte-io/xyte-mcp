@@ -1,6 +1,6 @@
 {
   "name": "@xyteai/mcp",
-  "version": "0.3.0",
+  "version": "0.5.2",
   "description": "MCP server for the Xyte platform API",
   "license": "Apache-2.0",
   "repository": {
@@ -42,6 +42,8 @@
     "catalog:generate": "node scripts/generate-catalog.mjs",
     "smoke:live": "npm run build && node scripts/live-smoke.mjs",
     "smoke:pack-install": "node scripts/pack-install-smoke.mjs",
+    "loop:partner-coupons": "npm run build && node scripts/partner-coupon-loop.mjs",
+    "loop:partner-store-reads": "npm run build && node scripts/partner-store-reads-loop.mjs",
     "inspect": "npm run build && npx @modelcontextprotocol/inspector node dist/index.js",
     "prepare": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run lint && npm test && npm run smoke:pack-install"

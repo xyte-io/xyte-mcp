@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { z } from 'zod';
 import { apiCallTool } from '../src/tools/api-call.js';
 import { endpointDescribeTool } from '../src/tools/endpoint-describe.js';
 import { endpointsListTool } from '../src/tools/endpoints-list.js';
-import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteHttpError } from '../src/http/errors.js';
+import { APPLICATION_PAUSED_HINT, RATE_LIMITED_HINT, XyteError, XyteHttpError } from '../src/http/errors.js';
 import { REDACTED } from '../src/redact.js';
 import { stubHttp, testContext } from './support/context.js';
 
@@ -134,6 +135,33 @@ describe('xyte_api_call', () => {
     expect(http.calls).toHaveLength(1);
     expect(http.calls[0]?.method).toBe('POST');
     expect(http.calls[0]?.body).toBe('{"name":"reboot"}');
+  });
+
+  it('returns data: null for a 204 with no body, so the result matches the output schema', async () => {
+    const http = stubHttp(() => ({ status: 204, statusText: 'No Content', data: undefined }));
+    const result = await apiCallTool.handler(
+      { key: 'partner.coupons.deleteCoupon', path: { id: 'c1' }, confirm: 'partner.coupons.deleteCoupon' },
+      testContext({ http, credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+
+    expect(result.isError).toBeUndefined();
+    const structured = JSON.parse(JSON.stringify(result.structuredContent)) as Record<string, unknown>;
+    expect(structured).toHaveProperty('data', null);
+    expect(z.object(apiCallTool.outputSchema ?? {}).safeParse(structured).success).toBe(true);
+  });
+
+  it('hints that the endpoint is missing on this hub when the hub does not know the path', async () => {
+    const http = stubHttp(
+      () => new XyteHttpError(404, 'Not Found', { error: 'Requested path /core/v1/partner/coupons does not exist' }, 'partner.coupons.getCoupons')
+    );
+    const result = await apiCallTool.handler(
+      { key: 'partner.coupons.getCoupons' },
+      testContext({ http, credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not available on this hub');
+    expect(result.content[0]?.text).not.toContain('the resource may not exist');
   });
 
   it('refuses an unknown endpoint with suggestions', async () => {
@@ -327,5 +355,97 @@ describe('xyte_api_call', () => {
       readOnlyHint: false,
       destructiveHint: true
     });
+  });
+});
+
+describe('xyte_api_call write log line', () => {
+  const SECRET = 'org-key-abcdef123456';
+  let stderr: string[];
+
+  beforeEach(() => {
+    stderr = [];
+    vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+      stderr.push(String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('writes one line with key, method, status and duration for a successful write', async () => {
+    const http = stubHttp(() => ({ status: 201, data: { id: 'cmd1', secret_note: 'body-xyz' } }));
+    await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot-body-abc' } },
+      testContext({ http })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(
+      new RegExp(`^\\[xyte-mcp\\] write ${WRITE_KEY} POST status=201 duration_ms=\\d+\\n$`)
+    );
+    expect(stderr[0]).not.toContain(SECRET);
+    expect(stderr[0]).not.toContain('reboot-body-abc');
+    expect(stderr[0]).not.toContain('body-xyz');
+  });
+
+  it('logs the HTTP status of a failed write, without the error body', async () => {
+    const http = stubHttp(
+      () => new XyteHttpError(422, 'Unprocessable', { error: 'body-xyz', key: SECRET }, WRITE_KEY)
+    );
+    await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
+      testContext({ http })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ POST status=422 duration_ms=\d+\n$/);
+    expect(stderr[0]).not.toContain('body-xyz');
+    expect(stderr[0]).not.toContain(SECRET);
+  });
+
+  it('logs status=error when a write fails without an HTTP status (it may have landed)', async () => {
+    const http = stubHttp(() => new XyteError('timeout', 'request timed out'));
+    await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: { name: 'reboot' } },
+      testContext({ http })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ POST status=error duration_ms=\d+\n$/);
+  });
+
+  it('logs a 204 DELETE with its status', async () => {
+    const http = stubHttp(() => ({ status: 204, statusText: 'No Content', data: undefined }));
+    await apiCallTool.handler(
+      { key: 'partner.coupons.deleteCoupon', path: { id: 'c1' }, confirm: 'partner.coupons.deleteCoupon' },
+      testContext({ http, credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+
+    expect(stderr).toHaveLength(1);
+    expect(stderr[0]).toMatch(/ write partner\.coupons\.deleteCoupon DELETE status=204 duration_ms=\d+\n$/);
+  });
+
+  it('writes nothing for a read, a refused write or a write that fails validation', async () => {
+    const read = await apiCallTool.handler({ key: READ_KEY }, testContext());
+    const readOnlyRefusal = await apiCallTool.handler(
+      { key: WRITE_KEY, path: { device_id: 'd1' }, body: {} },
+      testContext({ allowWrites: false })
+    );
+    const deleteWithoutConfirm = await apiCallTool.handler(
+      { key: 'partner.coupons.deleteCoupon', path: { id: 'c1' } },
+      testContext({ credentials: { partner: 'partner-key-abcdef123456' } })
+    );
+    const invalid = await apiCallTool.handler({ key: WRITE_KEY, body: {} }, testContext());
+
+    expect(read.isError).toBeUndefined();
+    expect(readOnlyRefusal.isError).toBe(true);
+    expect(readOnlyRefusal.content[0]?.text).toContain('read-only');
+    expect(deleteWithoutConfirm.isError).toBe(true);
+    expect(deleteWithoutConfirm.content[0]?.text).toContain('confirm');
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content[0]?.text).toContain('device_id');
+    expect(stderr).toEqual([]);
   });
 });

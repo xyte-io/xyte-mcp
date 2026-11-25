@@ -1,4 +1,4 @@
-import { ENV, type HubOAuthCredential } from '../config.js';
+import type { HubOAuthCredential } from '../config.js';
 import { VERSION } from '../version.js';
 import { XyteError } from './errors.js';
 import type { EndpointSpec } from '../catalog/types.js';
@@ -13,11 +13,6 @@ export interface CallArgs {
   query?: QueryArgs;
   body?: unknown;
 }
-
-const KEY_ENV_BY_SCOPE = {
-  organization: ENV.orgKey,
-  partner: ENV.partnerKey
-} as const;
 
 /**
  * Turn an endpoint spec plus caller arguments into a concrete request.
@@ -43,7 +38,8 @@ export function buildRequest(
     throw new XyteError(
       'config',
       `${endpoint.key} needs a ${endpoint.authScope} API key, which is not configured.`,
-      [`Set ${KEY_ENV_BY_SCOPE[endpoint.authScope]} in the server environment and restart.`]
+      // Model-facing, so no setting name (README names the variable for operators).
+      [`This connection has no ${endpoint.authScope} access; whoever set it up can add a ${endpoint.authScope} API key.`]
     );
   }
 

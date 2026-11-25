@@ -58,6 +58,36 @@ describe('buildRequest', () => {
     expect(request.url).toContain('per_page=50');
   });
 
+  it('encodes a "+02:00" time offset in a query value once, as %2B', () => {
+    const request = buildRequest(
+      spec({ queryParams: ['created_from'] }),
+      { path: { device_id: 'abc' }, query: { created_from: '2026-01-01T02:00:00+02:00' } },
+      testContext()
+    );
+    expect(request.url).toContain('created_from=2026-01-01T02%3A00%3A00%2B02%3A00');
+  });
+
+  it('encodes a pre-encoded "%2B" again, which is why callers pass "+" plain', () => {
+    const request = buildRequest(
+      spec({ queryParams: ['created_from'] }),
+      { path: { device_id: 'abc' }, query: { created_from: '2026-01-01T02:00:00%2B02:00' } },
+      testContext()
+    );
+    expect(request.url).toContain('created_from=2026-01-01T02%3A00%3A00%252B02%3A00');
+  });
+
+  it('builds the catalog requests for approving an order and updating a tag note', () => {
+    const partner = testContext({ credentials: { partner: 'partner-key-abcdef123456' } });
+    const approve = buildRequest(getEndpoint('partner.orders.approveOrder')!, { path: { order_id: 'o1' } }, partner);
+    expect(approve.method).toBe('POST');
+    expect(approve.url).toMatch(/\/core\/v1\/partner\/orders\/o1\/approve$/);
+    const tagNote = getEndpoint('partner.organizationTags.updateOrganizationTag')!;
+    const path = Object.fromEntries(tagNote.pathParams.map((name) => [name, name]));
+    const update = buildRequest(tagNote, { path, body: { note: 'n' } }, partner);
+    expect(update.method).toBe('PATCH');
+    expect(update.url).toContain(tagNote.pathTemplate.replace(/:(\w+)/g, '$1'));
+  });
+
   it('honours a base URL override', () => {
     const context = testContext({
       baseUrls: { hub: 'http://localhost:3001', entry: 'http://localhost:3002' }
@@ -154,7 +184,9 @@ describe('buildRequest', () => {
     }
     expect(caught).toBeInstanceOf(XyteError);
     expect((caught as XyteError).kind).toBe('config');
-    expect((caught as XyteError).hints.join(' ')).toContain('XYTE_PARTNER_API_KEY');
+    // The hint reaches the model, so it names no setting (D4); the README names the variable.
+    expect((caught as XyteError).hints.join(' ')).toContain('no partner access');
+    expect((caught as XyteError).hints.join(' ')).not.toContain('XYTE_');
   });
 
   it('says partner endpoints are unavailable over a Xyte sign-in, not to set a key', () => {

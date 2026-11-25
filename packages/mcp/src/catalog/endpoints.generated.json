@@ -43,7 +43,6 @@
       "group": "assets",
       "action": "getAsset",
       "title": "Get Asset",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for an asset they cannot view; an asset outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/assets/:asset_id",
@@ -54,7 +53,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Assets/Get Asset.bru"
+      "sourceFile": "Organization API/Assets/Get Asset.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for an asset they cannot view; an asset outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.assets.getAssetLabels",
@@ -81,7 +81,6 @@
       "group": "assets",
       "action": "getAssets",
       "title": "Get Assets",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the assets they can view only; pagination (`next_page`) covers those only. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/assets",
@@ -96,7 +95,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Assets/Get Assets.bru"
+      "sourceFile": "Organization API/Assets/Get Assets.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the assets they can view only; pagination (`next_page`) covers those only. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.assets.updateAsset",
@@ -143,14 +143,18 @@
       "group": "commands",
       "action": "getCommands",
       "title": "Get Commands",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the commands of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **401** as before. Administrators, API keys and other applications are unaffected.",
+      "description": "## Query parameters\n- `page` — page number (default `1`).\n- `per_page` — results per page (default `100`, **max `500`**).\n- `status` — optional, one or more of `scheduled`, `pending`, `in_progress`, `done`, `failed`, `aborted`; comma-separated (`status=done,failed`).\n\n## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the commands of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **401** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/:device_id/commands",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "status"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
@@ -228,25 +232,6 @@
       "bodyType": "none",
       "mutating": false,
       "sourceFile": "Organization API/Devices/Get Device.bru"
-    },
-    {
-      "key": "organization.devices.getDeviceDetailsHistory",
-      "namespace": "organization",
-      "group": "devices",
-      "action": "getDeviceDetailsHistory",
-      "title": "Get Device Details History",
-      "description": "## Success\n**200 OK** — the device's current `details` and its earlier values, newest first.\n\nHistory starts at the later of the endpoint's release and the device's claim by your organization; earlier changes are not available, so a newly claimed device starts with empty history. Some frequently changing fields, set per device model, are not tracked: a change to only those fields adds no history entry and does not update `since`.\n```json\n{\n  \"current\": {\n    \"details\": { \"firmware\": \"3.0\" },\n    \"since\": \"2026-11-15T12:00:00.000Z\"\n  },\n  \"history\": [\n    {\n      \"details\": { \"firmware\": \"2.0\" },\n      \"valid_from\": \"2026-11-14T12:00:00.000Z\",\n      \"valid_until\": \"2026-11-15T12:00:00.000Z\",\n      \"slot\": \"latest\"\n    },\n    {\n      \"details\": { \"firmware\": \"1.0\" },\n      \"valid_from\": null,\n      \"valid_until\": \"2026-10-07T12:00:00.000Z\",\n      \"slot\": \"month\"\n    }\n  ]\n}\n```\n- `current.since` — when the current details replaced the previous value; `null` when no change has been recorded.\n- `history` — the last 5 recorded changes (`slot: \"latest\"`), plus at most one older value that was at least a week old (`week`) and one at least 30 days old (`month`) when the details last changed. Entries can have gaps between them, so read each entry's `valid_from` and `valid_until`. Empty when no change has been recorded.\n- `valid_from` / `valid_until` — when that value was in effect; `valid_from` is `null` when it is not known.\n\n## Errors\n**401 Unauthorized** — Missing or invalid `Authorization` header, or the device does not exist or does not belong to the organization.",
-      "method": "GET",
-      "base": "hub",
-      "pathTemplate": "/core/v1/organization/devices/:device_id/details",
-      "pathParams": [
-        "device_id"
-      ],
-      "queryParams": [],
-      "authScope": "organization",
-      "bodyType": "none",
-      "mutating": false,
-      "sourceFile": "Organization API/Devices/Get Device Details History.bru"
     },
     {
       "key": "organization.devices.getDevices",
@@ -720,13 +705,16 @@
       "group": "incidents",
       "action": "deleteIncident",
       "title": "Delete Incident",
+      "description": "## Query parameters\n- `closed_reason` — optional, free-text reason recorded on the closed incident.",
       "method": "DELETE",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/incidents/:id",
       "pathParams": [
         "id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "closed_reason"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": true,
@@ -1061,7 +1049,6 @@
       "group": "notes",
       "action": "getAllDeviceNotes",
       "title": "Get All Device Notes",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the devices they can view only. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/notes",
@@ -1073,7 +1060,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get All Device Notes.bru"
+      "sourceFile": "Organization API/Notes/Get All Device Notes.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the devices they can view only. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.notes.getAllIncidentNotes",
@@ -1101,7 +1089,6 @@
       "group": "notes",
       "action": "getAllSpaceNotes",
       "title": "Get All Space Notes",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the spaces they can view only (an ancestor of such a space does not count). Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/spaces/notes",
@@ -1113,7 +1100,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get All Space Notes.bru"
+      "sourceFile": "Organization API/Notes/Get All Space Notes.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of the spaces they can view only (an ancestor of such a space does not count). Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.notes.getDeviceNotes",
@@ -1121,7 +1109,6 @@
       "group": "notes",
       "action": "getDeviceNotes",
       "title": "Get Device Notes",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/devices/:device_id/notes",
@@ -1135,7 +1122,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get Device Notes.bru"
+      "sourceFile": "Organization API/Notes/Get Device Notes.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a device they can view only: **403** `no_access_to_resource` for another device of the organization; a device outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.notes.getIncidentNotes",
@@ -1165,7 +1153,6 @@
       "group": "notes",
       "action": "getSpaceNotes",
       "title": "Get Space Notes",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a space they can view only: **403** `no_access_to_resource` for another space, including an ancestor of a space they can view; a space outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/spaces/:space_id/notes",
@@ -1179,7 +1166,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Notes/Get Space Notes.bru"
+      "sourceFile": "Organization API/Notes/Get Space Notes.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets the notes of a space they can view only: **403** `no_access_to_resource` for another space, including an ancestor of a space they can view; a space outside the organization answers **404** as before. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.spaces.createSpace",
@@ -1306,7 +1294,6 @@
       "group": "tickets",
       "action": "getTicket",
       "title": "Get Ticket",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for a ticket of a device they cannot view, or whose device was deleted; a ticket outside the organization answers **401** as before. Their ticket carries no `user_name` and `user_email`. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/tickets/:ticket_id",
@@ -1317,7 +1304,8 @@
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
-      "sourceFile": "Organization API/Tickets/Get Ticket.bru"
+      "sourceFile": "Organization API/Tickets/Get Ticket.bru",
+      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization gets **403** `no_access_to_resource` for a ticket of a device they cannot view, or whose device was deleted; a ticket outside the organization answers **401** as before. Their ticket carries no `user_name` and `user_email`. Administrators, API keys and other applications are unaffected."
     },
     {
       "key": "organization.tickets.getTickets",
@@ -1325,12 +1313,15 @@
       "group": "tickets",
       "action": "getTickets",
       "title": "Get Tickets",
-      "description": "## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the tickets of devices they can view only, without `user_name` and `user_email`. Administrators, API keys and other applications are unaffected.",
+      "description": "## Query parameters\n- `page` — page number (default `1`).\n- `per_page` — results per page (default `100`, **max `100`**).\n\n## Signed-in user access\nWith an OAuth2 token of an application that acts with the signed-in user's access, a user who is not an administrator of the organization lists the tickets of devices they can view only, without `user_name` and `user_email`. Administrators, API keys and other applications are unaffected.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/organization/tickets",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
       "authScope": "organization",
       "bodyType": "none",
       "mutating": false,
@@ -1485,11 +1476,89 @@
       "sourceFile": "Organization API/Users/Resend Welcome Email.bru"
     },
     {
+      "key": "partner.coupons.createCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "createCoupon",
+      "title": "Create Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Body\n- `name` — required.\n- `code` and/or `organization_tag_id` — at least one. A code is redeemed by the customer; a tag hands the coupon to every organization carrying it.\n- `discount_type` — `percent` with `percent_off` (1-100), or `fixed_amount` with `amount_off` and `currency`.\n- `amount_off` — in major units of `currency` (12.34 USD, 500 JPY); more decimals than the currency has is rejected, never rounded. `currency` must be one of the store currencies.\n- `store_listing_id` — optional; omitted means the whole store.\n- `starts_at` / `ends_at` — optional ISO 8601 exact instants with a UTC offset; `ends_at` is exclusive. See \"Dates\" below.\n- `active` — defaults to true.\n\n## Dates\nSend a time and a UTC offset, e.g. `2026-01-31T09:00:00Z`, `2026-01-31T09:00:00+02:00` or `2026-01-31T09:00:00+0200`. A date alone (`2026-01-31`) or a time without an offset (`2026-01-31T09:00:00`) returns **422** `starts_at must be an ISO 8601 time with a time zone offset (Z or +hh:mm), e.g. 2026-01-01T00:00:00Z` (or `ends_at ...`).\n\nThe Partner portal shows dates in the viewer's time zone. To match \"valid from <first day> through <last day>\":\n- `starts_at` — midnight that starts the first day, in the user's time zone. Example: `2026-12-01T00:00:00-05:00`.\n- `ends_at` — the last millisecond of the last day, in the same time zone. Example: `2026-12-31T23:59:59.999-05:00`. This is what the portal stores for \"through Dec 31\".\n- Do not send midnight of the next day (`2027-01-01T00:00:00-05:00`). The portal then shows Jan 1 as the end date.\n- If you do not know the user's time zone, ask for it.\n\n## How coupons apply\n- A customer gets the coupons of its organization tags plus the coupons it redeemed by code.\n- Per product, price interval and currency, the store applies one coupon: the one with the largest discount. Coupons never add up. On a tie, the older coupon wins.\n- A coupon applies only while it is active, after `starts_at` and before `ends_at`.\n\n## Free and minimum prices\nThe coupon is checked against every price it targets: every listing for a whole-store coupon, or the one listing. A `fixed_amount` coupon checks only prices in its currency.\n- **422** `Coupon would make the <interval> price of '<listing name>' free` — the discount is equal to or larger than a monthly or yearly price.\n- **422** `Coupon would bring the <interval> price of '<listing name>' below the minimum charge` — the price left is above 0 but below the minimum charge (the equivalent of 0.70 USD).\n- One-time prices may become free (0). They may not end between 0 and the minimum charge.\n- Create the coupon first. Add the tag to organizations only after the coupon exists.\n\n## Success\n**201 Created** — the new coupon, in the shape of Get Coupons.\n\n**200 OK** — an identical coupon of the partner already exists (a safe retry). It is returned in the same shape and nothing is created.\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **404** — `organization_tag_id` or `store_listing_id` is not the partner's.\n- **422** — validation, e.g. `Code is not available` (the code is taken, including by this partner's coupon with different fields), `amount_off has too many decimal places for USD`, a `starts_at` / `ends_at` without a time or an offset.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold 10\",\n  \"discount_type\": \"fixed_amount\",\n  \"amount_off\": 12.34,\n  \"currency\": \"USD\",\n  \"organization_tag_id\": \"....-d75e0abec7d2\",\n  \"store_listing_id\": \"....-c3\",\n  \"starts_at\": \"2026-03-01T00:00:00Z\",\n  \"ends_at\": \"2026-03-31T23:59:59.999Z\",\n  \"active\": true\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Create Coupon.bru"
+    },
+    {
+      "key": "partner.coupons.deleteCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "deleteCoupon",
+      "title": "Delete Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\nDeletes the coupon and every redemption of it, so no organization gets it any more.\n\nA coupon used in orders cannot be deleted: the orders keep pointing at it. Stop it instead with Update Coupon and `\"active\": false`.\n\n## Success\n**204 No Content**.\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **403** — `Deactivate the coupon instead; it was used in orders`.\n- **404** — the coupon is not the partner's, or it was already deleted.",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Delete Coupon.bru"
+    },
+    {
+      "key": "partner.coupons.getCoupons",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "getCoupons",
+      "title": "Get Coupons",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Success\n**200 OK** — the partner's coupons, newest first.\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 100. Any other value returns **422** with `{ \"error\": \"...\" }`.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"name\": \"Gold 10\",\n      \"code\": null,\n      \"discount_type\": \"fixed_amount\",\n      \"percent_off\": null,\n      \"amount_off\": 12.34,\n      \"currency\": \"USD\",\n      \"active\": true,\n      \"status\": \"active\",\n      \"starts_at\": \"2026-03-01T00:00:00.000Z\",\n      \"ends_at\": null,\n      \"organization_tag\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"Gold\" },\n      \"store_listing\": { \"id\": \"....-c3\", \"name\": \"Pro plan\" },\n      \"tagged_organizations_count\": 12,\n      \"redemptions_count\": 0,\n      \"used_in_orders\": true,\n      \"created_at\": \"2026-02-20T10:00:00.000Z\"\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `amount_off` — in major units of `currency` (12.34 USD, 500 JPY).\n- `status` — `active`, `scheduled` (before `starts_at`), `expired` (from `ends_at` on) or `inactive`.\n- `starts_at` / `ends_at` — exact instants; `ends_at` is exclusive. The portal stores \"through Dec 31\" as `ends_at` = Dec 31, 23:59:59.999 in the user's time zone (see Create Coupon).\n- Per product, interval and currency, the store applies one coupon: the one with the largest discount. Coupons never add up.\n- `redemptions_count` — code redemptions only, so always 0 for a tag-only coupon. `tagged_organizations_count` — organizations carrying the coupon's tag.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Coupons/Get Coupons.bru"
+    },
+    {
+      "key": "partner.coupons.updateCoupon",
+      "namespace": "partner",
+      "group": "coupons",
+      "action": "updateCoupon",
+      "title": "Update Coupon",
+      "description": "Requires the Store plan feature and store coupons enabled for the partner (403 otherwise).\n\n## Body\nTakes the fields of Create Coupon. Only the fields sent change:\n- An omitted field keeps its value.\n- A field sent as `null` is cleared, e.g. `\"code\": null`, `\"store_listing_id\": null` (the whole store) or `\"ends_at\": null`.\n- `active: false` stops the coupon at once; `active` cannot be `null`.\n- `amount_off` without `currency` is in the coupon's currency.\n- `currency` without `amount_off` keeps the amount in major units, e.g. 5 USD becomes 5 JPY. If the amount does not fit the new currency's decimals, send `amount_off` too.\n- Changing `discount_type` clears the other type's fields: `percent_off` on a switch to `fixed_amount`, `amount_off` and `currency` on a switch to `percent`.\n- Dates follow the rules of Create Coupon: a time with a UTC offset is required. For \"valid through Dec 31\" in New York, send `\"ends_at\": \"2026-12-31T23:59:59.999-05:00\"`. A date alone or a time without an offset returns **422** and the coupon is not changed.\n- When a discount field changes, the free and minimum-price checks of Create Coupon run again.\n\nSending the same body again changes nothing and returns the same coupon.\n\n## Success\n**200 OK** — the coupon, in the shape of Get Coupons.\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **404** — the coupon, `organization_tag_id` or `store_listing_id` is not the partner's.\n- **422** — validation, e.g. `Code is not available`, `active must be true or false`, `percent_off must be a whole number`, a `starts_at` / `ends_at` without a time or an offset.",
+      "method": "PATCH",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/coupons/:id",
+      "pathParams": [
+        "id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold 15\",\n  \"percent_off\": 15,\n  \"ends_at\": null,\n  \"active\": false\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Coupons/Update Coupon.bru"
+    },
+    {
       "key": "partner.devices.deleteDevice",
       "namespace": "partner",
       "group": "devices",
       "action": "deleteDevice",
       "title": "Delete Device",
+      "description": "## Errors\n- **403** — brand partner API key (read-only).",
       "method": "DELETE",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/:device_id",
@@ -1508,13 +1577,17 @@
       "group": "devices",
       "action": "getCommands",
       "title": "Get Commands",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `status` — optional, one of `scheduled`, `pending`, `in_progress`, `done`, `failed`, `aborted` — a single value; a comma-separated list matches nothing.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/:device_id/commands",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1563,12 +1636,17 @@
       "group": "devices",
       "action": "getDevices",
       "title": "Get Devices",
-      "description": "## Success\n**200 OK** — paginated list of the partner's devices.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 32 }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the group primary's row. On every other row — standalone or merged shadow — it mirrors that device's own `effective_status`.",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `model_id` — optional, device model id (UUID).\n- `sn` — optional, exact serial number match.\n- `mac` — optional, exact MAC address match.\n\n## Success\n**200 OK** — paginated list of the partner's devices.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"sn\": \"123\",\n      \"mac\": \"11:00:00:00:00:00\",\n      \"cloud_id\": \"....\",\n      \"status\": null,\n      \"effective_status\": \"ok\",\n      \"merged_effective_status\": \"ok\",\n      \"last_seen_at\": \"2022-11-06T09:52:47.546Z\",\n      \"details\": {},\n      \"state\": {},\n      \"claimed\": \"Acme Inc\",\n      \"model\": { \"id\": \"....-d75e0abec7d2\", \"name\": \"model name\", \"sub_model\": \"sub model\" },\n      \"firmware\": { \"version\": \"1.0.1\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 32 }\n}\n```\n### Status fields\n- `status` — the device's own raw self-reported state (`online` / `offline` / `error`).\n- `effective_status` — the device's own computed status: one of `ok`, `offline`, `error`, `warning`, `disconnected`, `never_seen`.\n- `merged_effective_status` — merge-aware rollup of `effective_status` across the device group (primary + merged shadows), maintained on the group primary's row. On every other row — standalone or merged shadow — it mirrors that device's own `effective_status`.",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "model_id",
+        "sn",
+        "mac"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1580,13 +1658,19 @@
       "group": "devices",
       "action": "getStateHistory",
       "title": "Get State History",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `from` — optional, ISO 8601 datetime (default 1 day ago). Its date must be no earlier than one month ago (start of that day).\n- `to` — optional, ISO 8601 datetime (default now). `from` and `to` must be at most 7 calendar days apart.\n- `status` — optional, keep only states whose `status` equals this value (e.g. `online`, `offline`, `error`).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/:device_id/history",
       "pathParams": [
         "device_id"
       ],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "from",
+        "to",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1598,11 +1682,17 @@
       "group": "devices",
       "action": "getStateHistoryMultiDevices",
       "title": "Get State History (multi-devices)",
+      "description": "## Query parameters\n- `page` — page number (default `1`); fixed page size of `500`.\n- `from` — optional, ISO 8601 datetime (default 1 day ago). Its date must be no earlier than one month ago (start of that day).\n- `to` — optional, ISO 8601 datetime (default now). `from` and `to` must be at most 7 calendar days apart.\n- `status` — optional, keep only states whose `status` equals this value (e.g. `online`, `offline`, `error`).",
       "method": "GET",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/devices/histories",
       "pathParams": [],
-      "queryParams": [],
+      "queryParams": [
+        "page",
+        "from",
+        "to",
+        "status"
+      ],
       "authScope": "partner",
       "bodyType": "none",
       "mutating": false,
@@ -1627,11 +1717,81 @@
       "sourceFile": "Partner API/Devices/Get Telemetries.bru"
     },
     {
+      "key": "partner.orders.approveOrder",
+      "namespace": "partner",
+      "group": "orders",
+      "action": "approveOrder",
+      "title": "Approve Order",
+      "description": "Requires the Store plan feature (403 otherwise). Approves an order waiting for the seller's approval (`approval_state` `pending_approval` in Get Orders). **This cannot be undone.**\n\nApproving creates the purchased products and emails the customer that the order is approved. For an order with physical items, the partner is emailed too. The order records the calling API key as its approver: `approved_by` is `{ \"type\": \"api_key\", \"name\": \"<key name>\" }`.\n\n## Body\n- `warranty_start_dates` — optional object `{ \"<order_item_id>\": \"YYYY-MM-DD\" }`. Required for every warranty item of the order (`warranty: true` in Get Order); dates already stored for an item (`warranty_start_at` in Get Order) may be left out. Item ids are matched case-insensitively.\n\nThe body is checked before the order's state: a malformed body gets 422 even on an order that is already approved. On an already approved order, valid dates are ignored and the stored ones stay.\n\n## Success\n**200 OK** — the order, in the shape of Get Order, with `approval_state` `approved`.\n\nApproving an order that is already approved returns **200 OK** with the order and changes nothing (no second email; `approved_by` keeps the first approver).\n\n## Errors\n- **401** — missing or invalid API key.\n- **403** — brand partner API key (read-only), or the partner has no Store plan feature.\n- **404** — unknown order, or another partner's order. Returned before the body is checked.\n- **422** `Order does not require approval` — the order was never held for approval.\n- **422** `Order is not waiting for approval` — e.g. the order is not paid yet, or is a purchase order not yet approved.\n- **422** `warranty_start_dates must be an object` — the value is not a JSON object (`null` counts as absent).\n- **422** `Warranty start date of order item <id> must be a YYYY-MM-DD date` — the value is not a real calendar date in `YYYY-MM-DD` form (for example `2026-02-30` or `15/01/2026`), or not a string (`null` included).\n- **422** `A warranty start date is required for every warranty product before the order can be approved` — a warranty item has no date.\n- **422** `Unknown order item <id>` / `Order item <id> is not a warranty product` — a key of `warranty_start_dates` is wrong.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/orders/:order_id/approve",
+      "pathParams": [
+        "order_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"warranty_start_dates\": {\n    \"....-e5\": \"2026-01-15\"\n  }\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Orders/Approve Order.bru"
+    },
+    {
+      "key": "partner.orders.getOrder",
+      "namespace": "partner",
+      "group": "orders",
+      "action": "getOrder",
+      "title": "Get Order",
+      "description": "Requires the Store plan feature (403 otherwise). One order with its items, renewal orders included. **404** for an order outside the partner (for a brand partner: outside its brands).\n\n## Success\n**200 OK** — every field of Get Orders, plus `items`:\n```json\n{\n  \"id\": \"....-a1\",\n  \"short_id\": \"ORD-JL8K3\",\n  \"currency\": \"USD\",\n  \"subtotal\": 25,\n  \"...\": \"as in Get Orders\",\n  \"items\": [\n    {\n      \"id\": \"....-e5\",\n      \"name\": \"Camera\",\n      \"quantity\": 2,\n      \"unit_list_price\": 15,\n      \"unit_price\": 12.5,\n      \"line_total\": 25,\n      \"payment_interval\": \"one_time\",\n      \"product\": { \"id\": \"....-f6\" },\n      \"store_listing\": { \"id\": \"....-a7\" },\n      \"subscription_id\": null,\n      \"coupon\": { \"id\": \"....-b8\", \"name\": \"Spring\" },\n      \"coupon_discount\": 5,\n      \"seller_discount\": 2,\n      \"seller_discount_type\": \"recurring\",\n      \"warranty\": false,\n      \"warranty_start_at\": null\n    }\n  ]\n}\n```\n- Money is a JSON number in major units of the order's `currency` (12.5 USD, 500 JPY), with a fraction when the amount has one; a money field is `null` when it does not apply.\n- `unit_list_price` — the unit price before any coupon; `null` for an item bought with no coupon price recorded (most orders); `coupon_discount` is then `null` too.\n- `unit_price` — the unit price after any coupon, per `payment_interval`.\n- `line_total` — the amount charged for the line under the store's pricing (all units; for a first monthly or yearly purchase, the prorated first period or the prepaid term). It is computed when read, not a stored charge.\n- `payment_interval`:\n  - `one_time` — a single charge.\n  - `monthly` — billed every month.\n  - `yearly` — billed every year.\n  - `usage_based` — billed by metered usage.\n- `coupon_discount` — what the coupon saved on the whole line (`unit_list_price` minus `unit_price`, for all units and the charged period); `0` when the item has a `unit_list_price` but no coupon, `null` when `unit_list_price` is `null`.\n- `seller_discount` — the seller's discount on the whole line; `null` without one.\n- `seller_discount_type`:\n  - `one_time` — taken off the first charge only.\n  - `recurring` — taken off every charge.\n- `coupon` — `{ id, name }` of the coupon used on the line; `null` when no coupon was used or the coupon was deleted later (`coupon_discount` stays set).\n- `subscription_id` — the subscription the line belongs to, when it has one.\n- `warranty` — `true` for a warranty item; Approve Order needs a warranty start date for each of these.\n- `warranty_start_at` — the warranty start date stored for a warranty item (`YYYY-MM-DD`, e.g. `2026-01-15`); `null` for other items and for a warranty item with no date yet. Set it with Approve Order.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/orders/:order_id",
+      "pathParams": [
+        "order_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Orders/Get Order.bru"
+    },
+    {
+      "key": "partner.orders.getOrders",
+      "namespace": "partner",
+      "group": "orders",
+      "action": "getOrders",
+      "title": "Get Orders",
+      "description": "Requires the Store plan feature (403 otherwise). The store orders of the partner (for a brand partner: of its brands), newest first (`created_at`, then `id`, both descending), so two pages never overlap.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n- `created_from` — orders created at or after this time (inclusive).\n- `created_to` — orders created before this time (**exclusive**); must be later than `created_from` when both are set.\nBoth times are ISO 8601 `YYYY-MM-DDThh:mm[:ss[.ffffff]]` with a time zone offset, `Z`, `±hh:mm` or `±hhmm`, e.g. `2026-01-01T00:00:00Z`. Send `+` URL-encoded as `%2B` (`created_from=2026-01-01T02:00:00%2B02:00`); a raw `+` reads as a space and is rejected.\n- `organization_id` — orders of one organization (UUID).\n- `coupon_id` — orders with at least one item bought with this coupon (UUID).\n- `short_id` — exact order number, e.g. `ORD-JL8K3`; must not be empty.\n- `reference_id` — exact reference the buyer entered; must not be empty.\n- `fulfillment_status` — one of `fulfillment_status` below.\n- `payment_status` — one of `payment_status` below. An order whose `payment_status` is `null` matches no value.\n- `pending_approval` — `true` or `false`. `true`: only orders waiting for your approval (`approval_state` = `pending_approval`); `false`: every other order.\n- `include_renewals` — `true` or `false`; `true` adds subscription renewal orders; default `false` (first purchases only).\n\nAn invalid value returns **422** with `{ \"error\": \"...\" }`: `page` below 1, `per_page` out of range, a boolean that cannot be read (`'maybe' is not a valid boolean`), an empty `short_id` or `reference_id` (`Parameter short_id cannot be blank`), an unknown or empty enum value (`Parameter fulfillment_status must be one of the following: order_placed / processing / ...`), an empty or malformed time or one without an offset, `created_to` not later than `created_from` (`created_to must be after created_from`), or an id that is not a UUID (`organization_id must be a valid UUID`).\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"short_id\": \"ORD-JL8K3\",\n      \"reference_id\": \"PO-77\",\n      \"created_at\": \"2026-01-15T10:00:00.000Z\",\n      \"currency\": \"USD\",\n      \"subtotal\": 25,\n      \"tax\": 1.25,\n      \"total\": 26.25,\n      \"payment_method\": \"credit_card\",\n      \"payment_status\": \"paid\",\n      \"approval_state\": \"not_required\",\n      \"approved_at\": null,\n      \"approved_by\": null,\n      \"fulfillment_status\": \"shipped\",\n      \"tracking_number\": \"1Z999\",\n      \"is_renewal\": false,\n      \"partner\": { \"id\": \"....-b2\", \"name\": \"Acme\" },\n      \"organization\": { \"id\": \"....-c3\", \"name\": \"Contoso\" },\n      \"payment\": { \"id\": \"....-d4\" },\n      \"coupon_names\": [\"Spring\"],\n      \"total_coupon_discount\": 5\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- Money (`subtotal`, `tax`, `total`, `total_coupon_discount`) is a JSON number in major units of the order's `currency` (12.5 USD, 500 JPY), with a fraction when the amount has one. `total` = `subtotal` + `tax`. `total_coupon_discount` is what coupons saved on the order, 0 without coupons.\n- `organization` — `null` when the order has none.\n- `payment` — `{ id }` of the order's payment; `null` when the order has no payment. Its status is `payment_status`. An `offline` payment is not available from Get Payments or Get Payment (404).\n- `payment_method`:\n  - `credit_card` — paid by card in the store.\n  - `purchase_order` — paid against a purchase order (PO) file.\n  - `offline` — paid outside the store.\n  - `lab` — a test order placed by a Lab Account; nothing is charged.\n- `payment_status` — `null` when the order has no payment; the `payment_status` filter cannot select such orders. A payment with the legacy status `expired` reads as `uncollectible`, and the `uncollectible` filter matches it. Otherwise:\n  - `pending` — payment not settled yet (not a purchase order).\n  - `awaiting_po_upload` — purchase order: the buyer has not uploaded the PO file yet.\n  - `awaiting_po_approval` — purchase order: PO file uploaded, waiting for approval.\n  - `paid` — paid.\n  - `failed` — the charge failed; it may be retried.\n  - `uncollectible` — given up on collecting.\n  - `archived` — the unpaid order was archived.\n  - `refunded` — paid, then refunded.\n- `approval_state`:\n  - `not_required` — the order needs no seller approval.\n  - `approved` — you approved the order (`approved_at`).\n  - `pending_approval` — paid and waiting for your approval.\n  - `awaiting_payment` — needs approval, but not paid yet (or approved as part of the purchase order step).\n- `approved_by` — who approved the order; `null` when nobody did, when the approving portal user was later removed, or for an order approved before this field was recorded.\n  - `{ \"type\": \"api_key\", \"name\": \"ERP sync\" }` — approved through the Partner API (Approve Order) with this API key of yours. `name` is the key's name at the time of approval; it stays after the key is renamed or deleted.\n  - `{ \"type\": \"user\", \"id\": \"....-e5\", \"name\": \"Dana Cohen\" }` — approved by this user in the partner portal (for a purchase order: the user who approved the PO).\n- `fulfillment_status`:\n  - `order_placed` — not paid yet.\n  - `processing` — paid; physical items wait for shipment.\n  - `missing_information` — paid; the buyer still owes post-purchase details.\n  - `available` — paid; digital items are available.\n  - `ready` — shipment ready to ship.\n  - `shipped` — shipment shipped (`tracking_number`).\n  - `delivered` — shipment delivered.\n  - `cancelled` — the order was cancelled.\n  - `cancelled_during_ready` — cancelled while its shipment was ready.\n- `is_renewal` — `true` for an order a subscription renewal created.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/orders",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "created_from",
+        "created_to",
+        "organization_id",
+        "fulfillment_status",
+        "payment_status",
+        "pending_approval",
+        "coupon_id",
+        "short_id",
+        "reference_id",
+        "include_renewals"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Orders/Get Orders.bru"
+    },
+    {
       "key": "partner.organizations.createOrganization",
       "namespace": "partner",
       "group": "organizations",
       "action": "createOrganization",
       "title": "Create Organization",
+      "description": "## Errors\n- **403** — brand partner API key (read-only).",
       "method": "POST",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/organizations",
@@ -1644,11 +1804,363 @@
       "sourceFile": "Partner API/Organizations/Create Organization.bru"
     },
     {
+      "key": "partner.organizations.getOrganizations",
+      "namespace": "partner",
+      "group": "organizations",
+      "action": "getOrganizations",
+      "title": "Get Organizations",
+      "description": "## Query\n- `name` — optional, case-insensitive substring of the organization name.\n- `tag` — optional, exact organization tag name of the partner, case-insensitive.\n- `page` — starts at 1. Organizations are ordered by name.\n- `per_page` — optional, 1-500, default 100. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\nTo find a customer by name, filter with `name`. Do not page through all organizations.\n\n## Success\n**200 OK** — the organizations visible to the partner, with the partner's tags and the coupons reaching each.\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-03cfda750cfa\",\n      \"name\": \"Acme Corp\",\n      \"store_visible\": true,\n      \"tags\": [\n        {\n          \"id\": \"....-d75e0abec7d2\",\n          \"name\": \"Gold\",\n          \"color\": null,\n          \"note\": \"Renewed in May\",\n          \"added_at\": \"2026-05-04T09:00:00.000Z\",\n          \"added_by\": { \"id\": \"....-77\", \"name\": \"Dana Levi\" }\n        }\n      ],\n      \"coupons\": [\n        { \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\", \"source\": \"tag\" },\n        { \"id\": \"....-b2\", \"name\": \"Spring\", \"status\": \"expired\", \"source\": \"code\" }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `tags` — the partner's tags on the organization, as in Add Organization Tag: `added_by` is `null` when the tag was attached with an API key or the user is no longer known.\n- `store_visible` — whether the organization sees the partner's store: a tag coupon discounts the customer only when `store_visible` is true.\n- `coupons` — `source: tag` for a coupon of one of the organization's tags, `source: code` for one the organization redeemed by code; a coupon reached both ways is listed once, as `code`. `status` is `active`, `scheduled`, `expired` or `inactive`. Empty when `store_visible` is false or store coupons are not enabled for the partner.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "name",
+        "tag"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Organizations/Get Organizations.bru"
+    },
+    {
+      "key": "partner.organizationTags.addOrganizationTag",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "addOrganizationTag",
+      "title": "Add Organization Tag",
+      "description": "Attaches a partner organization tag to an organization, creating the tag on first use. Tag names are case-insensitive; up to 50 tags per organization.\n\n- Tags cannot be deleted. They can only be removed from organizations.\n- A tag added with an API key shows no \"added by\" person in the Partner portal.\n- To give a tag a coupon, create the coupon first (Create Coupon). Add the tag to organizations after that.\n- `note` — optional, up to 1000 characters.\n- To change the note, use Update Organization Tag.\n\n## Success\n**200 OK** — the tag is attached. If it was already attached, the existing note is kept.\n```json\n{\n  \"id\": \"....-d75e0abec7d2\",\n  \"name\": \"Gold\",\n  \"color\": null,\n  \"note\": \"Renewed in May\",\n  \"added_at\": \"2026-05-04T09:00:00.000Z\",\n  \"added_by\": null,\n  \"store_visible\": true,\n  \"coupons\": [{ \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\", \"source\": \"tag\" }]\n}\n```\n- `id` — the organization tag id, used as `organization_tag_id` when creating a coupon.\n- `color` — the tag color, `null` when none is set.\n- `added_at` — when the tag was attached to this organization.\n- `added_by` — `{ \"id\", \"name\" }` of the person who attached the tag in the Partner portal, or `null` when the tag was attached with an API key or the user is no longer known.\n- `coupons` — every coupon now applied to the organization (same list as GET organizations: `source` `tag` or `code`, empty without the Store plan feature or the `store_coupons` flag); a tag coupon discounts the customer only when `store_visible` is true.\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **404** — the organization is not visible to the partner.\n- **422** — `name` is blank, `note` is an object or an array or longer than 1000 characters, or the organization already has 50 tags.",
+      "method": "POST",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations/:organization_id/tags",
+      "pathParams": [
+        "organization_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"name\": \"Gold\",\n  \"note\": \"Renewed in May\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Organization Tags/Add Organization Tag.bru"
+    },
+    {
+      "key": "partner.organizationTags.getOrganizationTags",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "getOrganizationTags",
+      "title": "Get Organization Tags",
+      "description": "The partner's organization tags, by name. Tags cannot be deleted. To stop using a tag, remove it from each organization (Remove Organization Tag).\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 100. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-d75e0abec7d2\",\n      \"name\": \"Gold\",\n      \"color\": null,\n      \"organizations_count\": 12,\n      \"coupons\": [\n        { \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\" }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n\n- `organizations_count` — organizations visible to the partner that carry the tag.\n- `coupons` — the partner's coupons handed out by the tag. `status` is `active`, `scheduled`, `expired` or `inactive`. Empty without the Store plan feature or store coupons.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organization_tags",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Organization Tags/Get Organization Tags.bru"
+    },
+    {
+      "key": "partner.organizationTags.removeOrganizationTag",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "removeOrganizationTag",
+      "title": "Remove Organization Tag",
+      "description": "Removes one of the partner's tags from an organization. The tag itself stays. Tags cannot be deleted.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"coupons_removed\": [\n    { \"id\": \"....-a1\", \"name\": \"Gold 10\" }\n  ]\n}\n```\n\n`coupons_removed` lists the coupons the organization got through this tag and no longer gets. A coupon that still reaches it through another tag, or that it redeemed by code, is not listed. It is empty without the Store plan feature or store coupons, or when the organization is not `store_visible`.\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **404** — the organization is not visible to the partner, or the tag is not attached to it (including a second remove of the same tag).",
+      "method": "DELETE",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations/:organization_id/tags/:tag_id",
+      "pathParams": [
+        "organization_id",
+        "tag_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": true,
+      "sourceFile": "Partner API/Organization Tags/Remove Organization Tag.bru"
+    },
+    {
+      "key": "partner.organizationTags.updateOrganizationTag",
+      "namespace": "partner",
+      "group": "organizationTags",
+      "action": "updateOrganizationTag",
+      "title": "Update Organization Tag",
+      "description": "Changes the note of one of the partner's tags on an organization. The note belongs to this organization only; the tag on other organizations keeps its own note.\n\n- `note` — required, up to 1000 characters. `null` or `\"\"` clears the note.\n- A changed note is recorded in the partner audit log, attributed to the API key. The note text is not recorded.\n\n## Success\n**200 OK** — same body as Add Organization Tag:\n```json\n{\n  \"id\": \"....-d75e0abec7d2\",\n  \"name\": \"Gold\",\n  \"color\": null,\n  \"note\": \"Renewed in June\",\n  \"added_at\": \"2026-05-04T09:00:00.000Z\",\n  \"added_by\": { \"id\": \"....-77\", \"name\": \"Dana Levi\" },\n  \"store_visible\": true,\n  \"coupons\": [{ \"id\": \"....-a1\", \"name\": \"Gold 10\", \"status\": \"active\", \"source\": \"tag\" }]\n}\n```\n\n## Errors\n- **403** — brand partner API key (read-only).\n- **404** — the organization is not visible to the partner, or the tag is not attached to it.\n- **422** — `note` is missing, an object or an array, or longer than 1000 characters.",
+      "method": "PATCH",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/organizations/:organization_id/tags/:tag_id",
+      "pathParams": [
+        "organization_id",
+        "tag_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "json",
+      "bodyExample": "{\n  \"note\": \"Renewed in June\"\n}",
+      "mutating": true,
+      "sourceFile": "Partner API/Organization Tags/Update Organization Tag.bru"
+    },
+    {
+      "key": "partner.payments.getPayment",
+      "namespace": "partner",
+      "group": "payments",
+      "action": "getPayment",
+      "title": "Get Payment",
+      "description": "Requires the Store plan feature (403 otherwise). One payment. **404** for a payment with no order of the partner (for a brand partner: of its brands), or one made outside the store (`offline`).\n\n## Success\n**200 OK** — the same fields as one item of Get Payments:\n```json\n{\n  \"id\": \"....-d4\",\n  \"status\": \"paid\",\n  \"currency\": \"USD\",\n  \"subtotal\": 25,\n  \"tax\": 1.25,\n  \"total\": 26.25,\n  \"payment_method\": \"credit_card\",\n  \"created_at\": \"2026-01-15T10:00:00.000Z\",\n  \"paid_at\": \"2026-01-15T00:00:00.000Z\",\n  \"failure_reason\": null,\n  \"is_renewal\": false,\n  \"organization\": { \"id\": \"....-c3\", \"name\": \"Contoso\" },\n  \"order_ids\": [\"....-a1\"],\n  \"invoices\": [{ \"id\": \"....-e5\", \"status\": \"issued\", \"note\": \"Net 30\" }]\n}\n```\nSee Get Payments for the meaning of each field and status value. Money is in major units of `currency`. **The totals are your share of the payment, not the buyer's full charge**: they are the amounts of your orders on the payment (for a brand partner: its brands' orders), tax included.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/payments/:payment_id",
+      "pathParams": [
+        "payment_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Payments/Get Payment.bru"
+    },
+    {
+      "key": "partner.payments.getPayments",
+      "namespace": "partner",
+      "group": "payments",
+      "action": "getPayments",
+      "title": "Get Payments",
+      "description": "Requires the Store plan feature (403 otherwise). The store payments for the partner's orders (for a brand partner: its brands' orders), newest first (`created_at`, then `id`, both descending), so two pages never overlap. Payments made outside the store (`offline`) are not listed. A buyer may pay for orders of several partners in one checkout; that payment is listed once, with only your orders' amounts.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n- `created_from` — payments created at or after this time (inclusive).\n- `created_to` — payments created before this time (**exclusive**); must be later than `created_from` when both are set.\n- `organization_id` — payments of one organization (UUID).\n- `status` — one of `status` below.\n\nBoth times are ISO 8601 `YYYY-MM-DDThh:mm[:ss[.ffffff]]` with a time zone offset, `Z`, `±hh:mm` or `±hhmm`, e.g. `2026-01-01T00:00:00Z`. Send `+` URL-encoded as `%2B` (`created_from=2026-01-01T02:00:00%2B02:00`); a raw `+` reads as a space and is rejected.\n\nAn invalid value returns **422** with `{ \"error\": \"...\" }`: `page` below 1, `per_page` out of range, an unknown or empty `status` (`Parameter status must be one of the following: pending / paid / failed / uncollectible / archived / refunded`), an empty or malformed time or one without an offset, `created_to` not later than `created_from` (`created_to must be after created_from`), or an id that is not a UUID (`organization_id must be a valid UUID`).\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-d4\",\n      \"status\": \"paid\",\n      \"currency\": \"USD\",\n      \"subtotal\": 25,\n      \"tax\": 1.25,\n      \"total\": 26.25,\n      \"payment_method\": \"credit_card\",\n      \"created_at\": \"2026-01-15T10:00:00.000Z\",\n      \"paid_at\": \"2026-01-15T00:00:00.000Z\",\n      \"failure_reason\": null,\n      \"is_renewal\": false,\n      \"organization\": { \"id\": \"....-c3\", \"name\": \"Contoso\" },\n      \"order_ids\": [\"....-a1\"],\n      \"invoices\": [{ \"id\": \"....-e5\", \"status\": \"issued\", \"note\": \"Net 30\" }]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- Money (`subtotal`, `tax`, `total`) is a JSON number in major units of `currency` (12.5 USD, 500 JPY), with a fraction when the amount has one. **The totals are your share of the payment, not the buyer's full charge**: they are the amounts of your orders on the payment (for a brand partner: its brands' orders), tax included, not other partners' orders paid in the same checkout. `total` = `subtotal` + `tax`.\n- `status`:\n  - `pending` — not settled yet (for a purchase order: waiting for the PO file or its approval).\n  - `paid` — paid.\n  - `failed` — the charge failed; it may be retried.\n  - `uncollectible` — given up on collecting. A payment stored with the legacy status `expired` reads as `uncollectible`, and the `uncollectible` filter matches it.\n  - `archived` — the unpaid payment was archived.\n  - `refunded` — paid, then refunded.\n- `payment_method`:\n  - `credit_card` — paid by card in the store.\n  - `purchase_order` — paid against a purchase order (PO) file.\n  - `lab` — a test payment by a Lab Account; nothing is charged.\n- `paid_at` — the latest date one of your orders on the payment was marked paid (midnight UTC; the time of day is not stored); `null` while it is not paid. A refunded payment keeps it.\n- `failure_reason` — the card processor's message for the last failed charge. It stays when the payment later turns `uncollectible` or `archived`, and is cleared once it is paid; `null` when no charge failed.\n- `is_renewal` — `true` when any of your orders on the payment is a subscription renewal.\n- `organization` — the buying organization; `null` when the payment has none.\n- `order_ids` — your orders on the payment (Get Order reads one).\n- `invoices` — invoices of those orders, newest first; `note` is your note on the invoice (`null` without one). Invoice `status`:\n  - `pending` — not issued yet.\n  - `issued` — issued to the buyer.\n  - `void` — cancelled.\n- Card details, payment processor ids and invoice files are not returned.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/payments",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "created_from",
+        "created_to",
+        "organization_id",
+        "status"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Payments/Get Payments.bru"
+    },
+    {
+      "key": "partner.products.getProduct",
+      "namespace": "partner",
+      "group": "products",
+      "action": "getProduct",
+      "title": "Get Product",
+      "description": "Requires the Store plan feature (403 otherwise). One product. **404** for a product outside the partner (for a brand partner: outside its brands), including a product another partner shares with you.\n\n## Success\n**200 OK** — the fields of one Get Products item:\n```json\n{\n  \"id\": \"....-f6\",\n  \"name\": \"Camera\",\n  \"sku\": \"CAM-1\",\n  \"type\": \"physical\",\n  \"category\": \"Video\",\n  \"pricing_model\": \"standard\",\n  \"partner\": { \"id\": \"....-a1\", \"name\": \"Acme AV\" },\n  \"archived\": false,\n  \"created_at\": \"2026-01-01T10:00:00.000Z\"\n}\n```\nSee Get Products for the meaning of `type`, `pricing_model`, `partner` and `archived`.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/products/:product_id",
+      "pathParams": [
+        "product_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Products/Get Product.bru"
+    },
+    {
+      "key": "partner.products.getProducts",
+      "namespace": "partner",
+      "group": "products",
+      "action": "getProducts",
+      "title": "Get Products",
+      "description": "Requires the Store plan feature (403 otherwise). The partner's product catalog (for a brand partner: the products of its brands), newest first (`created_at`, then `id`, both descending), so two pages never overlap. Products other partners share with you are not listed.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n- `archived` — `true` or `false`; without it, both.\n- `type` — one of `type` below.\n\nAn invalid value returns **422** with `{ \"error\": \"...\" }`: `page` below 1, `per_page` out of range, a boolean that cannot be read (`'maybe' is not a valid boolean`), or an unknown or empty `type` (`Parameter type must be one of the following: physical / device_license / ...`).\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-f6\",\n      \"name\": \"Camera\",\n      \"sku\": \"CAM-1\",\n      \"type\": \"physical\",\n      \"category\": \"Video\",\n      \"pricing_model\": \"standard\",\n      \"partner\": { \"id\": \"....-a1\", \"name\": \"Acme AV\" },\n      \"archived\": false,\n      \"created_at\": \"2026-01-01T10:00:00.000Z\"\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `sku`, `category` — free text the partner set; `null` or empty when not set.\n- `type`:\n  - `physical` — a shipped item.\n  - `device_license` — a license for one device.\n  - `platform_license` — a license for the organization, in use from purchase and not bound to a device.\n  - `warranty` — a warranty for a device the customer already owns.\n- `pricing_model`:\n  - `standard` — fixed prices set on the store listing.\n  - `usage_based` — billed by metered usage.\n  - `personalized` — priced per order by the seller instead of a list price; the portal store does not show these listings.\n- `partner` — the partner that owns the product; for a brand partner, the brand it belongs to.\n- `archived` — `true` when the product was archived; it can no longer be sold.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/products",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "archived",
+        "type"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Products/Get Products.bru"
+    },
+    {
+      "key": "partner.soldProducts.getSoldProduct",
+      "namespace": "partner",
+      "group": "soldProducts",
+      "action": "getSoldProduct",
+      "title": "Get Sold Product",
+      "description": "Requires the Store plan feature (403 otherwise). One sold product. **404** for a product the partner did not sell (for a brand partner: its brands did not sell). The 404 body is `{ \"error\": \"Sold product not found\" }`.\n\n## Success\n**200 OK** — the same object as one entry of Get Sold Products `data`:\n```json\n{\n  \"id\": \"....-a1\",\n  \"created_at\": \"2026-01-05T09:12:44.120Z\",\n  \"redeemed_at\": null,\n  \"subscription_id\": null,\n  \"...\": \"as in Get Sold Products\"\n}\n```",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/sold_products/:sold_product_id",
+      "pathParams": [
+        "sold_product_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Sold Products/Get Sold Product.bru"
+    },
+    {
+      "key": "partner.soldProducts.getSoldProducts",
+      "namespace": "partner",
+      "group": "soldProducts",
+      "action": "getSoldProducts",
+      "title": "Get Sold Products",
+      "description": "Requires the Store plan feature (403 otherwise). The products the partner sold: products it owns, and products of other partners sold through its store listings (for a brand partner: those of its brands). Newest first (`created_at`, then `id`, both descending), so two pages never overlap.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n- `organization_id` — sold products of one organization (UUID).\n- `order_id` — sold products of one order (UUID).\n- `product_id` — sold products of one product (UUID).\n- `redeemed` — `true`: the license was redeemed; `false`: the license was not redeemed, including sold products without a license. Without it, both. A product sold directly to an organization is never redeemed, so `false` does not mean unclaimed.\n\nAn invalid value returns **422** with `{ \"error\": \"...\" }`: `page` below 1, `per_page` out of range, a `redeemed` value that cannot be read (`'maybe' is not a valid boolean`), or an id that is not a UUID (`organization_id must be a valid UUID`, `order_id must be a valid UUID`, `product_id must be a valid UUID`).\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"created_at\": \"2026-01-05T09:12:44.120Z\",\n      \"redeemed_at\": \"2026-01-06T10:00:00.000Z\",\n      \"order_id\": \"....-b2\",\n      \"subscription_id\": \"....-c3\",\n      \"organization\": { \"id\": \"....-d4\", \"name\": \"Contoso\" },\n      \"product\": { \"id\": \"....-e5\", \"name\": \"Cloud Plan\" },\n      \"device\": { \"id\": \"....-f6\", \"sn\": \"SN-0001\", \"model\": \"Room Controller\" }\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `redeemed_at` — when the organization redeemed the license with its shareable token; `null` otherwise, and when there is no license. It stays `null` for a product sold directly to an organization.\n- `order_id` — the order the product was sold in (see Get Order). The order belongs to the seller; when a reseller sold your product, Get Order answers 404 for it.\n- `subscription_id` — the subscription of a recurring purchase; `null` for a one-time purchase. The subscription belongs to the product's owner; when you sold another partner's product through your store listing, Get Subscription answers 404 for it.\n- `organization` — `{ id, name }` of the organization that owns the sold product; `null` while it is not assigned to one.\n- `product` — `{ id, name }` of the product sold. The product can belong to another partner whose product you sold through your store listing; Get Product with this `id` then returns **404**.\n- `device` — `{ id, sn, model }` of the device the license is assigned to, `model` being the device model's name; `null` when there is no license, it is not assigned, or the device is scheduled for deletion.\n- The license shareable token and the device MAC are not returned. The shareable token is available in the partner portal only.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/sold_products",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "organization_id",
+        "order_id",
+        "product_id",
+        "redeemed"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Sold Products/Get Sold Products.bru"
+    },
+    {
+      "key": "partner.storeListings.getStoreListing",
+      "namespace": "partner",
+      "group": "storeListings",
+      "action": "getStoreListing",
+      "title": "Get Store Listing",
+      "description": "Requires the Store plan feature (403 otherwise). One store listing. **404** for a listing outside the partner (for a brand partner: outside its brands).\n\n## Success\n**200 OK** — the fields of one Get Store Listings item:\n```json\n{\n  \"id\": \"....-c3\",\n  \"name\": \"Remote care\",\n  \"status\": \"published\",\n  \"pricing_model\": \"standard\",\n  \"partner\": { \"id\": \"....-a1\", \"name\": \"Acme AV\" },\n  \"product\": { \"id\": \"....-f6\", \"type\": \"device_license\" },\n  \"prices\": [\n    { \"currency\": \"USD\", \"one_time_price\": 10.5, \"monthly_price\": 20, \"yearly_price\": null }\n  ]\n}\n```\n- `name` — the name shown in the store; the product's name when the listing has none of its own.\n- `status`:\n  - `draft` — not in the store yet.\n  - `published` — in the store.\n  - `archived` — removed from the store.\n- `pricing_model` — the product's: `standard`, `usage_based` or `personalized` (see Get Products).\n- `partner` — the partner that owns the listing; for a brand partner, the brand it belongs to.\n- `product` — the product the listing sells; `type` as in Get Products. The product can belong to another partner that shares it with you; Get Product with this `id` then returns **404**.\n- `prices` — one row per currency, sorted by currency; amounts in major units, `null` when the listing has no such price. The rate of a `usage_based` listing is not returned.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/store_listings/:store_listing_id",
+      "pathParams": [
+        "store_listing_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Store Listings/Get Store Listing.bru"
+    },
+    {
+      "key": "partner.storeListings.getStoreListings",
+      "namespace": "partner",
+      "group": "storeListings",
+      "action": "getStoreListings",
+      "title": "Get Store Listings",
+      "description": "Requires the Store plan feature (403 otherwise). The partner's store listings (for a brand partner: the listings of its brands), in store order. Store order is set per partner, so a brand's list mixes its brands' listings. Use an `id` as a coupon's `store_listing_id`; a brand partner's coupons cannot use its brands' listings.\n\n## Query\n- `page` — starts at 1.\n- `per_page` — optional, 1-500, default 100. Any other value returns **422** with `{ \"error\": \"...\" }`.\n\n## Success\n**200 OK**:\n\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-c3\",\n      \"name\": \"Remote care\",\n      \"status\": \"published\",\n      \"pricing_model\": \"standard\",\n      \"partner\": { \"id\": \"....-a1\", \"name\": \"Acme AV\" },\n      \"product\": { \"id\": \"....-f6\", \"type\": \"device_license\" },\n      \"prices\": [\n        { \"currency\": \"USD\", \"one_time_price\": 10.5, \"monthly_price\": 20, \"yearly_price\": null }\n      ]\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n\n- `status` — `draft`, `published` or `archived`.\n- `pricing_model` — a coupon can target only a `standard` listing.\n- `partner`, `product` — the owning partner and the product the listing sells; see Get Store Listing.\n- `prices` — one row per currency; amounts in major units, `null` when the listing has no such price.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/store_listings",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Store Listings/Get Store Listings.bru"
+    },
+    {
+      "key": "partner.storeSettings.getStoreSettings",
+      "namespace": "partner",
+      "group": "storeSettings",
+      "action": "getStoreSettings",
+      "title": "Get Store Settings",
+      "description": "Requires the Store plan feature (403 otherwise). The store settings of the key's own partner. A brand partner's key gets the brand's own settings, not those of its brands.\n\n## Success\n**200 OK**:\n```json\n{\n  \"currencies\": [\"USD\", \"EUR\"],\n  \"default_currency\": \"USD\",\n  \"payment_methods\": [\"credit_card\", \"purchase_order\"],\n  \"orders_require_approval\": false,\n  \"tax_enabled\": true\n}\n```\n- `currencies` — ISO 4217 codes the store sells in; a `standard` or `usage_based` listing was priced in each of them when it was published (a `personalized` listing has no prices), so a currency added later can be missing from older listings' `prices` (for a brand partner, its brands' listings follow their own currencies).\n- `default_currency` — the currency shown first; one of `currencies`.\n- `payment_methods` — the methods buyers can pay with; empty when both are off:\n  - `credit_card` — card payment at checkout.\n  - `purchase_order` — the buyer sends a purchase order and pays by invoice.\n- `orders_require_approval` — `true` when a new order waits for your approval before it is processed. An order with a `warranty` product always waits for approval, whatever this says.\n- `tax_enabled` — `true` when tax is calculated on orders that have a tax address.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/store_settings",
+      "pathParams": [],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Store Settings/Get Store Settings.bru"
+    },
+    {
+      "key": "partner.subscriptions.getSubscription",
+      "namespace": "partner",
+      "group": "subscriptions",
+      "action": "getSubscription",
+      "title": "Get Subscription",
+      "description": "Requires the Store plan feature (403 otherwise). One subscription. **404** for a subscription outside the partner (for a brand partner: outside its brands). The 404 body is `{ \"error\": \"Subscription not found\" }`.\n\n## Success\n**200 OK** — the same object as one entry of Get Subscriptions `data`:\n```json\n{\n  \"id\": \"....-a1\",\n  \"status\": \"active\",\n  \"amount\": 12.5,\n  \"currency\": \"USD\",\n  \"next_charge_at\": \"2026-04-05\",\n  \"...\": \"as in Get Subscriptions\"\n}\n```",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/subscriptions/:subscription_id",
+      "pathParams": [
+        "subscription_id"
+      ],
+      "queryParams": [],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Subscriptions/Get Subscription.bru"
+    },
+    {
+      "key": "partner.subscriptions.getSubscriptionInvoiceItems",
+      "namespace": "partner",
+      "group": "subscriptions",
+      "action": "getSubscriptionInvoiceItems",
+      "title": "Get Subscription Invoice Items",
+      "description": "Requires the Store plan feature (403 otherwise). The charges of one subscription: the first purchase and every renewal, one item each, newest first (`created_at`, then `id`, both descending). **404** for a subscription outside the partner (for a brand partner: outside its brands). The 404 body is `{ \"error\": \"Subscription not found\" }`.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n\n`page` below 1 or `per_page` out of range returns **422** with `{ \"error\": \"...\" }`.\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"created_at\": \"2026-02-05T00:10:02.311Z\",\n      \"order_id\": \"....-b2\",\n      \"start_period\": \"2026-02-05\",\n      \"end_period\": \"2026-03-05\",\n      \"currency\": \"USD\",\n      \"price\": 37.5,\n      \"payment_status\": \"paid\",\n      \"paid_at\": \"2026-02-05T00:00:00.000Z\",\n      \"invoice_id\": \"....-c3\"\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `order_id` — the order of the charge (see Get Order; renewal orders included).\n- `start_period`, `end_period` — dates (`YYYY-MM-DD`) of the period the item charges for.\n- `price` — the item's unit price (after any coupon) times its quantity, a JSON number in major units of `currency`; seller discounts, proration and prepaid terms are not applied (see `line_total` in Get Order for the charged amount). `null` when no price is recorded.\n- `payment_status` — the order's payment status, with the values of `payment_status` in Get Orders; `null` when the order has no payment.\n- `paid_at` — when the order was paid; `null` while unpaid.\n- `invoice_id` — the newest invoice of the order; `null` when it has none.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/subscriptions/:subscription_id/invoice_items",
+      "pathParams": [
+        "subscription_id"
+      ],
+      "queryParams": [
+        "page",
+        "per_page"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Subscriptions/Get Subscription Invoice Items.bru"
+    },
+    {
+      "key": "partner.subscriptions.getSubscriptions",
+      "namespace": "partner",
+      "group": "subscriptions",
+      "action": "getSubscriptions",
+      "title": "Get Subscriptions",
+      "description": "Requires the Store plan feature (403 otherwise). The store subscriptions on the partner's products (for a brand partner: on its brands' products), newest first (`created_at`, then `id`, both descending), so two pages never overlap.\n\n## Query\n- `page` — 1 or more, default 1.\n- `per_page` — optional, 1-500, default 100.\n- `status` — one of `status` below.\n- `organization_id` — subscriptions of one organization (UUID).\n- `next_charge_from` — subscriptions whose next charge is at or after this time (inclusive).\n- `next_charge_to` — subscriptions whose next charge is before this time (**exclusive**); must be later than `next_charge_from` when both are set.\n`next_charge_at` is a date; the filters read it as 00:00 UTC of that day. A subscription without a next charge (`null`) matches neither filter. Both times are ISO 8601 `YYYY-MM-DDThh:mm[:ss[.ffffff]]` with a time zone offset, `Z`, `±hh:mm` or `±hhmm`, e.g. `2026-01-01T00:00:00Z`. Send `+` URL-encoded as `%2B` (`next_charge_from=2026-01-01T02:00:00%2B02:00`); a raw `+` reads as a space and is rejected.\n\nAn invalid value returns **422** with `{ \"error\": \"...\" }`: `page` below 1, `per_page` out of range, an unknown or empty `status` (`Parameter status must be one of the following: active / pending_cancellation / canceled / suspended`), an empty or malformed time or one without an offset, `next_charge_to` not later than `next_charge_from` (`next_charge_to must be after next_charge_from`), or an id that is not a UUID (`organization_id must be a valid UUID`).\n\n## Success\n**200 OK**:\n```json\n{\n  \"data\": [\n    {\n      \"id\": \"....-a1\",\n      \"status\": \"pending_cancellation\",\n      \"created_at\": \"2026-01-05T09:12:44.120Z\",\n      \"payment_interval\": \"monthly\",\n      \"amount\": 12.5,\n      \"currency\": \"USD\",\n      \"payment_method\": \"credit_card\",\n      \"next_charge_at\": null,\n      \"canceled_at\": \"2026-03-02T10:00:00.000Z\",\n      \"canceled_scheduled_at\": \"2026-04-05T00:00:00.000Z\",\n      \"cancellation_details\": { \"reason\": \"too_expensive\", \"comment\": \"Moving to annual\", \"initiator\": \"buyer\" },\n      \"organization\": { \"id\": \"....-b2\", \"name\": \"Contoso\" },\n      \"product\": { \"id\": \"....-c3\", \"name\": \"Cloud Plan\" },\n      \"order_id\": \"....-d4\",\n      \"quantity\": 1,\n      \"purchased_product_id\": \"....-e5\",\n      \"device\": { \"id\": \"....-f6\", \"sn\": \"SN-0001\" },\n      \"latest_payment_id\": \"....-a7\",\n      \"latest_payment_status\": \"paid\"\n    }\n  ],\n  \"page_info\": { \"has_next\": false, \"total_count\": 1 }\n}\n```\n- `amount` — the recurring price of one unit, a JSON number in major units of `currency` (12.5 USD, 500 JPY), with a fraction when the amount has one. For a usage-based product it is the base monthly price, before usage. It is not the charged amount: see `price` in Get Subscription Invoice Items for each charge.\n- `status`:\n  - `active` — charged every period.\n  - `pending_cancellation` — canceled; runs until `canceled_scheduled_at`, then becomes `canceled`.\n  - `canceled` — ended.\n  - `suspended` — on hold and its license suspended; a paid renewal makes it `active` again.\n- `payment_interval`:\n  - `monthly` — charged every month.\n  - `yearly` — charged every year.\n- `payment_method` — as in Get Orders (`credit_card`, `purchase_order`, `offline`, `lab`).\n- `next_charge_at` — date (`YYYY-MM-DD`) of the next charge; `null` once a cancellation is scheduled (usage-based: the end of the cancellation month, for the final usage charge).\n- `canceled_at` — when the cancellation was requested; `null` if never canceled.\n- `canceled_scheduled_at` — when a scheduled cancellation takes effect; `null` otherwise.\n- `cancellation_details` — `{ reason, comment, initiator }`, `null` if never canceled. `reason` and `comment` are what the canceling user entered. `initiator`:\n  - `buyer` — canceled by the organization.\n  - `seller` — canceled by a partner user.\n  - `system` — canceled by Xyte (no user).\n  - `user` — older cancellations, before buyer and seller were told apart.\n- `organization` — `{ id, name }` of the buying organization.\n- `order_id` — the order that started the subscription (see Get Order). The subscription belongs to the product's owner; when a reseller sold the order, Get Order answers 404 for it.\n- `quantity` — the units bought in that order; `null` when it is not recorded.\n- `device` — `{ id, sn }` of the device the subscription's license is assigned to; `null` when there is no license or it is not assigned.\n- `latest_payment_id`, `latest_payment_status` — the payment of the newest invoice item (see Get Subscription Invoice Items); `null` when it has no payment. `latest_payment_status` has the values of `payment_status` in Get Orders.\n- No buyer, address or card data is returned.",
+      "method": "GET",
+      "base": "hub",
+      "pathTemplate": "/core/v1/partner/subscriptions",
+      "pathParams": [],
+      "queryParams": [
+        "page",
+        "per_page",
+        "status",
+        "organization_id",
+        "next_charge_from",
+        "next_charge_to"
+      ],
+      "authScope": "partner",
+      "bodyType": "none",
+      "mutating": false,
+      "sourceFile": "Partner API/Subscriptions/Get Subscriptions.bru"
+    },
+    {
       "key": "partner.tickets.addComment",
       "namespace": "partner",
       "group": "tickets",
       "action": "addComment",
       "title": "Add Comment",
+      "description": "## Errors\n- **403** — brand partner API key (read-only).",
       "method": "POST",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/tickets/:ticket_id/message",
@@ -1668,6 +2180,7 @@
       "group": "tickets",
       "action": "closeTicket",
       "title": "Close Ticket",
+      "description": "## Errors\n- **403** — brand partner API key (read-only).",
       "method": "POST",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/tickets/:ticket_id/resolved",
@@ -1720,6 +2233,7 @@
       "group": "tickets",
       "action": "updateTicket",
       "title": "Update Ticket",
+      "description": "## Errors\n- **403** — brand partner API key (read-only).",
       "method": "PUT",
       "base": "hub",
       "pathTemplate": "/core/v1/partner/tickets/:ticket_id",

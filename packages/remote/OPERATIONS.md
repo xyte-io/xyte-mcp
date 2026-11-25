@@ -1,15 +1,38 @@
 # Operating the hosted server
 
-How to stop the hosted MCP server, how to cut off one organization or one connection, what
-it logs, and which alerts to set up. It assumes the Heroku deployment from the
-[README](../../README.md#deploy-it). `<app>` is the Heroku app name.
+The one hub setting to check before launch, how to stop the hosted MCP server, how to cut off
+one organization or one connection, what it logs, and which alerts to set up. It assumes the
+Heroku deployment from the [README](../../README.md#deploy-it). `<app>` is the Heroku app name.
 
-Who acts: the on-call engineer with access to the hosting app. The names and the alert
-targets are in the internal runbook, not here.
+Who acts: the on-call engineer with access to the hosting app; "Before launch" also needs
+someone with a hub console in that hub environment. The names and the alert targets are in the
+internal runbook, not here.
 
 **Connection** in this document means one MCP grant: one user who signed in through one
 client (for example, one person's claude.ai connector). It is not the hub's org-level
 "connected app". The `connection` field in the logs is the grant's id.
+
+## Before launch
+
+Needs a hub console in the hub environment this server talks to, once per environment.
+
+- First check you have the right application: `rake "oauth:show[<hub OAuth client id>]"` (its
+  client id is the value of `XYTE_MCP_HUB_OAUTH_CLIENT_ID`). Its `redirect_uris` must hold the
+  origin of `XYTE_MCP_ISSUER_URL` (no trailing slash) + `/oauth/callback`. If not, it is the wrong
+  application: fix the client id before you change anything.
+- Turn on each signed-in user's own access with
+  `rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"`; a new
+  registration can set it at once (see "Registering at hub" in the
+  [README](../../README.md#oauth-21)).
+- Read it back with `oauth:show` before you open sign-in to non-administrators. It must print
+  `acts_with_signed_in_user_access: true`; if it prints `false`, run the previous step again.
+- This read-back is the only gate: the server does not check the setting, and sign-in and the
+  health check work without it. Without it, every member the connection's sign-in policy admits
+  acts as the organization (admin-only actions included). Check again after any hub-side change
+  to the app; a new registration gets a new client id with the setting off.
+- These rake tasks come with the hub's hosted-MCP release. On an older hub, turn the setting on
+  and read it back in a Rails console instead (see "Registering at hub" in the
+  [README](../../README.md#oauth-21)).
 
 ## Kill switch: stop the whole server
 

@@ -582,7 +582,7 @@ revocation — nothing hand-rolled. Our part (`packages/remote/src/oauth/`) is t
 **Registering at hub.** Once per hub environment, from a hub console:
 
 ```bash
-GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://<host>/oauth/callback]"
+ACTS_AS_SIGNED_IN_USER=true GLOBAL=true rake "oauth:register_application[Xyte MCP,,https://<host>/oauth/callback]"
 ```
 
 It prints the client id and secret for `XYTE_MCP_HUB_OAUTH_CLIENT_ID` /
@@ -592,15 +592,30 @@ that organization has to connect (approve) the app on hub's consent screen first
 then hub denies with `error_reason=org_not_approved`.
 
 The app must also have the hub setting "acts with the signed-in user's access" turned on;
-the command above leaves it off. To turn it on, run this in the same hub console:
+`ACTS_AS_SIGNED_IN_USER=true` above turns it on. For an app registered without it, run this
+in the same hub console:
 
-```ruby
-Oauth::Application.find_by!(client_id: '<client id>').update!(acts_with_signed_in_user_access: true)
+```bash
+rake "oauth:set_signed_in_user_access[<hub OAuth client id>,on,<your name>]"
 ```
 
-Without it every signed-in user gets the organization's
-full access and the consent page text is not true, so do not open sign-in to
-non-administrators until it is on.
+`<hub OAuth client id>` is the value of `XYTE_MCP_HUB_OAUTH_CLIENT_ID`, not a client registered
+at this server. After either path, check it: `rake "oauth:show[<hub OAuth client id>]"` must
+print `acts_with_signed_in_user_access: true`, and its `redirect_uris` must hold the callback
+above (so you checked the app this server uses). Without the setting every signed-in user who
+is not an organization administrator gets the organization's full access and the consent page
+text is not true, so do not open sign-in to non-administrators until it is on.
+
+The `set_signed_in_user_access` and `show` tasks and `ACTS_AS_SIGNED_IN_USER` come with the
+hub's hosted-MCP release. An older hub has no such tasks and ignores `ACTS_AS_SIGNED_IN_USER`,
+so the register command leaves the setting off there. On such a hub, turn it on and check it
+in a Rails console instead, and note who ran it (the console writes no log line naming you):
+
+```ruby
+app = Oauth::Application.find_by!(client_id: '<hub OAuth client id>')
+app.update!(acts_with_signed_in_user_access: true)
+app.slice(:acts_with_signed_in_user_access, :redirect_uris)
+```
 
 The static-bearer mode is the alternative, not an addition: unset the issuer to use it.
 Setting both refuses to start — a shared bearer mapping to the process keys has no place on

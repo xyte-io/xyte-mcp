@@ -8,8 +8,9 @@ Reads and writes are both available by default; `XYTE_MCP_READ_ONLY=1` makes it 
 read-only server.
 
 Xyte is a device management platform: connected device fleets, the spaces they live in,
-their telemetry and incidents, service tickets, commands, models, warranties and maintenance
-schedules, and for partners the store coupons they give their customers. This server
+their telemetry and incidents, service tickets, commands, models, warranties, maintenance
+schedules and nightly data exports, and for partners the store coupons they give their
+customers. This server
 puts that API in front of an agent as three tools instead of one hand-written tool per
 endpoint — it can discover the right endpoint, read its exact contract, and call it with
 arguments validated against that contract before a request goes out.
@@ -154,7 +155,7 @@ API keys are never echoed back: output is filtered both by field name (`api_key`
 
 ## The endpoint catalog
 
-`src/catalog/endpoints.generated.json` holds 112 endpoints (74 organization, 38 partner). It
+`src/catalog/endpoints.generated.json` holds 114 endpoints (76 organization, 38 partner). It
 is **generated** from hub's Bruno collection — `hub/docs/api/Xyte Public/` — which is the
 upstream source the [public API reference](https://docs.xyte.io/reference) is built from, and
 committed so this repo has no dependency on a hub checkout at runtime.
@@ -170,8 +171,9 @@ organization tag. Coupons need the Store plan feature and store coupons enabled 
 partner; the other store endpoints need only the Store plan feature.
 
 Organization endpoints also gained `organization.edges.devices.changeModel`, maintenance schedules
-(`organization.maintenanceSchedules.*`) and incident notes (`organization.notes.*IncidentNote*`), picked up from hub with this
-catalog refresh.
+(`organization.maintenanceSchedules.*`), incident notes (`organization.notes.*IncidentNote*`) and nightly data
+exports (`organization.exports.*`: list, get one day's export with download URLs), picked up from hub with these
+catalog refreshes.
 
 Device API endpoints are deliberately excluded: they authenticate as a device with a device
 access token, not as an operator.
